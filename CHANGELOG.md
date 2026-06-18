@@ -6,6 +6,10 @@ aims to follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Docs
+- README trimmed to the essentials with a **Contents** (table of contents) at the top for quick
+  jumping; deeper detail stays in [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ### Planned
 - Block‑level delta (rsync‑style) for large, slowly‑changing files.
 - VSS snapshot serving for zero‑downtime consistent database copies.
