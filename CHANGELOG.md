@@ -13,6 +13,17 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Progress output with speed / ETA and a final transfer summary.
 - Optional server‑side transfer log for auditing.
 
+## [0.5.0] — 2026-06-18
+
+### Added
+- **Live progress during a sync, on both sides.** The server counts the files in the tree at
+  the start of each pass and both server and client now print a throttled progress line
+  (about every 2 seconds): how many files are done, how many are left, how many were fetched
+  vs unchanged, and how much data has moved — e.g.
+  `progress: 4054/6000 (1946 left) - fetched 4054, unchanged 0, 12.3 MB`. The count is sent
+  to the client over the wire (a `T <n>` line) so it can show "x of N" too. Previously a long
+  transfer printed nothing between the start and end of a pass.
+
 ## [0.4.1] — 2026-06-18
 
 ### Fixed
@@ -143,7 +154,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/lotgon/folder-transfer/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/lotgon/folder-transfer/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/lotgon/folder-transfer/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/lotgon/folder-transfer/compare/v0.2.0...v0.3.0

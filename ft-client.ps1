@@ -79,12 +79,15 @@ try {
   Write-Line $stream 'SYNC'
   while ($more) {
     $pass++
+    $total = [int64]0      # file count for this pass (sent by the server as 'T <n>')
+    $lastProg = Get-Date
     $seen.Clear()   # mirror must reflect ONLY the latest pass, so files deleted
                     # between cutover pass 1 and pass 2 get removed on the client
     while ($true) {
       $h = Read-Line $stream
       if ($null -eq $h) { $more = $false; break }
       if ($h -eq 'PASS-END') { break }
+      if ($h -match '^T (\d+)$') { $total = [int64]$matches[1]; continue }   # server's file count
       if ($h -notmatch '^F (\d+) (\d+) (.+)$') { continue }
       $size = [int64]$matches[1]; $mt = [int64]$matches[2]; $rel = $matches[3]
       $target = [IO.Path]::GetFullPath((Join-Path $ToFolder $rel))
@@ -96,6 +99,11 @@ try {
         if ($top) { $mirrorRoot = [IO.Path]::GetFullPath((Join-Path $ToFolder $top)) }
       }
       [void]$seen.Add($target.ToLowerInvariant())
+      if (((Get-Date) - $lastProg).TotalSeconds -ge 2) {
+        $lastProg = Get-Date
+        $done = $got + $skipped; $left = $total - $done; if ($left -lt 0) { $left = 0 }
+        Write-Host ("[fetch] progress: {0}/{1} ({2} left) - fetched {3}, unchanged {4}, {5:N1} MB" -f $done, $total, $left, $got, $skipped, ($bytes / 1MB))
+      }
       $need = $true
       if (Test-Path -LiteralPath $target) {
         $li = Get-Item -LiteralPath $target

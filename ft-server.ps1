@@ -132,7 +132,21 @@ endlocal & exit /b %RC%
   Set-Content -LiteralPath $OutPath -Value $bat -Encoding ASCII
 }
 
-function Send-Pass($s, $root) {
+function Get-FileCount($root) {
+  # Cheap count-only walk (no per-file stat, no I/O) so we can show "x of N"
+  # progress. Constant memory, like Send-Pass. Best-effort: unreadable dirs are skipped.
+  $n = 0
+  $stack = New-Object System.Collections.Stack
+  $stack.Push($root)
+  while ($stack.Count -gt 0) {
+    $dir = $stack.Pop()
+    try { foreach ($sd in [IO.Directory]::EnumerateDirectories($dir)) { $stack.Push($sd) } } catch {}
+    try { foreach ($f in [IO.Directory]::EnumerateFiles($dir)) { $n++ } } catch {}
+  }
+  return $n
+}
+
+function Send-Pass($s, $root, $total) {
   # One lazy walk of the tree. For each file: send "F <size> <mtimeTicks> <rel>",
   # read the client's reply (byte offset to start at, or -1 to skip), send the
   # remaining bytes. Paths are relative to the PARENT of the shared folder so the
@@ -142,6 +156,8 @@ function Send-Pass($s, $root) {
   $st = [pscustomobject]@{ Ok = $true; Offered = 0; Sent = 0; Skipped = 0; Bytes = [int64]0 }
   $base = Split-Path $root -Parent
   if (-not $base) { $base = $root }
+  Write-Line $s ("T {0}" -f $total)   # tell the client the file count for its own progress
+  $lastProg = Get-Date
   $stack = New-Object System.Collections.Stack
   $stack.Push($root)
   while ($stack.Count -gt 0) {
@@ -158,6 +174,11 @@ function Send-Pass($s, $root) {
       $rel = $full.Substring($base.Length).TrimStart('\', '/')
       Write-Line $s ("F {0} {1} {2}" -f $fi.Length, $fi.LastWriteTimeUtc.Ticks, $rel)
       $st.Offered++
+      if (((Get-Date) - $lastProg).TotalSeconds -ge 2) {
+        $lastProg = Get-Date
+        $left = $total - $st.Offered; if ($left -lt 0) { $left = 0 }
+        Log ("  progress: {0}/{1} files ({2} left) - sent {3}, unchanged {4}, {5:N1} MB" -f $st.Offered, $total, $left, $st.Sent, $st.Skipped, ($st.Bytes / 1MB))
+      }
       $resp = Read-Line $s
       if ($null -eq $resp) { $st.Ok = $false; return $st }
       $offset = [int64]0
@@ -337,7 +358,9 @@ try {
           # changed/new ones and deletes local files no longer offered (mirror).
           # With -Cutover a second pass runs after the operator stops the database.
           Log ("session #{0}: sync pass 1 - scanning {1}" -f $sessionNum, $Folder)
-          $p1 = Send-Pass $stream $Folder
+          $tot1 = Get-FileCount $Folder
+          Log ("session #{0}: pass 1 - {1} files to check" -f $sessionNum, $tot1)
+          $p1 = Send-Pass $stream $Folder $tot1
           if (-not $p1.Ok) { Log ("session #{0}: client dropped during pass 1" -f $sessionNum); break }
           Write-Line $stream 'PASS-END'
           Log ("session #{0}: pass 1 done - changed/new {1}, unchanged {2}, {3:N0} bytes" -f $sessionNum, $p1.Sent, $p1.Skipped, $p1.Bytes)
@@ -346,7 +369,9 @@ try {
             Wait-Cutover $stream
             Write-Line $stream 'GO'
             Log ("session #{0}: pass 2 (final, DB stopped) - scanning {1}" -f $sessionNum, $Folder)
-            $p2 = Send-Pass $stream $Folder
+            $tot2 = Get-FileCount $Folder
+            Log ("session #{0}: pass 2 - {1} files to check" -f $sessionNum, $tot2)
+            $p2 = Send-Pass $stream $Folder $tot2
             if (-not $p2.Ok) { Log ("session #{0}: client dropped during pass 2" -f $sessionNum); break }
             Write-Line $stream 'PASS-END'
             Log ("session #{0}: pass 2 done - changed/new {1}, unchanged {2}, {3:N0} bytes" -f $sessionNum, $p2.Sent, $p2.Skipped, $p2.Bytes)
