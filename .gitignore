@@ -1,0 +1,12 @@
+# Generated client bats (contain a baked token — never commit)
+download-scripts/
+ft-download-*.bat
+
+# Local test / demo artifacts
+_demo/
+_d.ps1
+_v.ps1
+_evil.ps1
+_break.ps1
+*.b64
+*.tmp

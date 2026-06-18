@@ -1,0 +1,11 @@
+# Keep Windows scripts as CRLF (a .bat with LF endings can misbehave).
+* text=auto
+
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+*.md          text eol=lf
+LICENSE       text eol=lf
+.gitignore    text eol=lf
+.gitattributes text eol=lf
