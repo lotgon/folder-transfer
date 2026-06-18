@@ -163,7 +163,21 @@ function Send-Pass($s, $root) {
       $offset = [int64]0
       if (-not [int64]::TryParse($resp, [ref]$offset)) { $offset = [int64](-1) }
       if ($offset -lt 0) { $st.Skipped++; continue }
-      $fs = [IO.File]::OpenRead($full)
+      # Open with a permissive share mode so files another process holds open
+      # (e.g. a live database's data/log files during cutover pass 1) can still
+      # be read. If the file is locked exclusively, do NOT abort the session:
+      # send -1 so the client keeps its current copy (no truncation, no delete)
+      # and move on. In cutover, pass 2 (DB stopped) picks it up consistently.
+      $fs = $null
+      try {
+        $fs = New-Object IO.FileStream($full, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]'ReadWrite, Delete'))
+      }
+      catch {
+        Log ("session: cannot read (in use?), skipping this pass: {0} -- {1}" -f $rel, $_.Exception.Message)
+        Write-Line $s '-1'
+        $st.Skipped++
+        continue
+      }
       try {
         $remain = $fs.Length - $offset; if ($remain -lt 0) { $remain = 0 }
         Write-Line $s ([string]$remain)

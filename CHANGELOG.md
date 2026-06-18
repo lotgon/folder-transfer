@@ -13,6 +13,18 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Progress output with speed / ETA and a final transfer summary.
 - Optional server‑side transfer log for auditing.
 
+## [0.4.1] — 2026-06-18
+
+### Fixed
+- **A locked/in-use file no longer aborts the whole sync.** The server now opens each file
+  with a permissive share mode (`FileShare.ReadWrite, Delete`), so files another process holds
+  open — e.g. a **live database's data/log files during cutover pass 1** — can be read and
+  transferred instead of throwing *"The process cannot access the file … because it is being
+  used by another process"* and killing the session. If a file is still locked **exclusively**,
+  the server logs it and tells the client to skip it for that pass (the client keeps its current
+  copy — no truncation, no wrongful delete) and carries on; in cutover, pass 2 (after the DB is
+  stopped) picks it up consistently.
+
 ## [0.4.0] — 2026-06-18
 
 ### Added
@@ -131,7 +143,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/lotgon/folder-transfer/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/lotgon/folder-transfer/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/lotgon/folder-transfer/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/lotgon/folder-transfer/releases/tag/v0.2.0

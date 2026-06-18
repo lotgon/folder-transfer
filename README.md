@@ -337,6 +337,10 @@ Read these before trusting it with production data:
   client bat won't connect to a new server instance (by design).
 - **Symlinks/junctions inside the shared folder** are followed by enumeration and could
   point outside the folder; don't share a folder containing untrusted links.
+- **Exclusively‑locked files** (opened by another process with no sharing) can't be read and
+  are skipped for that pass with a log line — the sync still finishes. Files merely open for
+  writing (e.g. database logs) are read fine. For a consistent copy of a live database use
+  `-Cutover`: pass 2 runs after you stop it.
 - After a **hard kill** (not a normal exit) a firewall rule may linger — harmless
   (nothing is listening) and auto‑cleaned on the next start.
 
