@@ -13,6 +13,15 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Progress output with speed / ETA and a final transfer summary.
 - Optional server‑side transfer log for auditing.
 
+## [0.5.1] — 2026-06-18
+
+### Changed
+- The progress line now also shows **transfer speed (MB/s)** and an **ETA**, e.g.
+  `progress: 4054/6000 (1946 left) - fetched 4054, unchanged 0, 12.3 MB @ 215.0 MB/s, ETA 00:00:09`.
+  The client's final summary reports total elapsed time and average speed. (Speed is measured
+  over the last interval; ETA is estimated from the file‑processing rate, so it is a guide, not
+  a guarantee — a few very large files left can make it optimistic.)
+
 ## [0.5.0] — 2026-06-18
 
 ### Added
@@ -154,7 +163,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/lotgon/folder-transfer/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/lotgon/folder-transfer/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/lotgon/folder-transfer/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/lotgon/folder-transfer/compare/v0.3.0...v0.4.0

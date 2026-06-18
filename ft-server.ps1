@@ -26,6 +26,11 @@ if ($Cutover) { $Once = $true }   # a two-phase cutover is one session: exit aft
 $ErrorActionPreference = 'Stop'
 
 function Log($m) { Write-Host ("[serve {0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) }
+function Format-Span($sec) {
+  # compact h:mm:ss for ETA; '?' when not meaningful
+  if ($sec -lt 0 -or $sec -gt 359999) { return '?' }
+  return ('{0:hh\:mm\:ss}' -f [TimeSpan]::FromSeconds([int]$sec))
+}
 
 function Show-ServeHelp {
   Write-Host ''
@@ -157,7 +162,7 @@ function Send-Pass($s, $root, $total) {
   $base = Split-Path $root -Parent
   if (-not $base) { $base = $root }
   Write-Line $s ("T {0}" -f $total)   # tell the client the file count for its own progress
-  $lastProg = Get-Date
+  $passStart = Get-Date; $lastProg = $passStart; $lastBytes = [int64]0
   $stack = New-Object System.Collections.Stack
   $stack.Push($root)
   while ($stack.Count -gt 0) {
@@ -174,10 +179,16 @@ function Send-Pass($s, $root, $total) {
       $rel = $full.Substring($base.Length).TrimStart('\', '/')
       Write-Line $s ("F {0} {1} {2}" -f $fi.Length, $fi.LastWriteTimeUtc.Ticks, $rel)
       $st.Offered++
-      if (((Get-Date) - $lastProg).TotalSeconds -ge 2) {
-        $lastProg = Get-Date
+      $nowt = Get-Date
+      if (($nowt - $lastProg).TotalSeconds -ge 2) {
+        $dt = ($nowt - $lastProg).TotalSeconds
+        $spd = if ($dt -gt 0) { (($st.Bytes - $lastBytes) / 1MB) / $dt } else { 0 }
+        $el = ($nowt - $passStart).TotalSeconds
+        $rate = if ($el -gt 0) { $st.Offered / $el } else { 0 }   # files/sec over the pass
         $left = $total - $st.Offered; if ($left -lt 0) { $left = 0 }
-        Log ("  progress: {0}/{1} files ({2} left) - sent {3}, unchanged {4}, {5:N1} MB" -f $st.Offered, $total, $left, $st.Sent, $st.Skipped, ($st.Bytes / 1MB))
+        $eta = if ($rate -gt 0) { Format-Span ($left / $rate) } else { '?' }
+        Log ("  progress: {0}/{1} files ({2} left) - sent {3}, unchanged {4}, {5:N1} MB @ {6:N1} MB/s, ETA {7}" -f $st.Offered, $total, $left, $st.Sent, $st.Skipped, ($st.Bytes / 1MB), $spd, $eta)
+        $lastProg = $nowt; $lastBytes = $st.Bytes
       }
       $resp = Read-Line $s
       if ($null -eq $resp) { $st.Ok = $false; return $st }

@@ -263,7 +263,7 @@ The server logs every step to its console with timestamps — including the clie
 [serve 14:02:31] session #1 connected from 10.0.0.7:60434 (TLS ok; stall timeout 120s)
 [serve 14:02:31] session #1: sync pass 1 - scanning D:\db
 [serve 14:02:31] session #1: pass 1 - 19846 files to check
-[serve 14:02:33]   progress: 8120/19846 files (11726 left) - sent 312, unchanged 7808, 1,604.0 MB
+[serve 14:02:33]   progress: 8120/19846 files (11726 left) - sent 312, unchanged 7808, 1,604.0 MB @ 215.0 MB/s, ETA 00:00:18
 [serve 14:02:34] session #1: pass 1 done - changed/new 812, unchanged 19034, 4,210,118,400 bytes
 [serve 14:02:34] session #1: cutover - WAITING for you to stop the database and signal ...
 [serve 14:09:10] session #1: pass 2 done - changed/new 11, unchanged 19835, 26,214,400 bytes
@@ -271,8 +271,9 @@ The server logs every step to its console with timestamps — including the clie
 ```
 
 During a pass both sides print a throttled progress line (~every 2 s) with how many files
-are done / left, fetched vs unchanged, and data moved — on the server as above, and on the
-receiver as `[fetch] progress: 8120/19846 (11726 left) - fetched 312, unchanged 7808, …`.
+are done / left, fetched vs unchanged, data moved, **speed and an ETA** — on the server as
+above, and on the receiver as
+`[fetch] progress: 8120/19846 (11726 left) - fetched 312, unchanged 7808, 1,604.0 MB @ 215.0 MB/s, ETA 00:00:18`.
 
 Two independent timeouts govern when the server gives up:
 

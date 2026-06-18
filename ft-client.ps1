@@ -51,6 +51,10 @@ function Read-Line($s) {
   }
   return [Text.Encoding]::UTF8.GetString($ms.ToArray())
 }
+function Format-Span($sec) {
+  if ($sec -lt 0 -or $sec -gt 359999) { return '?' }
+  return ('{0:hh\:mm\:ss}' -f [TimeSpan]::FromSeconds([int]$sec))
+}
 
 $script:ExpectedFp = $Fingerprint.Replace(':', '').Replace('-', '').ToLower()
 
@@ -75,12 +79,13 @@ try {
   $seen = New-Object 'System.Collections.Generic.HashSet[string]'
   $mirrorRoot = $null      # <ToFolder>\<FolderName>, derived from the offered paths
   $more = $true; $syncOk = $false
+  $runStart = Get-Date
 
   Write-Line $stream 'SYNC'
   while ($more) {
     $pass++
     $total = [int64]0      # file count for this pass (sent by the server as 'T <n>')
-    $lastProg = Get-Date
+    $passStart = Get-Date; $lastProg = $passStart; $lastBytes = 0
     $seen.Clear()   # mirror must reflect ONLY the latest pass, so files deleted
                     # between cutover pass 1 and pass 2 get removed on the client
     while ($true) {
@@ -99,10 +104,17 @@ try {
         if ($top) { $mirrorRoot = [IO.Path]::GetFullPath((Join-Path $ToFolder $top)) }
       }
       [void]$seen.Add($target.ToLowerInvariant())
-      if (((Get-Date) - $lastProg).TotalSeconds -ge 2) {
-        $lastProg = Get-Date
-        $done = $got + $skipped; $left = $total - $done; if ($left -lt 0) { $left = 0 }
-        Write-Host ("[fetch] progress: {0}/{1} ({2} left) - fetched {3}, unchanged {4}, {5:N1} MB" -f $done, $total, $left, $got, $skipped, ($bytes / 1MB))
+      $nowt = Get-Date
+      if (($nowt - $lastProg).TotalSeconds -ge 2) {
+        $dt = ($nowt - $lastProg).TotalSeconds
+        $spd = if ($dt -gt 0) { (($bytes - $lastBytes) / 1MB) / $dt } else { 0 }
+        $el = ($nowt - $passStart).TotalSeconds
+        $done = $got + $skipped
+        $rate = if ($el -gt 0) { $done / $el } else { 0 }   # files/sec over the pass
+        $left = $total - $done; if ($left -lt 0) { $left = 0 }
+        $eta = if ($rate -gt 0) { Format-Span ($left / $rate) } else { '?' }
+        Write-Host ("[fetch] progress: {0}/{1} ({2} left) - fetched {3}, unchanged {4}, {5:N1} MB @ {6:N1} MB/s, ETA {7}" -f $done, $total, $left, $got, $skipped, ($bytes / 1MB), $spd, $eta)
+        $lastProg = $nowt; $lastBytes = $bytes
       }
       $need = $true
       if (Test-Path -LiteralPath $target) {
@@ -148,6 +160,8 @@ try {
   elseif (-not $syncOk) { Write-Host '[fetch] sync did not finish cleanly - nothing deleted' }
 
   Write-Line $stream 'BYE'
-  Write-Host ("[fetch] sync done. passes={0} fetched={1} unchanged={2} deleted={3} bytes={4:N0}" -f $pass, $got, $skipped, $deleted, $bytes)
+  $secs = ((Get-Date) - $runStart).TotalSeconds
+  $avg = if ($secs -gt 0) { ($bytes / 1MB) / $secs } else { 0 }
+  Write-Host ("[fetch] sync done. passes={0} fetched={1} unchanged={2} deleted={3} bytes={4:N0} in {5} @ {6:N1} MB/s avg" -f $pass, $got, $skipped, $deleted, $bytes, (Format-Span $secs), $avg)
 }
 finally { $tcp.Close() }
