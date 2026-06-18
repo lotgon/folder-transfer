@@ -10,8 +10,8 @@ rem  Requires ft-server.ps1 and ft-client.ps1 in this same folder.
 rem ====================================================================
 setlocal EnableExtensions
 if not exist "%~dp0ft-server.ps1" ( echo ERROR: ft-server.ps1 not found next to folder-transfer.bat & echo. & pause & exit /b 1 )
+rem  No arguments is NOT help anymore - ft-server.ps1 then asks interactively.
 set "HELP="
-if "%~1"=="" set "HELP=1"
 if "%~1"=="/?" set "HELP=1"
 if /i "%~1"=="-h" set "HELP=1"
 if /i "%~1"=="--help" set "HELP=1"

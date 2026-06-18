@@ -51,6 +51,7 @@ function Show-ServeHelp {
   Write-Host '  -Help               this help'
   Write-Host ''
   Write-Host 'Examples:'
+  Write-Host '  folder-transfer.bat                                         (no args - asks interactively)'
   Write-Host '  folder-transfer.bat D:\data                                 (simplest - just the folder)'
   Write-Host '  folder-transfer.bat D:\data -ServerHost 10.0.0.5 -Once       (single-phase sync)'
   Write-Host '  folder-transfer.bat D:\db   -ServerHost 10.0.0.5 -Cutover    (two-phase DB sync)'
@@ -61,8 +62,20 @@ function Show-ServeHelp {
 }
 
 if ($Help) { Show-ServeHelp; return }
-if (-not $Folder) { Write-Host 'ERROR: -Folder is required (the folder to share).'; Show-ServeHelp; return }
-if (-not (Test-Path -LiteralPath $Folder)) { Write-Host "ERROR: -Folder path not found: $Folder"; return }
+if (-not $Folder) {
+  # No folder on the command line (e.g. double-clicked) - ask a couple of questions,
+  # the same way the generated client asks for its destination.
+  Write-Host ''
+  Write-Host 'No folder given - a couple of quick questions (press Enter for the default).'
+  Write-Host ''
+  $Folder = (Read-Host '1) Folder to share / sync (full path)').Trim().Trim('"')
+  $modeAns = (Read-Host '2) Mode: [1] single-phase sync (default) or [2] cutover (two-phase, for a live DB)').Trim()
+  if ($modeAns -eq '2') { $Cutover = $true; $Once = $true; Write-Host '   -> cutover mode (two passes; implies -Once)' }
+  else { Write-Host '   -> single-phase sync' }
+  Write-Host ''
+}
+if (-not $Folder) { Write-Host 'ERROR: a folder is required (the folder to share).'; Show-ServeHelp; return }
+if (-not (Test-Path -LiteralPath $Folder)) { Write-Host "ERROR: folder path not found: $Folder"; return }
 $Folder = (Resolve-Path -LiteralPath $Folder).Path
 
 function Write-Line($s, [string]$t) { $b = [Text.Encoding]::UTF8.GetBytes($t + "`n"); $s.Write($b, 0, $b.Length); $s.Flush() }

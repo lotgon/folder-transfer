@@ -92,7 +92,11 @@ design rationale.
 
 ### On the SENDER (the machine that has the folder)
 
-The simplest call is just the folder — everything else has a sane default:
+The simplest way is to just **run `folder-transfer.bat` with no arguments** (or
+double‑click it): it asks what to share and in which mode (single‑phase or cutover),
+the same way the receiver asks for its destination.
+
+Or pass the folder directly — everything else has a sane default:
 
 ```bat
 folder-transfer.bat D:\ProjectX
@@ -302,8 +306,16 @@ A dropped or aborted session never counts as completion, so `-Once` does not exi
   - **Admin** is needed for the default firewall opening.
   - Quick check on the host: `$ExecutionContext.SessionState.LanguageMode` (want
     `FullLanguage`) and `Get-ExecutionPolicy -List`.
-- **Mark‑of‑the‑Web:** a file downloaded from the internet is marked "blocked"; clear it
-  with right‑click → *Unblock*, or `Unblock-File .\folder-transfer.bat`.
+- **Mark‑of‑the‑Web / "Unknown Publisher" dialog:** files extracted from a ZIP you downloaded
+  (e.g. a GitHub release) inherit the internet "blocked" mark, so Windows shows *“Open File –
+  Security Warning … The publisher could not be verified … Unknown Publisher”* the first time
+  you run `folder-transfer.bat`. This is expected for any unsigned downloaded script — it is
+  not specific to this tool. To clear it:
+  - **Best:** right‑click the **`.zip`** → *Properties* → tick **Unblock** → *OK*, **then**
+    extract. The mark is removed from every file at once.
+  - Already extracted? Run in the folder:
+    `Get-ChildItem -Recurse | Unblock-File` (or right‑click each file → *Unblock*).
+  - The dialog only disappears entirely if the scripts are **code‑signed** (needs a certificate).
 - `-ExecutionPolicy Bypass` is passed only to the launched PowerShell process; it does not
   change the machine's execution policy.
 

@@ -87,13 +87,14 @@ Info "release notes -> $notesPath"
 
 # ---- build the ZIP -------------------------------------------------------
 $dist  = Join-Path $root 'dist'
-$stage = Join-Path $dist "folder-transfer-$ver"
+$stage = Join-Path $dist 'FileTransfer'        # the folder users get when they unzip
 $zip   = Join-Path $dist "folder-transfer-$ver.zip"
 if (Test-Path -LiteralPath $stage) { Remove-Item -Recurse -Force -LiteralPath $stage }
 if (Test-Path -LiteralPath $zip)   { Remove-Item -Force -LiteralPath $zip }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 foreach ($f in $payload) { Copy-Item -LiteralPath (Join-Path $root $f) -Destination $stage }
-Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+# zip the FOLDER (not its contents) so the archive root is FileTransfer\ - unzip gives a ready folder
+Compress-Archive -Path $stage -DestinationPath $zip -Force
 Info ("built {0} ({1:N1} KB)" -f $zip, ((Get-Item -LiteralPath $zip).Length / 1KB))
 
 if ($DryRun) { Info "dry run - no tag/push/publish. ZIP ready at $zip"; return }

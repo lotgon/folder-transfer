@@ -13,6 +13,24 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Progress output with speed / ETA and a final transfer summary.
 - Optional server‑side transfer log for auditing.
 
+## [0.4.0] — 2026-06-18
+
+### Added
+- **Interactive server prompts.** Running `folder-transfer.bat` with no arguments (e.g. by
+  double‑clicking) now asks what to do instead of printing help: (1) which folder to share /
+  sync, and (2) which mode — single‑phase or cutover. This mirrors the client, which already
+  asks for its destination. Explicit command‑line arguments still work and skip the questions;
+  `--help` / `-h` / `/?` still show help.
+
+### Changed (packaging)
+- The release ZIP now contains a top‑level **`FileTransfer\`** folder, so unzipping creates
+  that folder ready to use — no need to choose a destination folder when extracting.
+
+### Docs
+- Expanded the Mark‑of‑the‑Web guidance: the "Open File – Security Warning / Unknown
+  Publisher" dialog comes from files extracted from a downloaded ZIP. **Unblock the `.zip`
+  before extracting** (right‑click → Properties → Unblock) to clear it from all files at once.
+
 ## [0.3.0] — 2026-06-18
 
 ### Added (usability)
@@ -113,7 +131,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/lotgon/folder-transfer/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/lotgon/folder-transfer/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/lotgon/folder-transfer/releases/tag/v0.2.0
 [0.1.0]: https://github.com/lotgon/folder-transfer/releases/tag/v0.1.0
