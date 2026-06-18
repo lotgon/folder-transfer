@@ -117,8 +117,14 @@ git push origin $Branch; Check "git push origin $Branch"
 git push origin $tag;    Check "git push origin $tag"
 
 # ---- create or update the release ---------------------------------------
+# gh prints "release not found" to stderr + returns non-zero when absent; with
+# ErrorActionPreference=Stop that stderr would become a terminating error, so
+# silence it locally and decide purely on the exit code.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'SilentlyContinue'
 gh release view $tag --repo $Repo *> $null
 $relExists = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = $prevEap
 if ($relExists) {
   Warn "release $tag already exists - uploading the ZIP (clobber)"
   gh release upload $tag $zip --repo $Repo --clobber; Check "gh release upload"
