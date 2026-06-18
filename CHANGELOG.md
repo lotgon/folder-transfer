@@ -6,16 +6,17 @@ aims to follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Docs
-- README trimmed to the essentials with a **Contents** (table of contents) at the top for quick
-  jumping; deeper detail stays in [ARCHITECTURE.md](ARCHITECTURE.md).
-
 ### Planned
 - Block‑level delta (rsync‑style) for large, slowly‑changing files.
 - VSS snapshot serving for zero‑downtime consistent database copies.
 - Optional hash‑based integrity verification (`-Verify`).
-- Progress output with speed / ETA and a final transfer summary.
 - Optional server‑side transfer log for auditing.
+
+## [0.5.2] — 2026-06-18
+
+### Docs
+- README trimmed to the essentials with a **Contents** (table of contents) at the top for quick
+  jumping; deeper detail stays in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## [0.5.1] — 2026-06-18
 
@@ -167,7 +168,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/lotgon/folder-transfer/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/lotgon/folder-transfer/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/lotgon/folder-transfer/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/lotgon/folder-transfer/compare/v0.4.0...v0.4.1
