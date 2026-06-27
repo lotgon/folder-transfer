@@ -311,14 +311,15 @@ endlocal & exit /b %RC%
   Set-Content -LiteralPath $OutPath -Value $bat -Encoding ASCII
 }
 
-$script:SmallFile = 65536    # files <= this are batched into one bundle (cuts per-file round-trips)
-$script:BundleMax = 1024     # flush a bundle after this many small files (fewer round-trips over WAN)
+$script:SmallFile = 1048576      # files <= 1 MB are batched into bundles (cuts per-file round-trips)
+$script:BundleBytes = 10485760   # flush a bundle once it has accumulated ~10 MB of files
+$script:BundleMaxCount = 4096    # ...or this many files (safety for huge numbers of tiny files)
 function Send-Bundle($s, $bundle, $st, $total) {
   # Send many small files with ONE round-trip instead of one per file. Protocol:
   #   server: "B <count>" then <count> manifest lines "<size> <mtime> <rel>"
   #   client: a want-mask line (one char per file, '1' = send it, '0' = already have / skip)
   #   server: for each wanted file in order: "<len>" + len bytes  (or "-1" if it is locked)
-  # Returns $false if the client disconnected. Bundled files are sent raw (they are tiny).
+  # Returns $false if the client disconnected. Bundled files (<= 1 MB) are sent raw.
   if ($bundle.Count -eq 0) { return $true }
   Write-Line $s ("B {0}" -f $bundle.Count)
   foreach ($b in $bundle) { Write-Line $s ("{0} {1} {2}" -f $b.Size, $b.Mtime, $b.Rel) }
@@ -363,6 +364,7 @@ function Send-Pass($s, $roots, $total, $ignore) {
   Write-Line $s ("T {0}" -f $total)   # tell the client the file count for its own progress
   $script:passStart = Get-Date; $script:lastProg = $script:passStart; $script:lastBytes = [int64]0
   $bundle = New-Object System.Collections.Generic.List[object]
+  $bundleBytes = [int64]0
   foreach ($root in $roots) {
   $base = Split-Path $root -Parent
   if (-not $base) { $base = $root }
@@ -396,11 +398,15 @@ function Send-Pass($s, $roots, $total, $ignore) {
       if ($fi.Length -le $script:SmallFile) {
         # batch small files into a bundle (one round-trip for many)
         [void]$bundle.Add([pscustomobject]@{ Full = $full; Rel = $rel; Size = $fi.Length; Mtime = $fi.LastWriteTimeUtc.Ticks })
-        if ($bundle.Count -ge $script:BundleMax) { if (-not (Send-Bundle $s $bundle $st $total)) { return $st }; $bundle.Clear() }
+        $bundleBytes += $fi.Length
+        # flush once the bundle is ~10 MB (group by SIZE), or hits the file-count safety cap
+        if ($bundleBytes -ge $script:BundleBytes -or $bundle.Count -ge $script:BundleMaxCount) {
+          if (-not (Send-Bundle $s $bundle $st $total)) { return $st }; $bundle.Clear(); $bundleBytes = 0
+        }
         continue
       }
       # a large file: flush any pending bundle first, then offer it on its own
-      if ($bundle.Count -gt 0) { if (-not (Send-Bundle $s $bundle $st $total)) { return $st }; $bundle.Clear() }
+      if ($bundle.Count -gt 0) { if (-not (Send-Bundle $s $bundle $st $total)) { return $st }; $bundle.Clear(); $bundleBytes = 0 }
       Write-Line $s ("F {0} {1} {2}" -f $fi.Length, $fi.LastWriteTimeUtc.Ticks, $rel)
       $st.Offered++
       Show-ServeProgress $st $total
@@ -467,7 +473,7 @@ function Send-Pass($s, $roots, $total, $ignore) {
     }
   }
   }
-  if ($bundle.Count -gt 0) { if (-not (Send-Bundle $s $bundle $st $total)) { return $st }; $bundle.Clear() }
+  if ($bundle.Count -gt 0) { if (-not (Send-Bundle $s $bundle $st $total)) { return $st }; $bundle.Clear(); $bundleBytes = 0 }
   return $st
 }
 

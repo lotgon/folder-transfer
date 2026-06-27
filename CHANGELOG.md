@@ -12,6 +12,15 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.11.2] — 2026-06-27
+
+### Changed
+- **Bundle by size, and bundle bigger files.** Small‑file bundling now batches files up to **1 MB**
+  (was 64 KB) and flushes a bundle once it has accumulated **~10 MB** of files (was a flat
+  1024‑file count), with a 4096‑file safety cap for huge numbers of tiny files. Grouping by size
+  means each round‑trip carries a meaningful chunk of data regardless of individual file sizes.
+  (Bundled files are sent raw; files > 1 MB still go individually and compressed.)
+
 ## [0.11.1] — 2026-06-27
 
 ### Changed
@@ -333,7 +342,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.11.2...HEAD
+[0.11.2]: https://github.com/lotgon/folder-transfer/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/lotgon/folder-transfer/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/lotgon/folder-transfer/compare/v0.10.4...v0.11.0
 [0.10.4]: https://github.com/lotgon/folder-transfer/compare/v0.10.3...v0.10.4

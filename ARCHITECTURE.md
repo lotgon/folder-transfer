@@ -55,11 +55,11 @@ client → SYNC
         ┌─ one pass, server-driven lazy walk of every shared folder: ───────────────┐
 server →   T <count>                         file count, or 0 = unknown (no pre-count; see below)
 server →   D <rel>                           create an EMPTY dir (ignored folders)
-server →   B <n> + n manifest lines          a BUNDLE of small files (<=64 KB):
+server →   B <n> + n manifest lines          a BUNDLE of small files (<=1 MB):
               <size> <mtime> <rel>             ... the manifest
 client →   <want-mask>                          one char per file: '1'=send, '0'=have it
 server →   per wanted file: <len> + bytes       (or "-1" if the file is locked)
-server →   F <size> <mtime> <rel>            a LARGE file (>64 KB), offered on its own
+server →   F <size> <mtime> <rel>            a LARGE file (>1 MB), offered on its own
 client →   0 (fetch) | -1 (skip)
 server →   R <bytes> + raw                      ... raw, or
          | Z + (<clen> <rlen> + bytes)…+ "0 0"  ... deflate, per-1 MB-block chunks, or
@@ -80,9 +80,11 @@ Key points:
   add a silent delay and a second full walk), so the transfer starts at once and memory stays flat
   even for millions of files. `T` therefore carries `0` (total unknown), and progress shows
   running counts + speed without an "x of N" or ETA.
-- **Small files are bundled.** Files ≤ 64 KB are batched (up to 1024 per bundle) and exchanged in
-  **one round‑trip per bundle** instead of one per file: manifest → want‑mask → only the wanted
-  files stream back. Over a high‑latency link this is the difference between minutes and hours.
+- **Small files are bundled.** Files ≤ 1 MB are batched **by size** — a bundle is flushed once it
+  reaches ~10 MB of files (or a 4096‑file safety cap) — and exchanged in **one round‑trip per
+  bundle** instead of one per file: manifest → want‑mask → only the wanted files stream back. Over
+  a high‑latency link this is the difference between minutes and hours. (Bundled files are sent
+  raw; files > 1 MB go individually and are compressed.)
 - **Large files are streamed individually**, optionally **compressed**: each is Deflate‑compressed
   on the fly in constant‑memory 1 MB blocks (`Z`), unless compression is off or the extension is
   already‑compressed (`.zip/.jpg/.mp4/.pdf/…`) in which case it goes raw (`R`). Per‑block framing
@@ -200,7 +202,7 @@ lingering exposure (one‑shot / idle auto‑shutdown + cleanup).
   constant memory. (The only up‑front pass is a cheap count for the progress bar.)
 - **Why bundle small files?** The protocol is one round‑trip per item; over a high‑latency link
   thousands of tiny files are latency‑bound, not bandwidth‑bound. Bundling amortises the round‑trip
-  over up to 1024 files while still preserving the per‑file delta via the want‑mask.
+  over a ~10 MB bundle of files while still preserving the per‑file delta via the want‑mask.
 - **Why compress per‑block, and skip some files?** Per‑block deflate keeps memory constant and lets
   the receiver frame each chunk exactly; already‑compressed types (and tiny files) are sent raw so
   no CPU is wasted where it can't help.
