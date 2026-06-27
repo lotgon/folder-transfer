@@ -12,6 +12,15 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.9.1] — 2026-06-27
+
+### Fixed
+- **Destination path with a trailing backslash broke the client.** Running
+  `ft-download-X.bat t:\bridge\` baked `-ToFolder "t:\bridge\"`, where the `\"` escaped the
+  quote and shifted the remaining arguments — so `-Fingerprint` never reached the client and it
+  failed with *"-Fingerprint is required"*. The generated client now strips trailing backslashes
+  from the destination (keeping a bare drive like `T:` → `T:\`).
+
 ## [0.9.0] — 2026-06-27
 
 ### Added
@@ -245,7 +254,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/lotgon/folder-transfer/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/lotgon/folder-transfer/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/lotgon/folder-transfer/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/lotgon/folder-transfer/compare/v0.8.0...v0.8.1

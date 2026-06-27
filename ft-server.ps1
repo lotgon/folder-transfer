@@ -270,6 +270,11 @@ echo Destination folder not given. Where should the folder be synced to?
 set /p "DEST=Destination [%CD%]: "
 if "%DEST%"=="" set "DEST=%CD%"
 :gotdest
+rem A trailing backslash before the closing quote (e.g. "t:\dir\") escapes the quote and breaks
+rem PowerShell argument parsing, so strip trailing backslashes (keep a bare drive like T: -> T:\).
+:ftstriptrail
+if "%DEST:~-1%"=="\" set "DEST=%DEST:~0,-1%"& goto :ftstriptrail
+if "%DEST:~-1%"==":" set "DEST=%DEST%\"
 echo Downloading from %SERVER%:%PORT% into "%DEST%" ...
 set "PS1=%TEMP%\ftdl_%RANDOM%%RANDOM%.ps1"
 powershell -NoProfile -Command "$c=Get-Content -Raw -LiteralPath '%~f0'; $m='#'+'FTPSBODY#'; [IO.File]::WriteAllText($env:PS1, $c.Substring($c.IndexOf($m)+$m.Length))"
