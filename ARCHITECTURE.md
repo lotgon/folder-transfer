@@ -119,6 +119,42 @@ Key points:
   sends nothing for `-StallTimeout` seconds is aborted (the server keeps listening); the idle
   timeout governs only the wait **between** connections.
 
+### 2.1 Parallel streams (`-Streams n`, default 4)
+
+A single TCP connection is throughput‑bound to ~`window / RTT`; on a high‑latency link that leaves
+most of the bandwidth idle. With `-Streams > 1` the client opens **n connections** and the work is
+spread across them. Per connection the handshake is identical (`AUTH`/`OK`), then the command is
+**`PSYNC`** instead of `SYNC`, and the body is a loop of folder units:
+
+```
+client → PSYNC
+server →   U <leaf>           a folder unit follows (its pass: T/D/B/F … exactly as above)
+server →   …one pass…  PASS-END
+        (repeat U + pass until the queue is empty)
+server →   NOUNIT             no work left → this connection is done
+client → BYE
+```
+
+- **Server side.** A shared `System.Collections.Concurrent.ConcurrentQueue` is seeded with the
+  shared folders. Each accepted connection runs in its own **runspace** (helper functions are
+  injected by prepending their definitions; `param()` is emitted first so arguments bind) and pulls
+  one folder at a time with `TryDequeue` until empty — so connections **self‑balance** without a
+  scheduler. The accept loop runs until the queue is drained and all connection runspaces finish.
+- **Client side.** `n` runspaces each reconnect, send `PSYNC`, and process the units they receive;
+  progress lines funnel back through a concurrent queue to the main thread. A connection that finds
+  the queue already empty (small/fast jobs) closes quietly; if **no** stream connects at all that is
+  a real error.
+- **Unit = whole folder, on purpose.** Sharding by whole folder means one folder is handled
+  end‑to‑end by one connection, so **the existing per‑folder mirror stays exactly correct**
+  (deletes within a folder still propagate). Bundling and adaptive compression are unchanged inside
+  each unit. The cost is that balance is per folder — a single giant folder isn't split (list its
+  subfolders as separate `folders` entries to spread it).
+- **Mirror limitation (parallel only).** Because a connection only ever walks folders that still
+  exist, **a whole top‑level folder deleted on the source has no unit and is therefore not
+  auto‑removed on the receiver.** This is the deliberate trade‑off for the simple, always‑correct
+  per‑folder mirror. Prune with a one‑off `-Streams 1` run (the classic full‑tree walk) or by hand.
+  `-Cutover` forces `-Streams 1`, so it is never affected.
+
 ---
 
 ## 3. Security model
@@ -188,6 +224,9 @@ lingering exposure (one‑shot / idle auto‑shutdown + cleanup).
 - A changed file is re‑fetched whole — no byte‑level resume within one huge file. Over a flaky
   WAN a very large file that drops near the end restarts from zero.
 - Symlinks/junctions inside a shared folder are followed and could escape it.
+- In **parallel mode** (`-Streams > 1`, default) a whole top‑level folder deleted on the source is
+  not auto‑removed on the receiver, and balance is per folder (a single giant folder isn't split).
+  See §2.1; run `-Streams 1` for the classic full‑tree behavior.
 - Token is compared non‑constant‑time (negligible over TLS on a short‑lived server).
 - Verified end‑to‑end on Windows 11 (loopback) and over a real two‑machine WAN link; still a young
   tool — review and test in your environment before production use.

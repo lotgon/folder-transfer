@@ -10,9 +10,9 @@
 
 Pure PowerShell + the .NET that ships with Windows. You point it at one or more folders; it
 serves them over TLS and shuts itself down, leaving the machine exactly as it was. Transfers are
-**compressed on the fly** (skipping already‑compressed files) and **many small files are bundled**
-so they fly over high‑latency links. It generates **one self‑contained file** to carry to the
-receiver.
+**compressed on the fly** (skipping already‑compressed files), **many small files are bundled**,
+and **several connections run in parallel** so transfers fly over high‑latency links. It
+generates **one self‑contained file** to carry to the receiver.
 
 > Status: young but functional; verified end‑to‑end on Windows 11 (loopback) and over a real
 > two‑machine WAN link. Still review and test it in your environment before relying on it — see
@@ -23,6 +23,7 @@ receiver.
 - [Quick start](#quick-start)
 - [Modes](#modes)
 - [Many folders and ignoring](#many-folders-and-ignoring)
+- [Parallel streams](#parallel-streams)
 - [Parameters](#parameters)
 - [Progress and logs](#progress-and-logs)
 - [Security](#security)
@@ -107,6 +108,27 @@ A matched folder's **files** are skipped, but the folder (and its subfolders) is
 **recreated empty** on the receiver — some software won't start without them. Ignored content is
 **never transferred and never deleted** on the receiver.
 
+## Parallel streams
+
+On a fast link with high latency (a long‑distance WAN, VPN, or anything with a big ping), a
+**single** TCP connection can't fill the pipe — throughput is capped at roughly *window ÷
+round‑trip‑time* no matter how much bandwidth you have. Opening several connections multiplies
+that ceiling. folder-transfer uses **4 parallel streams by default** (`-Streams <n>`, or
+`"streams": <n>` in JSON; `1` restores the classic single stream).
+
+How it works: the sender puts every shared folder into a work queue; each connection pulls a
+whole folder at a time until the queue is empty, so the streams self‑balance. Small files are
+still bundled and data is still compressed within each stream.
+
+- **Balance is per shared folder.** A single huge folder is handled by one connection and is
+  *not* split across streams. To parallelize one big tree, list its subfolders as separate
+  `folders` entries (e.g. `Ticks/2023`, `Ticks/2024`, … instead of just `Ticks`).
+- **Mirror caveat (parallel only).** Files removed *inside* a folder are mirror‑deleted on the
+  receiver as usual. But a **whole top‑level folder that you delete on the source is _not_
+  auto‑removed** on the receiver in parallel mode (no stream walks a path that no longer exists).
+  To prune such folders, run once with `-Streams 1`, or delete them by hand. `-Cutover` always
+  uses a single stream, so it is unaffected.
+
 ## Parameters
 
 Two separate programs: the **sender** (`folder-transfer.bat`) which you configure, and the
@@ -121,7 +143,8 @@ case‑insensitive:
 | `<folder>` (positional) | required (or via `-Config`) | Folder to share, read‑only. |
 | `<config.json>` / `-Config <file.json>` | — | JSON config (folders, ignore, options). A `.json` first argument is auto‑detected. |
 | `-Ignore <list>` | none | Ignore name patterns, comma/semicolon separated (`log/,*.tmp`). |
-| `-Cutover` | off | Two‑phase sync for a live DB (implies `-Once`). |
+| `-Streams <n>` | `4` | Parallel connections — big speed‑up on high‑latency links. `1` = classic single stream. See [Parallel streams](#parallel-streams). |
+| `-Cutover` | off | Two‑phase sync for a live DB (implies `-Once`; forces `-Streams 1`). |
 | `-AllowIp <ip>` | any | Serve only this client IP. |
 | `-Once` | off | Close after one successful transfer. |
 | `-IdleSeconds <n>` | `600` | Auto‑close after N s with no client connected. |
@@ -190,6 +213,10 @@ exit. If the port is already open or managed elsewhere, pass `-NoFirewall`.
   a new server instance (by design).
 - **Exclusively‑locked** files are skipped for that pass (logged); files merely open for writing
   (e.g. DB logs) are read fine. Use `-Cutover` for a consistent live‑DB copy.
+- **Parallel mode (`-Streams > 1`, the default)** balances per shared folder, so one giant folder
+  isn't split across streams; and a whole top‑level folder deleted on the source is not
+  auto‑removed on the receiver. See [Parallel streams](#parallel-streams). Run `-Streams 1` for
+  the classic behavior.
 - Symlinks/junctions inside the shared folder are followed — don't share untrusted links.
 
 ## Troubleshooting

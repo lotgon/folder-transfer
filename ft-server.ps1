@@ -14,6 +14,7 @@ param(
   [string]$Config = '',         # JSON config: folders[], ignore[], and any of the options below
   [string]$Ignore = '',         # ignore patterns (comma/semicolon separated), e.g. log/,*.log,mtlog
   [switch]$NoCompress,          # disable on-the-fly compression (it is ON by default)
+  [int]$Streams = 4,            # parallel connections (1 = classic single-stream; >1 = parallel, per-folder)
   [int]$Port = 8722,
   [string]$AllowIp = '',
   [int]$IdleSeconds = 600,
@@ -156,6 +157,7 @@ function Show-ServeHelp {
   Write-Host '  -AllowIp <ip>       allow only this client IP              (default: any)'
   Write-Host '  -ServerHost <addr>  source address baked into the client   (default: auto IPv4)'
   Write-Host '  -Ignore <list>      ignore patterns, comma/semicolon separated (e.g. log/,*.log)'
+  Write-Host '  -Streams <n>        parallel connections, big speed-up on high-latency links (default: 4; 1 = classic)'
   Write-Host '  -Help               this help'
   Write-Host ''
   Write-Host 'Examples:'
@@ -210,6 +212,7 @@ if ($Config) {
   if ($null -ne $cfg.cutover -and -not $PSBoundParameters.ContainsKey('Cutover')) { $Cutover = [bool]$cfg.cutover }
   if ($null -ne $cfg.once -and -not $PSBoundParameters.ContainsKey('Once')) { $Once = [bool]$cfg.once }
   if ($null -ne $cfg.noFirewall -and -not $PSBoundParameters.ContainsKey('NoFirewall')) { $NoFirewall = [bool]$cfg.noFirewall }
+  if ($null -ne $cfg.streams -and -not $PSBoundParameters.ContainsKey('Streams')) { $Streams = [int]$cfg.streams }
   if ($Cutover) { $Once = $true }
 }
 if ($Folder) { $folders += $Folder }                 # positional folder (allowed with or without -Config)
@@ -219,6 +222,9 @@ if ($Ignore) { $ignorePatterns += ($Ignore -split '[;,]') }
 $UseCompress = $true
 if ($Config -and $null -ne $cfg.compress) { $UseCompress = [bool]$cfg.compress }
 if ($NoCompress) { $UseCompress = $false }
+# parallel streams: cutover is inherently single-session, so force 1 there; floor at 1
+if ($Streams -lt 1) { $Streams = 1 }
+if ($Cutover) { $Streams = 1 }
 
 if (@($folders).Count -eq 0) {
   # nothing given (e.g. double-clicked) - ask, the same way the client asks for its destination.
@@ -262,7 +268,7 @@ function Read-Line($s) {
   }
   return [Text.Encoding]::UTF8.GetString($ms.ToArray())
 }
-function Write-ClientBat($OutPath, $Hostt, $Portt, $Tok, $Fpr, $FetchSrc, $IgnoreSpec) {
+function Write-ClientBat($OutPath, $Hostt, $Portt, $Tok, $Fpr, $FetchSrc, $IgnoreSpec, $StreamsN) {
   # Generate a SINGLE self-contained client .bat (the only file you carry to the
   # receiver): a batch header with the baked connection details, then the PLAIN
   # PowerShell client body after a marker. The header writes that body to a temp
@@ -282,6 +288,7 @@ set "PORT=__PORT__"
 set "TOKEN=__TOKEN__"
 set "FP=__FP__"
 set "IGNORE=__IGNORE__"
+set "STREAMS=__STREAMS__"
 set "DEST=%~1"
 if not "%DEST%"=="" goto :gotdest
 echo Destination folder not given. Where should the folder be synced to?
@@ -296,7 +303,7 @@ if "%DEST:~-1%"==":" set "DEST=%DEST%\"
 echo Downloading from %SERVER%:%PORT% into "%DEST%" ...
 set "PS1=%TEMP%\ftdl_%RANDOM%%RANDOM%.ps1"
 powershell -NoProfile -Command "$c=Get-Content -Raw -LiteralPath '%~f0'; $m='#'+'FTPSBODY#'; [IO.File]::WriteAllText($env:PS1, $c.Substring($c.IndexOf($m)+$m.Length))"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Server "%SERVER%" -Port %PORT% -Token "%TOKEN%" -ToFolder "%DEST%" -Fingerprint "%FP%" -Ignore "%IGNORE%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Server "%SERVER%" -Port %PORT% -Token "%TOKEN%" -ToFolder "%DEST%" -Fingerprint "%FP%" -Ignore "%IGNORE%" -Streams %STREAMS%
 set "RC=%errorlevel%"
 del "%PS1%" >nul 2>&1
 if not "%RC%"=="0" ( echo [ERROR] Download failed ^(code %RC%^). Re-run to resume. ) else ( echo [OK] Done -^> %DEST% )
@@ -306,7 +313,7 @@ pause
 endlocal & exit /b %RC%
 #FTPSBODY#
 '@
-  $bat = $tpl.Replace('__HOST__', $Hostt).Replace('__PORT__', [string]$Portt).Replace('__TOKEN__', $Tok).Replace('__FP__', $Fpr).Replace('__IGNORE__', [string]$IgnoreSpec)
+  $bat = $tpl.Replace('__HOST__', $Hostt).Replace('__PORT__', [string]$Portt).Replace('__TOKEN__', $Tok).Replace('__FP__', $Fpr).Replace('__IGNORE__', [string]$IgnoreSpec).Replace('__STREAMS__', [string]$StreamsN)
   $bat = ($bat + "`r`n" + $FetchSrc) -replace "`r?`n", "`r`n"
   Set-Content -LiteralPath $OutPath -Value $bat -Encoding ASCII
 }
@@ -349,6 +356,53 @@ function Send-Bundle($s, $bundle, $st, $total) {
     } finally { $fs.Close() }
   }
   return $true
+}
+
+function Send-LargeFile($s, $fs, $offset, $ext, $st, $total, $useCompress) {
+  # Send one already-opened large file over $s: raw ("R <bytes>") or adaptive per-block
+  # compression ("Z" + chunks). Updates $st (Bytes/Wire/Sent). Shared by single-stream and
+  # parallel paths.
+  $remain = $fs.Length - $offset; if ($remain -lt 0) { $remain = 0 }
+  if ($offset -gt 0) { [void]$fs.Seek($offset, 'Begin') }
+  $zip = $useCompress -and ($remain -ge 256) -and -not (Test-Incompressible $ext)
+  if (-not $zip) {
+    Write-Line $s ("R {0}" -f $remain)
+    $buf = New-Object byte[] 1048576; $left = $remain
+    while ($left -gt 0) {
+      $n = $fs.Read($buf, 0, [Math]::Min($buf.Length, $left))
+      if ($n -le 0) { break }
+      $s.Write($buf, 0, $n); $left -= $n
+      $st.Bytes += $n; Show-ServeProgress $st $total
+    }
+    $st.Wire += $remain
+  }
+  else {
+    # adaptive: try each 1 MB block; "Z <clen> <rlen>" if it shrinks, else "R <rlen>" raw;
+    # after a few poor blocks stop trying for a while, then re-probe. Ended by "E".
+    Write-Line $s 'Z'
+    $buf = New-Object byte[] 1048576
+    $bad = 0; $skip = 0
+    while ($true) {
+      $n = $fs.Read($buf, 0, $buf.Length)
+      if ($n -le 0) { break }
+      $cb = $null
+      if ($skip -le 0) {
+        $cms = New-Object IO.MemoryStream
+        $dz = New-Object IO.Compression.DeflateStream($cms, [IO.Compression.CompressionLevel]::Fastest, $true)
+        $dz.Write($buf, 0, $n); $dz.Close()
+        $cb = $cms.ToArray(); $cms.Dispose()
+        if ($cb.Length -ge ($n * 0.95)) { $cb = $null; $bad++; if ($bad -ge 3) { $skip = 64; $bad = 0 } }
+        else { $bad = 0 }
+      }
+      else { $skip-- }
+      if ($null -ne $cb) { Write-Line $s ("Z {0} {1}" -f $cb.Length, $n); $s.Write($cb, 0, $cb.Length); $st.Wire += $cb.Length }
+      else { Write-Line $s ("R {0}" -f $n); $s.Write($buf, 0, $n); $st.Wire += $n }
+      $st.Bytes += $n; Show-ServeProgress $st $total
+    }
+    Write-Line $s 'E'
+  }
+  $s.Flush()
+  $st.Sent++
 }
 
 function Send-Pass($s, $roots, $total, $ignore) {
@@ -431,67 +485,93 @@ function Send-Pass($s, $roots, $total, $ignore) {
         continue
       }
       try {
-        $remain = $fs.Length - $offset; if ($remain -lt 0) { $remain = 0 }
-        if ($offset -gt 0) { [void]$fs.Seek($offset, 'Begin') }
-        $ext = [IO.Path]::GetExtension($full)
-        $zip = $UseCompress -and ($remain -ge 256) -and -not (Test-Incompressible $ext)
-        if (-not $zip) {
-          # RAW: header "R <bytes>" then the bytes verbatim (current behaviour).
-          Write-Line $s ("R {0}" -f $remain)
-          $buf = New-Object byte[] 1048576; $left = $remain
-          while ($left -gt 0) {
-            $n = $fs.Read($buf, 0, [Math]::Min($buf.Length, $left))
-            if ($n -le 0) { break }
-            $s.Write($buf, 0, $n); $left -= $n
-            $st.Bytes += $n; Show-ServeProgress $st $total
-          }
-          $st.Wire += $remain
-        }
-        else {
-          # ADAPTIVE COMPRESSED: header "Z", then per-1MB-block chunks. Each block is tried;
-          # if it shrinks enough we send "Z <clen> <rlen>" + compressed, else "R <rlen>" + raw.
-          # After a few poor blocks we stop even trying for a while (skip back-off), then probe
-          # again - so we never burn CPU compressing data that doesn't compress. Ended by "E".
-          Write-Line $s 'Z'
-          $buf = New-Object byte[] 1048576
-          $bad = 0; $skip = 0
-          while ($true) {
-            $n = $fs.Read($buf, 0, $buf.Length)
-            if ($n -le 0) { break }
-            $cb = $null
-            if ($skip -le 0) {
-              $cms = New-Object IO.MemoryStream
-              $dz = New-Object IO.Compression.DeflateStream($cms, [IO.Compression.CompressionLevel]::Fastest, $true)
-              $dz.Write($buf, 0, $n); $dz.Close()
-              $cb = $cms.ToArray(); $cms.Dispose()
-              if ($cb.Length -ge ($n * 0.95)) {
-                # poor ratio: send raw and count toward backing off
-                $cb = $null; $bad++
-                if ($bad -ge 3) { $skip = 64; $bad = 0 }   # stop trying for ~64 blocks, then re-probe
-              }
-              else { $bad = 0 }
-            }
-            else { $skip-- }
-            if ($null -ne $cb) {
-              Write-Line $s ("Z {0} {1}" -f $cb.Length, $n)
-              $s.Write($cb, 0, $cb.Length); $st.Wire += $cb.Length
-            }
-            else {
-              Write-Line $s ("R {0}" -f $n)
-              $s.Write($buf, 0, $n); $st.Wire += $n
-            }
-            $st.Bytes += $n; Show-ServeProgress $st $total
-          }
-          Write-Line $s 'E'
-        }
-        $s.Flush()
-        $st.Sent++
+        Send-LargeFile $s $fs $offset ([IO.Path]::GetExtension($full)) $st $total $UseCompress
       } finally { $fs.Close() }
     }
   }
   }
   if ($bundle.Count -gt 0) { if (-not (Send-Bundle $s $bundle $st $total)) { return $st }; $bundle.Clear(); $bundleBytes = 0 }
   return $st
+}
+
+function Invoke-ParallelServe($listener, $cert, $token, $allowIp, $stallTimeout, $useCompress, $ignore, $folders, $idleSeconds, $streams) {
+  # Parallel mode: a shared queue of whole folders; each accepted connection runs in its own
+  # runspace and pulls folders until the queue is empty. One folder is handled entirely by one
+  # connection, so the existing per-folder mirror stays correct. Helper functions are injected
+  # into each runspace by prepending their definitions to the connection script.
+  $queue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+  foreach ($f in $folders) { $queue.Enqueue($f) }
+  $logq = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+  $statq = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+
+  $fnNames = 'Write-Line', 'Read-Line', 'Test-IgnoredRel', 'Convert-GlobToRegex', 'Test-Incompressible', 'Format-Span', 'Send-Bundle', 'Send-LargeFile', 'Send-Pass', 'Show-ServeProgress'
+  $fnText = ''
+  foreach ($n in $fnNames) { $fnText += ("function $n {`r`n" + (Get-Command $n).Definition + "`r`n}`r`n") }
+
+  # NB: param() must be the FIRST statement, so it is prepended (below) ahead of the helper
+  # function text - the handler body here deliberately has no param() block of its own.
+  $handlerParam = 'param($rawClient, $cert, $token, $allowIp, $stallTimeout, $useCompress, $ignore, $queue, $logq, $statq, $smallFile, $bundleBytes, $bundleMaxCount, $incompExt)'
+  $handler = {
+    $script:SmallFile = $smallFile; $script:BundleBytes = $bundleBytes; $script:BundleMaxCount = $bundleMaxCount
+    $script:IncompressibleExt = $incompExt; $script:RxCache = @{}; $UseCompress = $useCompress
+    function Log($m) { $logq.Enqueue(("[serve {0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m)) }
+    $remote = $rawClient.Client.RemoteEndPoint.ToString(); $ip = $rawClient.Client.RemoteEndPoint.Address.ToString()
+    $ssl = $null
+    try {
+      if ($allowIp -and $ip -ne $allowIp) { Log "parallel conn REJECTED from $remote (only $allowIp)"; return }
+      $ssl = New-Object System.Net.Security.SslStream($rawClient.GetStream(), $false)
+      $ssl.AuthenticateAsServer($cert, $false, [System.Security.Authentication.SslProtocols]::Tls12, $false)
+      try { $ssl.ReadTimeout = $stallTimeout * 1000 } catch {}
+      $line = Read-Line $ssl
+      if ($line -notmatch '^AUTH (.*)$' -or ($token -and $matches[1] -ne $token)) { Write-Line $ssl 'ERR auth'; Log "parallel conn BAD AUTH from $remote"; return }
+      Write-Line $ssl 'OK'
+      if ((Read-Line $ssl) -ne 'PSYNC') { Write-Line $ssl 'ERR cmd'; return }
+      Log "parallel conn from $remote (TLS ok)"
+      $sent = 0; $skip = 0; $bytes = [int64]0
+      while ($true) {
+        $f = $null
+        if (-not $queue.TryDequeue([ref]$f)) { Write-Line $ssl 'NOUNIT'; break }
+        $leaf = Split-Path $f -Leaf
+        Write-Line $ssl ("U {0}" -f $leaf)
+        $st = Send-Pass $ssl @($f) 0 $ignore
+        if (-not $st.Ok) { Log "parallel conn $remote dropped during $leaf"; break }
+        Write-Line $ssl 'PASS-END'
+        $sent += $st.Sent; $skip += $st.Skipped; $bytes += $st.Bytes
+        Log ("  {0} [{1}]: sent {2}, unchanged {3}, {4:N0} bytes" -f $leaf, $remote, $st.Sent, $st.Skipped, $st.Bytes)
+      }
+      $statq.Enqueue([pscustomobject]@{ Sent = $sent; Skipped = $skip; Bytes = $bytes })
+    }
+    catch { Log ("parallel conn {0} ABORTED: {1}" -f $remote, $_.Exception.Message) }
+    finally { if ($ssl) { $ssl.Dispose() }; $rawClient.Close() }
+  }
+  $connScript = $handlerParam + "`r`n" + $fnText + "`r`n" + $handler.ToString()
+
+  $running = New-Object System.Collections.ArrayList
+  $idle = 0
+  Log ("PARALLEL: up to {0} streams, {1} folder unit(s) queued" -f $streams, $queue.Count)
+  while ($queue.Count -gt 0 -or $running.Count -gt 0) {
+    $m = $null; while ($logq.TryDequeue([ref]$m)) { Write-Host $m }
+    if ($listener.Pending()) {
+      $c = $listener.AcceptTcpClient(); try { $c.NoDelay = $true } catch {}
+      $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
+      $ps = [powershell]::Create(); $ps.Runspace = $rs
+      [void]$ps.AddScript($connScript).AddArgument($c).AddArgument($cert).AddArgument($token).AddArgument($allowIp).AddArgument($stallTimeout).AddArgument($useCompress).AddArgument($ignore).AddArgument($queue).AddArgument($logq).AddArgument($statq).AddArgument($script:SmallFile).AddArgument($script:BundleBytes).AddArgument($script:BundleMaxCount).AddArgument($script:IncompressibleExt)
+      [void]$running.Add([pscustomobject]@{ ps = $ps; h = $ps.BeginInvoke(); rs = $rs })
+      $idle = 0
+    }
+    else {
+      Start-Sleep -Milliseconds 150; $idle += 150
+      if ($running.Count -eq 0 -and $idle -ge $idleSeconds * 1000) { Write-Host ("[serve] idle timeout ({0}s, no client) - shutting down" -f $idleSeconds); break }
+    }
+    foreach ($r in @($running | Where-Object { $_.h.IsCompleted })) {
+      try { [void]$r.ps.EndInvoke($r.h) } catch { Write-Host "[serve] conn error: $_" }
+      $r.ps.Dispose(); $r.rs.Dispose(); [void]$running.Remove($r)
+    }
+  }
+  foreach ($r in @($running)) { try { [void]$r.ps.EndInvoke($r.h) } catch {}; $r.ps.Dispose(); $r.rs.Dispose() }
+  $m = $null; while ($logq.TryDequeue([ref]$m)) { Write-Host $m }
+  $all = @($statq); $sw = 0; $sk = 0; $by = [int64]0; foreach ($x in $all) { $sw += $x.Sent; $sk += $x.Skipped; $by += $x.Bytes }
+  Write-Host ("[serve] parallel job done - {0} connection(s), sent {1}, unchanged {2}, {3:N0} bytes" -f $all.Count, $sw, $sk, $by)
 }
 
 function Wait-Cutover($s) {
@@ -572,7 +652,7 @@ $fetchPath = Join-Path $PSScriptRoot 'ft-client.ps1'
 # join with ';' and use '/' for the dir-only marker to stay safe inside a .bat argument.
 $ignoreSpec = (($ignorePatterns | ForEach-Object { ($_ -replace '\\', '/') }) -join ';')
 if (Test-Path -LiteralPath $fetchPath) {
-  Write-ClientBat $ClientOut $ServerHost $Port $Token $fp (Get-Content -Raw -LiteralPath $fetchPath) $ignoreSpec
+  Write-ClientBat $ClientOut $ServerHost $Port $Token $fp (Get-Content -Raw -LiteralPath $fetchPath) $ignoreSpec $Streams
   $modeLabel = if ($Cutover) { 'two-phase sync (cutover)' } else { 'single-phase sync' }
   Log "CLIENT WRITTEN ($modeLabel) -> $ClientOut"
   Log "    this is ONE self-contained file - copy just it to the receiver"
@@ -606,6 +686,12 @@ Log ("listening 0.0.0.0:{0}  folders={1}  idle={2}s  once={3}" -f $Port, ($folde
 
 $sessionNum = 0
 try {
+  if ($Streams -gt 1) {
+    Log ("PARALLEL mode ({0} streams). NOTE: a top-level folder removed on the source is NOT auto-deleted" -f $Streams)
+    Log "      on the receiver in parallel mode - run once with -Streams 1 to prune, or delete manually."
+    Invoke-ParallelServe $listener $cert $Token $AllowIp $StallTimeout $UseCompress $ignorePatterns $folders $IdleSeconds $Streams
+    return
+  }
   while ($true) {
     Log ("idle: waiting for a client - will auto-close in {0}s if none connects" -f $IdleSeconds)
     $waited = 0

@@ -11,6 +11,26 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - VSS snapshot serving for zero‑downtime consistent database copies.
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
+- Reconcile vanished top‑level folders in parallel mode (so `-Streams > 1` can prune them too).
+
+## [0.12.0] — 2026-06-28
+
+### Added
+- **Parallel streams (`-Streams <n>`, default 4).** Transfers now use several TCP connections at
+  once, which lifts the single‑connection `window ÷ RTT` throughput ceiling — a large speed‑up on
+  high‑latency links. The sender queues the shared folders and each connection pulls a whole folder
+  at a time (runspace per connection on both sides), so the streams self‑balance. Small‑file
+  bundling and adaptive compression still apply within each stream. Set `-Streams 1` (or
+  `"streams": 1`) for the classic single‑stream behavior; `-Cutover` forces single‑stream.
+
+### Notes / limitations
+- Balance is **per shared folder** — a single giant folder is handled by one connection and is not
+  split across streams. List its subfolders as separate `folders` entries to parallelize one big
+  tree.
+- In parallel mode, a **whole top‑level folder deleted on the source is not auto‑removed** on the
+  receiver (files removed *inside* a folder still are). This keeps the per‑folder mirror simple and
+  always correct; run once with `-Streams 1` to prune vanished folders, or delete them by hand. The
+  server and client print this caveat at startup when `-Streams > 1`.
 
 ## [0.11.3] — 2026-06-27
 

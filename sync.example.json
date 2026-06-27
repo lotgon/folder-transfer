@@ -22,7 +22,11 @@
   ],
 
   "compress": true,            // compress on the fly (already-compressed types are skipped); false to disable
-  "cutover": false,            // true = two-phase mode for a LIVE database (implies once)
+  "streams": 4,                // parallel connections - big speed-up on high-latency links (1 = classic single-stream)
+                               //   balance is per folder above: split a giant folder into subfolders here to spread it.
+                               //   NOTE: with streams > 1, a whole top-level folder deleted on the source is NOT
+                               //   auto-removed on the receiver (run once with streams:1 to prune, or delete by hand).
+  "cutover": false,            // true = two-phase mode for a LIVE database (implies once; forces streams:1)
   "once": true,                // exit after one successful transfer
 
   "allowIp": "",               // only this client IP may connect (empty = any)

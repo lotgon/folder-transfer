@@ -14,6 +14,7 @@ param(
   [string]$ToFolder = '',
   [string]$Fingerprint = '',
   [string]$Ignore = '',          # same ignore patterns as the server (baked in) - so mirror won't delete them
+  [int]$Streams = 1,             # parallel connections (1 = classic; >1 = pull folder-units in parallel)
   [switch]$Help
 )
 $ErrorActionPreference = 'Stop'
@@ -126,6 +127,226 @@ function Test-IgnoredRel([string]$rel, [bool]$isDir, $patterns) {
 }
 
 $script:ExpectedFp = $Fingerprint.Replace(':', '').Replace('-', '').ToLower()
+
+# ---------------------------------------------------------------------------
+# PARALLEL mode (-Streams > 1): open N connections, each pulls whole folders
+# from the server ("U <leaf>" / "NOUNIT") and syncs them. One folder is handled
+# entirely by one connection, so the per-folder mirror below stays correct.
+# NOTE: balance is per shared folder - a single giant folder is not split across
+# streams; list its subfolders as separate "folders" entries to parallelize it.
+# ---------------------------------------------------------------------------
+if ($Streams -gt 1) {
+  $fnNames = 'Write-Line', 'Read-Line', 'Format-Span', 'Convert-GlobToRegex', 'Test-IgnoredRel'
+  $fnText = ''
+  foreach ($n in $fnNames) { $fnText += ("function $n {`r`n" + (Get-Command $n).Definition + "`r`n}`r`n") }
+
+  # NB: param() must be the FIRST statement, so it is prepended (below) ahead of the helper
+  # function text - the worker body here deliberately has no param() block of its own.
+  $workerParam = 'param($cid, $server, $port, $token, $expFp, $toFolder, $rootPrefix, $ignorePatterns, $logq, $statq)'
+  $worker = {
+    $ErrorActionPreference = 'Stop'
+    $script:ExpectedFp = $expFp; $script:RxCache = @{}
+    $script:passStart = Get-Date; $script:lastProg = $script:passStart; $script:lastBytes = [int64]0
+    function Show-FetchProgress($done, $total, $got, $skipped, $bytes) {
+      $now = Get-Date; if (($now - $script:lastProg).TotalSeconds -lt 2) { return }
+      $dt = ($now - $script:lastProg).TotalSeconds
+      $spd = if ($dt -gt 0) { (($bytes - $script:lastBytes) / 1MB) / $dt } else { 0 }
+      $logq.Enqueue(("[s{0}] {1} files - fetched {2}, unchanged {3}, {4:N1} MB @ {5:N1} MB/s" -f $cid, $done, $got, $skipped, ($bytes / 1MB), $spd))
+      $script:lastProg = $now; $script:lastBytes = $bytes
+    }
+    $tcp = [System.Net.Sockets.TcpClient]::new(); try { $tcp.NoDelay = $true } catch {}
+    try { $tcp.Connect($server, $port) }
+    catch [System.Net.Sockets.SocketException] {
+      # The server may have already drained the work queue (and stopped accepting) before this
+      # stream connected - common for small/fast jobs. Benign as long as another stream did the
+      # work; this stream simply records no units. A genuine "server down" shows up as ALL streams
+      # recording zero units (handled by the aggregator below).
+      $logq.Enqueue("[s$cid] no work to claim (server already finished serving) - idle stream")
+      $tcp.Close(); return
+    }
+    $cb = [System.Net.Security.RemoteCertificateValidationCallback] {
+      param($sndr, $crt, $chain, $err)
+      $h = [Security.Cryptography.SHA256]::Create().ComputeHash($crt.GetRawCertData())
+      return ((([BitConverter]::ToString($h)).Replace('-', '').ToLower()) -eq $script:ExpectedFp)
+    }
+    $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, $cb)
+    try {
+      $ssl.AuthenticateAsClient('ft-onetime')
+      Write-Line $ssl ("AUTH " + $token)
+      if ((Read-Line $ssl) -ne 'OK') { throw 'auth failed / rejected by server' }
+      Write-Line $ssl 'PSYNC'
+      $got = 0; $skipped = 0; $bytes = [int64]0; $deleted = 0; $units = 0
+      while ($true) {
+        $u = Read-Line $ssl
+        if ($null -eq $u -or $u -eq 'NOUNIT') { break }
+        if ($u -notmatch '^U (.+)$') { continue }
+        $units++
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+        $mirrorRoots = New-Object 'System.Collections.Generic.HashSet[string]'
+        $script:passStart = Get-Date; $script:lastProg = $script:passStart; $script:lastBytes = $bytes
+        $total = [int64]0; $ok = $true
+        while ($true) {
+          $h = Read-Line $ssl
+          if ($null -eq $h) { $ok = $false; break }
+          if ($h -eq 'PASS-END') { break }
+          if ($h -match '^T (\d+)$') { $total = [int64]$matches[1]; continue }
+          if ($h -match '^D (.+)$') {
+            $drel = $matches[1]
+            $dt = [IO.Path]::GetFullPath((Join-Path $toFolder $drel))
+            if ($dt.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+              if (-not (Test-Path -LiteralPath $dt)) { New-Item -ItemType Directory -Path $dt -Force | Out-Null }
+              $top = ($drel -split '[\\/]')[0]
+              if ($top) { [void]$mirrorRoots.Add([IO.Path]::GetFullPath((Join-Path $toFolder $top))) }
+            }
+            continue
+          }
+          if ($h -match '^B (\d+)$') {
+            $bcount = [int]$matches[1]
+            $bitems = New-Object System.Collections.Generic.List[object]
+            for ($k = 0; $k -lt $bcount; $k++) {
+              $ml = Read-Line $ssl
+              if ($ml -match '^(\d+) (\d+) (.+)$') { $bitems.Add([pscustomobject]@{ Size = [int64]$matches[1]; Mt = [int64]$matches[2]; Rel = $matches[3] }) }
+              else { $bitems.Add($null) }
+            }
+            $sbm = New-Object Text.StringBuilder
+            $btargets = New-Object System.Collections.Generic.List[object]
+            foreach ($it in $bitems) {
+              if ($null -eq $it) { [void]$sbm.Append('0'); $btargets.Add($null); continue }
+              $bt = [IO.Path]::GetFullPath((Join-Path $toFolder $it.Rel))
+              if (-not ($bt.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase))) { [void]$sbm.Append('0'); $btargets.Add($null); continue }
+              $top = ($it.Rel -split '[\\/]')[0]
+              if ($top) { [void]$mirrorRoots.Add([IO.Path]::GetFullPath((Join-Path $toFolder $top))) }
+              [void]$seen.Add($bt.ToLowerInvariant())
+              $need = $true
+              if (Test-Path -LiteralPath $bt) { $li = Get-Item -LiteralPath $bt; if ($li.Length -eq $it.Size -and $li.LastWriteTimeUtc.Ticks -eq $it.Mt) { $need = $false } }
+              if ($need) { [void]$sbm.Append('1'); $btargets.Add($bt) } else { [void]$sbm.Append('0'); $skipped++; $btargets.Add($null) }
+            }
+            Write-Line $ssl $sbm.ToString()
+            for ($k = 0; $k -lt $bcount; $k++) {
+              if ($null -eq $btargets[$k]) { continue }
+              $len = [int64](Read-Line $ssl)
+              if ($len -lt 0) { continue }
+              $bt = $btargets[$k]
+              $bdir = Split-Path $bt -Parent
+              if (-not (Test-Path -LiteralPath $bdir)) { New-Item -ItemType Directory -Path $bdir -Force | Out-Null }
+              $bfs = [IO.File]::Open($bt, [IO.FileMode]::Create, [IO.FileAccess]::Write)
+              try {
+                $buf = New-Object byte[] 65536; $left = $len
+                while ($left -gt 0) {
+                  $n = $ssl.Read($buf, 0, [Math]::Min($buf.Length, $left))
+                  if ($n -le 0) { throw "connection closed early (bundle) on $($bitems[$k].Rel)" }
+                  $bfs.Write($buf, 0, $n); $left -= $n; $bytes += $n
+                }
+              } finally { $bfs.Close() }
+              try { (Get-Item -LiteralPath $bt).LastWriteTimeUtc = [DateTime]::new($bitems[$k].Mt, [DateTimeKind]::Utc) } catch {}
+              $got++
+              Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
+            }
+            continue
+          }
+          if ($h -notmatch '^F (\d+) (\d+) (.+)$') { continue }
+          $size = [int64]$matches[1]; $mt = [int64]$matches[2]; $rel = $matches[3]
+          $target = [IO.Path]::GetFullPath((Join-Path $toFolder $rel))
+          if (-not ($target.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase))) {
+            $logq.Enqueue("[s$cid] skip unsafe path from server: $rel"); Write-Line $ssl '-1'; continue
+          }
+          $top = ($rel -split '[\\/]')[0]
+          if ($top) { [void]$mirrorRoots.Add([IO.Path]::GetFullPath((Join-Path $toFolder $top))) }
+          [void]$seen.Add($target.ToLowerInvariant())
+          Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
+          $need = $true
+          if (Test-Path -LiteralPath $target) {
+            $li = Get-Item -LiteralPath $target
+            if ($li.Length -eq $size -and $li.LastWriteTimeUtc.Ticks -eq $mt) { $need = $false }
+          }
+          if (-not $need) { Write-Line $ssl '-1'; $skipped++; continue }
+          Write-Line $ssl '0'
+          $hdr = Read-Line $ssl
+          if ($hdr -eq '-1') { continue }
+          $dir = Split-Path $target -Parent
+          if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+          $fs = [IO.File]::Open($target, [IO.FileMode]::Create, [IO.FileAccess]::Write)
+          try {
+            if ($hdr -eq 'Z') {
+              while ($true) {
+                $ch = Read-Line $ssl
+                if ($ch -eq 'E') { break }
+                $cp = $ch -split ' '
+                if ($cp[0] -eq 'R') {
+                  $rlen = [int]$cp[1]; $obuf = New-Object byte[] $rlen; $off = 0
+                  while ($off -lt $rlen) { $n = $ssl.Read($obuf, $off, $rlen - $off); if ($n -le 0) { throw "connection closed early (raw chunk) on $rel" }; $off += $n }
+                  $fs.Write($obuf, 0, $off); $bytes += $off
+                }
+                else {
+                  $clen = [int]$cp[1]; $rlen = [int]$cp[2]
+                  $cbuf = New-Object byte[] $clen; $cgot = 0
+                  while ($cgot -lt $clen) { $n = $ssl.Read($cbuf, $cgot, $clen - $cgot); if ($n -le 0) { throw "connection closed early (compressed) on $rel" }; $cgot += $n }
+                  $cms = New-Object IO.MemoryStream(, $cbuf)
+                  $dz = New-Object IO.Compression.DeflateStream($cms, [IO.Compression.CompressionMode]::Decompress)
+                  $obuf = New-Object byte[] $rlen; $off = 0
+                  while ($off -lt $rlen) { $n = $dz.Read($obuf, $off, $rlen - $off); if ($n -le 0) { break }; $off += $n }
+                  $dz.Close(); $cms.Dispose()
+                  $fs.Write($obuf, 0, $off); $bytes += $off
+                }
+                Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
+              }
+            }
+            else {
+              $remain = [int64](($hdr -split ' ')[1])
+              $buf = New-Object byte[] 1048576; $left = $remain
+              while ($left -gt 0) {
+                $n = $ssl.Read($buf, 0, [Math]::Min($buf.Length, $left))
+                if ($n -le 0) { throw "connection closed early on $rel" }
+                $fs.Write($buf, 0, $n); $left -= $n; $bytes += $n
+                Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
+              }
+            }
+          } finally { $fs.Close() }
+          try { (Get-Item -LiteralPath $target).LastWriteTimeUtc = [DateTime]::new($mt, [DateTimeKind]::Utc) } catch {}
+          $got++
+        }
+        if (-not $ok) { $logq.Enqueue("[s$cid] connection dropped - folder left unmirrored"); break }
+        foreach ($mr in $mirrorRoots) {
+          if (-not (Test-Path -LiteralPath $mr)) { continue }
+          foreach ($f in @(Get-ChildItem -LiteralPath $mr -Recurse -File)) {
+            $rel2 = $f.FullName.Substring($rootPrefix.Length)
+            if (Test-IgnoredRel $rel2 $false $ignorePatterns) { continue }
+            if (-not $seen.Contains($f.FullName.ToLowerInvariant())) { Remove-Item -LiteralPath $f.FullName -Force -EA SilentlyContinue; $deleted++ }
+          }
+        }
+      }
+      Write-Line $ssl 'BYE'
+      $statq.Enqueue([pscustomobject]@{ Got = $got; Skipped = $skipped; Bytes = $bytes; Deleted = $deleted; Units = $units })
+    }
+    finally { if ($ssl) { $ssl.Dispose() }; $tcp.Close() }
+  }
+  $connScript = $workerParam + "`r`n" + $fnText + "`r`n" + $worker.ToString()
+
+  Write-Host ("[fetch] sync -> {0}  ({1} parallel streams)" -f $ToFolder, $Streams)
+  $logq = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+  $statq = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+  $runStart = Get-Date
+  $running = @()
+  for ($i = 1; $i -le $Streams; $i++) {
+    $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
+    $ps = [powershell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript($connScript).AddArgument($i).AddArgument($Server).AddArgument($Port).AddArgument($Token).AddArgument($script:ExpectedFp).AddArgument($ToFolder).AddArgument($rootPrefix).AddArgument($ignorePatterns).AddArgument($logq).AddArgument($statq)
+    $running += [pscustomobject]@{ ps = $ps; h = $ps.BeginInvoke(); rs = $rs }
+  }
+  while (@($running | Where-Object { -not $_.h.IsCompleted }).Count -gt 0) {
+    $m = $null; while ($logq.TryDequeue([ref]$m)) { Write-Host $m }
+    Start-Sleep -Milliseconds 200
+  }
+  foreach ($r in $running) { try { [void]$r.ps.EndInvoke($r.h) } catch { Write-Host "[fetch] stream error: $($_.Exception.Message)" }; $r.ps.Dispose(); $r.rs.Dispose() }
+  $m = $null; while ($logq.TryDequeue([ref]$m)) { Write-Host $m }
+  $all = @($statq)
+  if ($all.Count -eq 0) { throw "could not connect to server $Server`:$Port (no stream reached it)" }
+  $g = 0; $sk = 0; $d = 0; $b = [int64]0; $u = 0
+  foreach ($x in $all) { $g += $x.Got; $sk += $x.Skipped; $d += $x.Deleted; $b += $x.Bytes; $u += $x.Units }
+  $secs = ((Get-Date) - $runStart).TotalSeconds; $avg = if ($secs -gt 0) { ($b / 1MB) / $secs } else { 0 }
+  Write-Host ("[fetch] sync done. streams={0} folders={1} fetched={2} unchanged={3} deleted={4} bytes={5:N0} in {6} @ {7:N1} MB/s avg" -f $Streams, $u, $g, $sk, $d, $b, (Format-Span $secs), $avg)
+  return
+}
 
 $tcp = [System.Net.Sockets.TcpClient]::new()
 try { $tcp.NoDelay = $true } catch {}   # disable Nagle - huge win for many small files over WAN
