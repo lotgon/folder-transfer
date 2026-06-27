@@ -141,21 +141,46 @@ try {
       }
       if (-not $need) { Write-Line $stream '-1'; $skipped++; continue }
       Write-Line $stream '0'                       # changed/new -> full fetch (overwrite)
-      $remain = [int64](Read-Line $stream)
-      if ($remain -lt 0) { continue }
+      $hdr = Read-Line $stream
+      if ($hdr -eq '-1') { continue }              # server can't provide it (locked) -> keep our copy
       $dir = Split-Path $target -Parent
       if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
       $fs = [IO.File]::Open($target, [IO.FileMode]::Create, [IO.FileAccess]::Write)
       try {
-        $buf = New-Object byte[] 1048576; $left = $remain
-        while ($left -gt 0) {
-          $n = $stream.Read($buf, 0, [Math]::Min($buf.Length, $left))
-          if ($n -le 0) { throw "connection closed early on $rel" }
-          $fs.Write($buf, 0, $n); $left -= $n
+        if ($hdr -eq 'Z') {
+          # compressed: deflate chunks "<clen> <rlen>" + clen bytes, ended by "0 0"
+          while ($true) {
+            $cinfo = (Read-Line $stream) -split ' '
+            $clen = [int]$cinfo[0]; $rlen = [int]$cinfo[1]
+            if ($clen -le 0) { break }
+            $cbuf = New-Object byte[] $clen; $cgot = 0
+            while ($cgot -lt $clen) {
+              $n = $stream.Read($cbuf, $cgot, $clen - $cgot)
+              if ($n -le 0) { throw "connection closed early (compressed) on $rel" }
+              $cgot += $n
+            }
+            $cms = New-Object IO.MemoryStream(, $cbuf)
+            $dz = New-Object IO.Compression.DeflateStream($cms, [IO.Compression.CompressionMode]::Decompress)
+            $obuf = New-Object byte[] $rlen; $off = 0
+            while ($off -lt $rlen) { $n = $dz.Read($obuf, $off, $rlen - $off); if ($n -le 0) { break }; $off += $n }
+            $dz.Close(); $cms.Dispose()
+            $fs.Write($obuf, 0, $off); $bytes += $off
+          }
+        }
+        else {
+          # raw: header "R <bytes>"
+          $remain = [int64](($hdr -split ' ')[1])
+          $buf = New-Object byte[] 1048576; $left = $remain
+          while ($left -gt 0) {
+            $n = $stream.Read($buf, 0, [Math]::Min($buf.Length, $left))
+            if ($n -le 0) { throw "connection closed early on $rel" }
+            $fs.Write($buf, 0, $n); $left -= $n
+          }
+          $bytes += $remain
         }
       } finally { $fs.Close() }
       try { (Get-Item -LiteralPath $target).LastWriteTimeUtc = [DateTime]::new($mt, [DateTimeKind]::Utc) } catch {}
-      $bytes += $remain; $got++
+      $got++
     }
     if (-not $more) { break }
     $dir2 = $null

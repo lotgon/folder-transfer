@@ -12,6 +12,17 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.7.0] — 2026-06-27
+
+### Added
+- **On-the-fly streaming compression, on by default.** File payloads are now Deflate-compressed
+  as they stream, in constant-memory 1 MB blocks (no whole-file buffering). It is **smart**:
+  already-compressed/encrypted types (`.zip .7z .gz .jpg .png .mp4 .pdf .docx …`) and tiny
+  files are sent raw, so no CPU is wasted where it wouldn't help. The server reports the saving,
+  e.g. `pass 1 done … 24,785,734 bytes (3,306,207 on wire, 87% saved by compression)`.
+  Turn it off with **`-NoCompress`** or JSON `"compress": false`. Purely server-driven and
+  per-file (each transfer is tagged raw/compressed), so the receiver needs no extra setup.
+
 ## [0.6.0] — 2026-06-18
 
 ### Added
@@ -183,7 +194,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/lotgon/folder-transfer/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/lotgon/folder-transfer/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/lotgon/folder-transfer/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/lotgon/folder-transfer/compare/v0.4.1...v0.5.0

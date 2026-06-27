@@ -9,8 +9,9 @@
 — no service, no trace, with a two‑phase cutover mode for live databases.**
 
 Pure PowerShell + the .NET that ships with Windows. You point it at a folder; it serves that
-folder over TLS and shuts itself down, leaving the machine exactly as it was. It generates
-**one self‑contained file** to carry to the receiver.
+folder over TLS and shuts itself down, leaving the machine exactly as it was. Transfers are
+**compressed on the fly** (smartly skipping already‑compressed files). It generates **one
+self‑contained file** to carry to the receiver.
 
 > Status: early but functional; verified end‑to‑end on Windows 11. Do one real two‑machine
 > run before relying on it — see [Limitations](#limitations).
@@ -71,14 +72,15 @@ files) — put everything in a **JSON config** and run `folder-transfer.bat -Con
   "folders": ["H:/FTHistory/Quote/Bars", "H:/FTHistory/Quote/Ticks"],
   "ignore":  ["log/", "*.tmp", "mtlog"],
   "once": true,
-  "allowIp": "10.0.0.7"
+  "allowIp": "10.0.0.7",
+  "compress": true
 }
 ```
 
 - `folders` — each is shared and arrives under its own name (`<dest>\Bars\…`, `<dest>\Ticks\…`).
   Use forward slashes (or escaped `\\`).
 - `ignore` — name patterns; the rest of the keys are the same options as the command line
-  (command‑line options override the JSON).
+  (command‑line options override the JSON). `"compress": false` turns off compression.
 - You can also ignore from the command line: `-Ignore log/,*.tmp,mtlog`.
 
 **Ignore pattern rules** (like `.gitignore`, matched by name at any depth):
@@ -115,6 +117,7 @@ case‑insensitive:
 | `-ServerHost <addr>` | auto IPv4 | Address baked into the generated client. |
 | `-ClientOut <path>` | `.\download-scripts\…` | Where to write the generated client. |
 | `-NoFirewall` | off | Don't touch the firewall (opening it otherwise needs admin). |
+| `-NoCompress` | off | Disable streaming compression (it is **on by default**). |
 | `-Help` | — | Show help. |
 
 **Receiver** — one optional argument:

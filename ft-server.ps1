@@ -13,6 +13,7 @@ param(
   [Parameter(Position = 0)] [string]$Folder = '',   # positional: folder-transfer.bat <folder> ...
   [string]$Config = '',         # JSON config: folders[], ignore[], and any of the options below
   [string]$Ignore = '',         # ignore patterns (comma/semicolon separated), e.g. log/,*.log,mtlog
+  [switch]$NoCompress,          # disable on-the-fly compression (it is ON by default)
   [int]$Port = 8722,
   [string]$AllowIp = '',
   [int]$IdleSeconds = 600,
@@ -45,6 +46,22 @@ function Test-Ignored([string]$name, [bool]$isDir, $patterns) {
   }
   return $false
 }
+# Already-compressed / encrypted formats - deflating them again just burns CPU.
+$script:IncompressibleExt = @(
+  '.zip', '.7z', '.gz', '.tgz', '.rar', '.bz2', '.xz', '.zst', '.lz4', '.br', '.cab', '.msi',
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.heic', '.tif', '.tiff',
+  '.mp4', '.mkv', '.mov', '.avi', '.wmv', '.webm', '.mp3', '.aac', '.ogg', '.flac', '.m4a',
+  '.pdf', '.docx', '.xlsx', '.pptx', '.odt', '.ods', '.jar', '.apk', '.iso'
+)
+function Test-Incompressible($ext) {
+  if (-not $ext) { return $false }
+  return $script:IncompressibleExt -contains $ext.ToLowerInvariant()
+}
+function Format-Saved($bytes, $wire) {
+  # suffix for the pass summary; empty unless compression actually helped
+  if ($bytes -le 0 -or $wire -le 0 -or $wire -ge $bytes) { return '' }
+  return (" ({0:N0} on wire, {1:N0}% saved by compression)" -f $wire, (100 - 100.0 * $wire / $bytes))
+}
 
 function Show-ServeHelp {
   Write-Host ''
@@ -62,6 +79,8 @@ function Show-ServeHelp {
   Write-Host '  -Config <path>      JSON with folders[], ignore[], and any of the options below'
   Write-Host '  -Ignore <list>      ignore name patterns, comma/semicolon separated (e.g. log/,*.log,mtlog)'
   Write-Host '                      a trailing / means directory-only; wildcards * and ? are allowed'
+  Write-Host '  -NoCompress         disable on-the-fly compression (ON by default; already-compressed'
+  Write-Host '                      file types like .zip/.jpg/.mp4 are skipped automatically)'
   Write-Host '  -ServerHost <addr>  source address baked into the client   (default: auto IPv4)'
   Write-Host '  -Port <n>           TCP port                               (default: 8722)'
   Write-Host '  -AllowIp <ip>       allow only this client IP              (default: any)'
@@ -112,6 +131,11 @@ if ($Config) {
 if ($Folder) { $folders += $Folder }                 # positional folder (allowed with or without -Config)
 if ($Ignore) { $ignorePatterns += ($Ignore -split '[;,]') }
 
+# compression is ON by default; JSON "compress": false or -NoCompress turns it off (CLI wins)
+$UseCompress = $true
+if ($Config -and $null -ne $cfg.compress) { $UseCompress = [bool]$cfg.compress }
+if ($NoCompress) { $UseCompress = $false }
+
 if (@($folders).Count -eq 0) {
   # nothing given (e.g. double-clicked) - ask, the same way the client asks for its destination.
   Write-Host ''
@@ -139,6 +163,7 @@ foreach ($f in $folders) {
 }
 $folders = @($resolved)
 if ($ignorePatterns.Count) { Log ("ignore patterns: {0}" -f ($ignorePatterns -join ', ')) }
+Log ("compression: {0}" -f $(if ($UseCompress) { 'on (skips already-compressed file types)' } else { 'off' }))
 
 function Write-Line($s, [string]$t) { $b = [Text.Encoding]::UTF8.GetBytes($t + "`n"); $s.Write($b, 0, $b.Length); $s.Flush() }
 function Read-Line($s) {
@@ -224,7 +249,7 @@ function Send-Pass($s, $roots, $total, $ignore) {
   # ignore pattern are skipped (a matched directory is pruned whole). Returns a
   # stats object; .Ok is $false if the client disconnected mid-pass. The client
   # never sends a path -> no traversal / reserved device names by construction.
-  $st = [pscustomobject]@{ Ok = $true; Offered = 0; Sent = 0; Skipped = 0; Bytes = [int64]0 }
+  $st = [pscustomobject]@{ Ok = $true; Offered = 0; Sent = 0; Skipped = 0; Bytes = [int64]0; Wire = [int64]0 }
   Write-Line $s ("T {0}" -f $total)   # tell the client the file count for its own progress
   $passStart = Get-Date; $lastProg = $passStart; $lastBytes = [int64]0
   foreach ($root in $roots) {
@@ -282,13 +307,38 @@ function Send-Pass($s, $roots, $total, $ignore) {
       }
       try {
         $remain = $fs.Length - $offset; if ($remain -lt 0) { $remain = 0 }
-        Write-Line $s ([string]$remain)
         if ($offset -gt 0) { [void]$fs.Seek($offset, 'Begin') }
-        $buf = New-Object byte[] 1048576; $left = $remain
-        while ($left -gt 0) {
-          $n = $fs.Read($buf, 0, [Math]::Min($buf.Length, $left))
-          if ($n -le 0) { break }
-          $s.Write($buf, 0, $n); $left -= $n
+        $ext = [IO.Path]::GetExtension($full)
+        $zip = $UseCompress -and ($remain -ge 256) -and -not (Test-Incompressible $ext)
+        if (-not $zip) {
+          # RAW: header "R <bytes>" then the bytes verbatim (current behaviour).
+          Write-Line $s ("R {0}" -f $remain)
+          $buf = New-Object byte[] 1048576; $left = $remain
+          while ($left -gt 0) {
+            $n = $fs.Read($buf, 0, [Math]::Min($buf.Length, $left))
+            if ($n -le 0) { break }
+            $s.Write($buf, 0, $n); $left -= $n
+          }
+          $st.Wire += $remain
+        }
+        else {
+          # COMPRESSED: header "Z", then deflate-per-block chunks "<clen> <rlen>" + clen
+          # bytes, ended by "0 0". Per-block keeps memory constant and lets the client
+          # know each chunk's exact size (no over-read of the shared TLS stream).
+          Write-Line $s 'Z'
+          $buf = New-Object byte[] 1048576
+          while ($true) {
+            $n = $fs.Read($buf, 0, $buf.Length)
+            if ($n -le 0) { break }
+            $cms = New-Object IO.MemoryStream
+            $dz = New-Object IO.Compression.DeflateStream($cms, [IO.Compression.CompressionLevel]::Fastest, $true)
+            $dz.Write($buf, 0, $n); $dz.Close()
+            $cb = $cms.ToArray(); $cms.Dispose()
+            Write-Line $s ("{0} {1}" -f $cb.Length, $n)
+            $s.Write($cb, 0, $cb.Length)
+            $st.Wire += $cb.Length
+          }
+          Write-Line $s '0 0'
         }
         $s.Flush()
         $st.Sent++; $st.Bytes += $remain
@@ -450,7 +500,7 @@ try {
           $p1 = Send-Pass $stream $folders $tot1 $ignorePatterns
           if (-not $p1.Ok) { Log ("session #{0}: client dropped during pass 1" -f $sessionNum); break }
           Write-Line $stream 'PASS-END'
-          Log ("session #{0}: pass 1 done - changed/new {1}, unchanged {2}, {3:N0} bytes" -f $sessionNum, $p1.Sent, $p1.Skipped, $p1.Bytes)
+          Log ("session #{0}: pass 1 done - changed/new {1}, unchanged {2}, {3:N0} bytes{4}" -f $sessionNum, $p1.Sent, $p1.Skipped, $p1.Bytes, (Format-Saved $p1.Bytes $p1.Wire))
           if ($Cutover) {
             Log ("session #{0}: cutover - WAITING for you to stop the database and signal (keypress or ft-cutover.go)" -f $sessionNum)
             Wait-Cutover $stream
@@ -461,7 +511,7 @@ try {
             $p2 = Send-Pass $stream $folders $tot2 $ignorePatterns
             if (-not $p2.Ok) { Log ("session #{0}: client dropped during pass 2" -f $sessionNum); break }
             Write-Line $stream 'PASS-END'
-            Log ("session #{0}: pass 2 done - changed/new {1}, unchanged {2}, {3:N0} bytes" -f $sessionNum, $p2.Sent, $p2.Skipped, $p2.Bytes)
+            Log ("session #{0}: pass 2 done - changed/new {1}, unchanged {2}, {3:N0} bytes{4}" -f $sessionNum, $p2.Sent, $p2.Skipped, $p2.Bytes, (Format-Saved $p2.Bytes $p2.Wire))
           }
           Write-Line $stream 'DONE'
         }
