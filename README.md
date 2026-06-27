@@ -70,7 +70,7 @@ A ready‑to‑edit **`sync.example.json`** ships alongside the scripts — copy
 
 ```json
 {
-  "folders": ["H:/FTHistory/Quote/Bars", "H:/FTHistory/Quote/Ticks"],
+  "folders": ["H:\\FTHistory\\Quote\\Bars", "H:\\FTHistory\\Quote\\Ticks"],
   "ignore":  ["log/", "*.tmp", "mtlog"],
   "once": true,
   "allowIp": "10.0.0.7",
@@ -79,7 +79,7 @@ A ready‑to‑edit **`sync.example.json`** ships alongside the scripts — copy
 ```
 
 - `folders` — each is shared and arrives under its own name (`<dest>\Bars\…`, `<dest>\Ticks\…`).
-  Use forward slashes (or escaped `\\`).
+  In JSON, double the backslashes (`C:\\path`) — or use forward slashes; both work on Windows.
 - `ignore` — name patterns; the rest of the keys are the same options as the command line
   (command‑line options override the JSON). `"compress": false` turns off compression.
 - You can also ignore from the command line: `-Ignore log/,*.tmp,mtlog`.
