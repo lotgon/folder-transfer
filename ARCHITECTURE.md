@@ -62,7 +62,8 @@ server →   per wanted file: <len> + bytes       (or "-1" if the file is locked
 server →   F <size> <mtime> <rel>            a LARGE file (>1 MB), offered on its own
 client →   0 (fetch) | -1 (skip)
 server →   R <bytes> + raw                      ... raw, or
-         | Z + (<clen> <rlen> + bytes)…+ "0 0"  ... deflate, per-1 MB-block chunks, or
+         | Z + per-block + "E"                   ... adaptive: each 1 MB block is
+         |     ("Z <clen> <rlen>" | "R <rlen>")      sent compressed or raw, or
          | -1                                    ... locked: keep your copy
 server → PASS-END                            └──────────────────────────────────────┘
         ── if -Cutover: server sends PING keepalives while it waits ──
@@ -85,10 +86,13 @@ Key points:
   bundle** instead of one per file: manifest → want‑mask → only the wanted files stream back. Over
   a high‑latency link this is the difference between minutes and hours. (Bundled files are sent
   raw; files > 1 MB go individually and are compressed.)
-- **Large files are streamed individually**, optionally **compressed**: each is Deflate‑compressed
-  on the fly in constant‑memory 1 MB blocks (`Z`), unless compression is off or the extension is
-  already‑compressed (`.zip/.jpg/.mp4/.pdf/…`) in which case it goes raw (`R`). Per‑block framing
-  means the client knows each chunk's exact size and never over‑reads the shared stream.
+- **Large files are streamed individually with adaptive compression.** Each 1 MB block is tried;
+  if it shrinks ≥ 5 % it's sent compressed (`Z <clen> <rlen>`), otherwise raw (`R <rlen>`), and
+  after a few poor blocks the server stops trying for a while (then re‑probes) — so CPU isn't
+  wasted on data that won't compress and incompressible data is never expanded on the wire. Known
+  already‑compressed extensions (`.zip/.jpg/.mp4/.pdf/…`), or `-NoCompress`, skip it entirely
+  (whole‑file `R <bytes>`). Per‑block framing means the client knows each chunk's exact size and
+  never over‑reads the shared stream.
 - **Change detection** is by **size + last‑write‑time (UTC ticks)**, no content hashing. Missing
   / different size / different mtime → fetch; identical → skip. After writing, the client sets the
   file's mtime to the source's so the next sync compares correctly. A changed file is fetched

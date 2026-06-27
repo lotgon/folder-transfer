@@ -12,6 +12,16 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.11.3] — 2026-06-27
+
+### Changed
+- **Adaptive compression — try, and back off when it doesn't help.** For large files the per‑block
+  compressor now measures each 1 MB block: if it doesn't shrink (≥ 5 %) the block is sent raw, and
+  after a few poor blocks the server stops compressing for a while before probing again. So no CPU
+  is wasted compressing data that doesn't compress (e.g. an unknown but already‑compressed format),
+  and incompressible data is never expanded on the wire. Known already‑compressed extensions still
+  skip compression up front.
+
 ## [0.11.2] — 2026-06-27
 
 ### Changed
@@ -342,7 +352,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.11.2...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.11.3...HEAD
+[0.11.3]: https://github.com/lotgon/folder-transfer/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/lotgon/folder-transfer/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/lotgon/folder-transfer/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/lotgon/folder-transfer/compare/v0.10.4...v0.11.0

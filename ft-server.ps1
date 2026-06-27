@@ -448,24 +448,41 @@ function Send-Pass($s, $roots, $total, $ignore) {
           $st.Wire += $remain
         }
         else {
-          # COMPRESSED: header "Z", then deflate-per-block chunks "<clen> <rlen>" + clen
-          # bytes, ended by "0 0". Per-block keeps memory constant and lets the client
-          # know each chunk's exact size (no over-read of the shared TLS stream).
+          # ADAPTIVE COMPRESSED: header "Z", then per-1MB-block chunks. Each block is tried;
+          # if it shrinks enough we send "Z <clen> <rlen>" + compressed, else "R <rlen>" + raw.
+          # After a few poor blocks we stop even trying for a while (skip back-off), then probe
+          # again - so we never burn CPU compressing data that doesn't compress. Ended by "E".
           Write-Line $s 'Z'
           $buf = New-Object byte[] 1048576
+          $bad = 0; $skip = 0
           while ($true) {
             $n = $fs.Read($buf, 0, $buf.Length)
             if ($n -le 0) { break }
-            $cms = New-Object IO.MemoryStream
-            $dz = New-Object IO.Compression.DeflateStream($cms, [IO.Compression.CompressionLevel]::Fastest, $true)
-            $dz.Write($buf, 0, $n); $dz.Close()
-            $cb = $cms.ToArray(); $cms.Dispose()
-            Write-Line $s ("{0} {1}" -f $cb.Length, $n)
-            $s.Write($cb, 0, $cb.Length)
-            $st.Wire += $cb.Length
+            $cb = $null
+            if ($skip -le 0) {
+              $cms = New-Object IO.MemoryStream
+              $dz = New-Object IO.Compression.DeflateStream($cms, [IO.Compression.CompressionLevel]::Fastest, $true)
+              $dz.Write($buf, 0, $n); $dz.Close()
+              $cb = $cms.ToArray(); $cms.Dispose()
+              if ($cb.Length -ge ($n * 0.95)) {
+                # poor ratio: send raw and count toward backing off
+                $cb = $null; $bad++
+                if ($bad -ge 3) { $skip = 64; $bad = 0 }   # stop trying for ~64 blocks, then re-probe
+              }
+              else { $bad = 0 }
+            }
+            else { $skip-- }
+            if ($null -ne $cb) {
+              Write-Line $s ("Z {0} {1}" -f $cb.Length, $n)
+              $s.Write($cb, 0, $cb.Length); $st.Wire += $cb.Length
+            }
+            else {
+              Write-Line $s ("R {0}" -f $n)
+              $s.Write($buf, 0, $n); $st.Wire += $n
+            }
             $st.Bytes += $n; Show-ServeProgress $st $total
           }
-          Write-Line $s '0 0'
+          Write-Line $s 'E'
         }
         $s.Flush()
         $st.Sent++
