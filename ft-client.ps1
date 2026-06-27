@@ -63,11 +63,16 @@ function Show-FetchProgress($done, $total, $got, $skipped, $bytes) {
   if (($nowt - $script:lastProg).TotalSeconds -lt 2) { return }
   $dt = ($nowt - $script:lastProg).TotalSeconds
   $spd = if ($dt -gt 0) { (($bytes - $script:lastBytes) / 1MB) / $dt } else { 0 }
-  $el = ($nowt - $script:passStart).TotalSeconds
-  $rate = if ($el -gt 0) { $done / $el } else { 0 }
-  $left = $total - $done; if ($left -lt 0) { $left = 0 }
-  $eta = if ($rate -gt 0) { Format-Span ($left / $rate) } else { '?' }
-  Write-Host ("[fetch] progress: {0}/{1} ({2} left) - fetched {3}, unchanged {4}, {5:N1} MB @ {6:N1} MB/s, ETA {7}" -f $done, $total, $left, $got, $skipped, ($bytes / 1MB), $spd, $eta)
+  if ($total -gt 0) {
+    $el = ($nowt - $script:passStart).TotalSeconds
+    $rate = if ($el -gt 0) { $done / $el } else { 0 }
+    $left = $total - $done; if ($left -lt 0) { $left = 0 }
+    $eta = if ($rate -gt 0) { Format-Span ($left / $rate) } else { '?' }
+    Write-Host ("[fetch] progress: {0}/{1} ({2} left) - fetched {3}, unchanged {4}, {5:N1} MB @ {6:N1} MB/s, ETA {7}" -f $done, $total, $left, $got, $skipped, ($bytes / 1MB), $spd, $eta)
+  }
+  else {
+    Write-Host ("[fetch] progress: {0} files - fetched {1}, unchanged {2}, {3:N1} MB @ {4:N1} MB/s" -f $done, $got, $skipped, ($bytes / 1MB), $spd)
+  }
   $script:lastProg = $nowt; $script:lastBytes = $bytes
 }
 $script:RxCache = @{}

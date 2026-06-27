@@ -141,17 +141,19 @@ case‑insensitive:
 
 ## Progress and logs
 
-During a pass both sides print a throttled line (~every 2 s) with files done / left, fetched
-vs unchanged, data moved, speed and an ETA:
+During a pass both sides print a throttled line (~every 2 s) with how many files are done,
+fetched vs unchanged, data moved and speed — updated even mid‑file, so a large file never looks
+frozen:
 
 ```
-[serve …]   progress: 8120/19846 files (11726 left) - sent 312, unchanged 7808, 1,604.0 MB @ 215.0 MB/s, ETA 00:00:18
-[fetch] progress: 8120/19846 (11726 left) - fetched 312, unchanged 7808, 1,604.0 MB @ 215.0 MB/s, ETA 00:00:18
+[serve …]   progress: 8120 files - sent 312, unchanged 7808, 1,604.0 MB @ 215.0 MB/s
+[fetch] progress: 8120 files - fetched 312, unchanged 7808, 1,604.0 MB @ 215.0 MB/s
 ```
 
-The server also logs the client `IP:port`, each pass's file/byte counts, and how the session
-ended. Speed is the last‑interval rate; ETA is estimated from the file rate (a guide, not a
-guarantee).
+There is **no up‑front file count**, so the transfer starts immediately instead of pausing to
+scan the whole tree first (the progress line therefore shows what's done so far, not "x of N" or
+an ETA). The server also logs the client `IP:port`, each pass's file/byte counts, and how the
+session ended.
 
 ## Security
 

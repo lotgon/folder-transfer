@@ -53,7 +53,7 @@ client → AUTH <token>
 server → OK                                 (or "ERR auth" and disconnect)
 client → SYNC
         ┌─ one pass, server-driven lazy walk of every shared folder: ───────────────┐
-server →   T <count>                         file count for this pass (progress only)
+server →   T <count>                         file count, or 0 = unknown (no pre-count; see below)
 server →   D <rel>                           create an EMPTY dir (ignored folders)
 server →   B <n> + n manifest lines          a BUNDLE of small files (<=64 KB):
               <size> <mtime> <rel>             ... the manifest
@@ -74,10 +74,12 @@ client → BYE
 
 Key points:
 
-- **Lazy, server‑driven walk, constant memory.** The server walks each folder with an explicit
-  stack and `[IO.Directory]::EnumerateFiles/EnumerateDirectories` (lazy), emitting work as it
-  goes. Nothing is enumerated up front, so memory stays flat even for millions of files. (`T
-  <count>` is a cheap count‑only pre‑walk just for the progress total.)
+- **Lazy, server‑driven walk, constant memory, immediate start.** The server walks each folder
+  with an explicit stack and `[IO.Directory]::EnumerateFiles/EnumerateDirectories` (lazy),
+  emitting work as it goes. Nothing is enumerated up front (no whole‑tree pre‑count — that would
+  add a silent delay and a second full walk), so the transfer starts at once and memory stays flat
+  even for millions of files. `T` therefore carries `0` (total unknown), and progress shows
+  running counts + speed without an "x of N" or ETA.
 - **Small files are bundled.** Files ≤ 64 KB are batched (up to 256 per bundle) and exchanged in
   **one round‑trip per bundle** instead of one per file: manifest → want‑mask → only the wanted
   files stream back. Over a high‑latency link this is the difference between minutes and hours.

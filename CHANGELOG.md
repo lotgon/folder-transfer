@@ -12,6 +12,16 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.11.0] — 2026-06-27
+
+### Changed
+- **No up‑front file count — the transfer starts immediately.** Previously the server walked the
+  whole tree once before sending, to compute the "x of N" total for the ETA; on a big tree or a
+  slow disk that was a silent pause before anything happened, plus a second full enumeration. That
+  pre‑walk is gone: sending begins at once and the progress line now shows files done, data moved
+  and speed (no "of N" / ETA). Net: faster start and no duplicate walk. Progress still updates
+  mid‑file so large files don't look frozen.
+
 ## [0.10.4] — 2026-06-27
 
 ### Changed
@@ -316,7 +326,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.10.4...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/lotgon/folder-transfer/compare/v0.10.4...v0.11.0
 [0.10.4]: https://github.com/lotgon/folder-transfer/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/lotgon/folder-transfer/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/lotgon/folder-transfer/compare/v0.10.1...v0.10.2

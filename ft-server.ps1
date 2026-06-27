@@ -40,11 +40,16 @@ function Show-ServeProgress($st, $total) {
   if (($nowt - $script:lastProg).TotalSeconds -lt 2) { return }
   $dt = ($nowt - $script:lastProg).TotalSeconds
   $spd = if ($dt -gt 0) { (($st.Bytes - $script:lastBytes) / 1MB) / $dt } else { 0 }
-  $el = ($nowt - $script:passStart).TotalSeconds
-  $rate = if ($el -gt 0) { $st.Offered / $el } else { 0 }
-  $left = $total - $st.Offered; if ($left -lt 0) { $left = 0 }
-  $eta = if ($rate -gt 0) { Format-Span ($left / $rate) } else { '?' }
-  Log ("  progress: {0}/{1} files ({2} left) - sent {3}, unchanged {4}, {5:N1} MB @ {6:N1} MB/s, ETA {7}" -f $st.Offered, $total, $left, $st.Sent, $st.Skipped, ($st.Bytes / 1MB), $spd, $eta)
+  if ($total -gt 0) {
+    $el = ($nowt - $script:passStart).TotalSeconds
+    $rate = if ($el -gt 0) { $st.Offered / $el } else { 0 }
+    $left = $total - $st.Offered; if ($left -lt 0) { $left = 0 }
+    $eta = if ($rate -gt 0) { Format-Span ($left / $rate) } else { '?' }
+    Log ("  progress: {0}/{1} files ({2} left) - sent {3}, unchanged {4}, {5:N1} MB @ {6:N1} MB/s, ETA {7}" -f $st.Offered, $total, $left, $st.Sent, $st.Skipped, ($st.Bytes / 1MB), $spd, $eta)
+  }
+  else {
+    Log ("  progress: {0} files - sent {1}, unchanged {2}, {3:N1} MB @ {4:N1} MB/s" -f $st.Offered, $st.Sent, $st.Skipped, ($st.Bytes / 1MB), $spd)
+  }
   $script:lastProg = $nowt; $script:lastBytes = $st.Bytes
 }
 function Remove-JsonComments([string]$s) {
@@ -304,28 +309,6 @@ endlocal & exit /b %RC%
   $bat = $tpl.Replace('__HOST__', $Hostt).Replace('__PORT__', [string]$Portt).Replace('__TOKEN__', $Tok).Replace('__FP__', $Fpr).Replace('__IGNORE__', [string]$IgnoreSpec)
   $bat = ($bat + "`r`n" + $FetchSrc) -replace "`r?`n", "`r`n"
   Set-Content -LiteralPath $OutPath -Value $bat -Encoding ASCII
-}
-
-function Get-FileCount($roots, $ignore) {
-  # Cheap count-only walk (no per-file stat, no I/O) so we can show "x of N"
-  # progress. Constant memory, like Send-Pass. Honours ignore patterns so the
-  # total matches what is actually offered. Best-effort: unreadable dirs skipped.
-  $n = 0
-  foreach ($root in $roots) {
-    $base = Split-Path $root -Parent; if (-not $base) { $base = $root }
-    $stack = New-Object System.Collections.Stack
-    $stack.Push($root)
-    while ($stack.Count -gt 0) {
-      $dir = $stack.Pop()
-      try { foreach ($sd in [IO.Directory]::EnumerateDirectories($dir)) {
-          if (-not (Test-IgnoredRel ($sd.Substring($base.Length)) $true $ignore)) { $stack.Push($sd) }
-        } } catch {}
-      try { foreach ($f in [IO.Directory]::EnumerateFiles($dir)) {
-          if (-not (Test-IgnoredRel ($f.Substring($base.Length)) $false $ignore)) { $n++ }
-        } } catch {}
-    }
-  }
-  return $n
 }
 
 $script:SmallFile = 65536    # files <= this are batched into one bundle (cuts per-file round-trips)
@@ -635,9 +618,7 @@ try {
           # changed/new ones and deletes local files no longer offered (mirror).
           # With -Cutover a second pass runs after the operator stops the database.
           Log ("session #{0}: sync pass 1 - scanning {1} folder(s)" -f $sessionNum, @($folders).Count)
-          $tot1 = Get-FileCount $folders $ignorePatterns
-          Log ("session #{0}: pass 1 - {1} files to check" -f $sessionNum, $tot1)
-          $p1 = Send-Pass $stream $folders $tot1 $ignorePatterns
+          $p1 = Send-Pass $stream $folders 0 $ignorePatterns   # no up-front count: start sending immediately
           if (-not $p1.Ok) { Log ("session #{0}: client dropped during pass 1" -f $sessionNum); break }
           Write-Line $stream 'PASS-END'
           Log ("session #{0}: pass 1 done - changed/new {1}, unchanged {2}, {3:N0} bytes{4}" -f $sessionNum, $p1.Sent, $p1.Skipped, $p1.Bytes, (Format-Saved $p1.Bytes $p1.Wire))
@@ -646,9 +627,7 @@ try {
             Wait-Cutover $stream
             Write-Line $stream 'GO'
             Log ("session #{0}: pass 2 (final, DB stopped) - scanning {1} folder(s)" -f $sessionNum, @($folders).Count)
-            $tot2 = Get-FileCount $folders $ignorePatterns
-            Log ("session #{0}: pass 2 - {1} files to check" -f $sessionNum, $tot2)
-            $p2 = Send-Pass $stream $folders $tot2 $ignorePatterns
+            $p2 = Send-Pass $stream $folders 0 $ignorePatterns
             if (-not $p2.Ok) { Log ("session #{0}: client dropped during pass 2" -f $sessionNum); break }
             Write-Line $stream 'PASS-END'
             Log ("session #{0}: pass 2 done - changed/new {1}, unchanged {2}, {3:N0} bytes{4}" -f $sessionNum, $p2.Sent, $p2.Skipped, $p2.Bytes, (Format-Saved $p2.Bytes $p2.Wire))
