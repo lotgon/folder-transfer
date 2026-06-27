@@ -12,6 +12,17 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.10.0] — 2026-06-27
+
+### Added
+- **Automatic small-file bundling — big speedup for many small files over a WAN.** Files
+  ≤ 64 KB are batched (up to 256 per bundle) and exchanged in **one round-trip per bundle**
+  instead of one per file: the server sends a manifest, the client replies with a want‑mask, then
+  only the needed files stream back. The delta is preserved (unchanged files are still skipped),
+  the mirror still works (bundled files count as offered, so they're not deleted), and a locked
+  file in a bundle is skipped gracefully. Large files (> 64 KB) are unchanged — sent one at a
+  time, compressed, with mid‑file progress. No client setup; the tool decides automatically.
+
 ## [0.9.3] — 2026-06-27
 
 ### Changed
@@ -274,7 +285,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/lotgon/folder-transfer/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/lotgon/folder-transfer/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/lotgon/folder-transfer/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/lotgon/folder-transfer/compare/v0.9.0...v0.9.1

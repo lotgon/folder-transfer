@@ -329,8 +329,48 @@ function Get-FileCount($roots, $ignore) {
   return $n
 }
 
+$script:SmallFile = 65536    # files <= this are batched into one bundle (cuts per-file round-trips)
+$script:BundleMax = 256      # flush a bundle after this many small files
+function Send-Bundle($s, $bundle, $st, $total) {
+  # Send many small files with ONE round-trip instead of one per file. Protocol:
+  #   server: "B <count>" then <count> manifest lines "<size> <mtime> <rel>"
+  #   client: a want-mask line (one char per file, '1' = send it, '0' = already have / skip)
+  #   server: for each wanted file in order: "<len>" + len bytes  (or "-1" if it is locked)
+  # Returns $false if the client disconnected. Bundled files are sent raw (they are tiny).
+  if ($bundle.Count -eq 0) { return $true }
+  Write-Line $s ("B {0}" -f $bundle.Count)
+  foreach ($b in $bundle) { Write-Line $s ("{0} {1} {2}" -f $b.Size, $b.Mtime, $b.Rel) }
+  $mask = Read-Line $s
+  if ($null -eq $mask) { $st.Ok = $false; return $false }
+  for ($i = 0; $i -lt $bundle.Count; $i++) {
+    $st.Offered++
+    if (-not ($i -lt $mask.Length -and $mask[$i] -eq '1')) { $st.Skipped++; continue }
+    $b = $bundle[$i]
+    $fs = $null
+    try { $fs = New-Object IO.FileStream($b.Full, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]'ReadWrite, Delete')) }
+    catch {
+      Log ("session: cannot read (in use?), skipping this pass: {0} -- {1}" -f $b.Rel, $_.Exception.Message)
+      Write-Line $s '-1'; $st.Skipped++; continue
+    }
+    try {
+      $len = $fs.Length
+      Write-Line $s ([string]$len)
+      $buf = New-Object byte[] 65536; $left = $len
+      while ($left -gt 0) {
+        $n = $fs.Read($buf, 0, [Math]::Min($buf.Length, $left))
+        if ($n -le 0) { break }
+        $s.Write($buf, 0, $n); $left -= $n; $st.Bytes += $n
+      }
+      $st.Sent++; $st.Wire += $len
+      Show-ServeProgress $st $total
+    } finally { $fs.Close() }
+  }
+  return $true
+}
+
 function Send-Pass($s, $roots, $total, $ignore) {
-  # One lazy walk of each shared folder. For each file: send "F <size> <mtime> <rel>",
+  # One lazy walk of each shared folder. Small files (<= $SmallFile) are batched into bundles
+  # (see Send-Bundle); larger files are offered one at a time: send "F <size> <mtime> <rel>",
   # read the client's reply (byte offset to start at, or -1 to skip), send the
   # remaining bytes. Paths are relative to the PARENT of each folder so its own
   # name is preserved on the client. Directories/files whose name matches an
@@ -340,6 +380,7 @@ function Send-Pass($s, $roots, $total, $ignore) {
   $st = [pscustomobject]@{ Ok = $true; Offered = 0; Sent = 0; Skipped = 0; Bytes = [int64]0; Wire = [int64]0 }
   Write-Line $s ("T {0}" -f $total)   # tell the client the file count for its own progress
   $script:passStart = Get-Date; $script:lastProg = $script:passStart; $script:lastBytes = [int64]0
+  $bundle = New-Object System.Collections.Generic.List[object]
   foreach ($root in $roots) {
   $base = Split-Path $root -Parent
   if (-not $base) { $base = $root }
@@ -360,6 +401,14 @@ function Send-Pass($s, $roots, $total, $ignore) {
       try { $fi = [IO.FileInfo]::new($full) } catch { $fi = $null }
       if (-not $fi) { continue }
       $rel = $full.Substring($base.Length).TrimStart('\', '/')
+      if ($fi.Length -le $script:SmallFile) {
+        # batch small files into a bundle (one round-trip for many)
+        [void]$bundle.Add([pscustomobject]@{ Full = $full; Rel = $rel; Size = $fi.Length; Mtime = $fi.LastWriteTimeUtc.Ticks })
+        if ($bundle.Count -ge $script:BundleMax) { if (-not (Send-Bundle $s $bundle $st $total)) { return $st }; $bundle.Clear() }
+        continue
+      }
+      # a large file: flush any pending bundle first, then offer it on its own
+      if ($bundle.Count -gt 0) { if (-not (Send-Bundle $s $bundle $st $total)) { return $st }; $bundle.Clear() }
       Write-Line $s ("F {0} {1} {2}" -f $fi.Length, $fi.LastWriteTimeUtc.Ticks, $rel)
       $st.Offered++
       Show-ServeProgress $st $total
@@ -426,6 +475,7 @@ function Send-Pass($s, $roots, $total, $ignore) {
     }
   }
   }
+  if ($bundle.Count -gt 0) { if (-not (Send-Bundle $s $bundle $st $total)) { return $st }; $bundle.Clear() }
   return $st
 }
 

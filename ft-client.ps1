@@ -158,6 +158,51 @@ try {
       if ($null -eq $h) { $more = $false; break }
       if ($h -eq 'PASS-END') { break }
       if ($h -match '^T (\d+)$') { $total = [int64]$matches[1]; continue }   # server's file count
+      if ($h -match '^B (\d+)$') {
+        # bundle of small files: read the manifest, reply with a want-mask, receive the wanted ones
+        $bcount = [int]$matches[1]
+        $bitems = New-Object System.Collections.Generic.List[object]
+        for ($k = 0; $k -lt $bcount; $k++) {
+          $ml = Read-Line $stream
+          if ($ml -match '^(\d+) (\d+) (.+)$') { $bitems.Add([pscustomobject]@{ Size = [int64]$matches[1]; Mt = [int64]$matches[2]; Rel = $matches[3] }) }
+          else { $bitems.Add($null) }
+        }
+        $sbm = New-Object Text.StringBuilder
+        $btargets = New-Object System.Collections.Generic.List[object]
+        foreach ($it in $bitems) {
+          if ($null -eq $it) { [void]$sbm.Append('0'); $btargets.Add($null); continue }
+          $bt = [IO.Path]::GetFullPath((Join-Path $ToFolder $it.Rel))
+          if (-not ($bt.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase))) { [void]$sbm.Append('0'); $btargets.Add($null); continue }
+          $top = ($it.Rel -split '[\\/]')[0]
+          if ($top) { [void]$mirrorRoots.Add([IO.Path]::GetFullPath((Join-Path $ToFolder $top))) }
+          [void]$seen.Add($bt.ToLowerInvariant())
+          $need = $true
+          if (Test-Path -LiteralPath $bt) { $li = Get-Item -LiteralPath $bt; if ($li.Length -eq $it.Size -and $li.LastWriteTimeUtc.Ticks -eq $it.Mt) { $need = $false } }
+          if ($need) { [void]$sbm.Append('1'); $btargets.Add($bt) } else { [void]$sbm.Append('0'); $skipped++; $btargets.Add($null) }
+        }
+        Write-Line $stream $sbm.ToString()
+        for ($k = 0; $k -lt $bcount; $k++) {
+          if ($null -eq $btargets[$k]) { continue }
+          $len = [int64](Read-Line $stream)
+          if ($len -lt 0) { continue }   # server could not provide it (locked) -> keep our copy
+          $bt = $btargets[$k]
+          $bdir = Split-Path $bt -Parent
+          if (-not (Test-Path -LiteralPath $bdir)) { New-Item -ItemType Directory -Path $bdir -Force | Out-Null }
+          $bfs = [IO.File]::Open($bt, [IO.FileMode]::Create, [IO.FileAccess]::Write)
+          try {
+            $buf = New-Object byte[] 65536; $left = $len
+            while ($left -gt 0) {
+              $n = $stream.Read($buf, 0, [Math]::Min($buf.Length, $left))
+              if ($n -le 0) { throw "connection closed early (bundle) on $($bitems[$k].Rel)" }
+              $bfs.Write($buf, 0, $n); $left -= $n; $bytes += $n
+            }
+          } finally { $bfs.Close() }
+          try { (Get-Item -LiteralPath $bt).LastWriteTimeUtc = [DateTime]::new($bitems[$k].Mt, [DateTimeKind]::Utc) } catch {}
+          $got++
+          Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
+        }
+        continue
+      }
       if ($h -notmatch '^F (\d+) (\d+) (.+)$') { continue }
       $size = [int64]$matches[1]; $mt = [int64]$matches[2]; $rel = $matches[3]
       $target = [IO.Path]::GetFullPath((Join-Path $ToFolder $rel))
