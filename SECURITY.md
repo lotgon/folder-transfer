@@ -1,7 +1,7 @@
 # Security Policy
 
 folder-transfer moves data over the network and (by default) opens a firewall port, so please review
-it before using it on production systems. See the **Security & antivirus** section in the
+it before using it on production systems. See the **Security** section in the
 [README](README.md) and the **Security model** and **Threat model & limitations** sections
 in [ARCHITECTURE.md](ARCHITECTURE.md).
 

@@ -8,13 +8,15 @@
 **Encrypted, zero‑install folder transfer & mirror‑sync between two Windows machines over TLS
 — no service, no trace, with a two‑phase cutover mode for live databases.**
 
-Pure PowerShell + the .NET that ships with Windows. You point it at a folder; it serves that
-folder over TLS and shuts itself down, leaving the machine exactly as it was. Transfers are
-**compressed on the fly** (smartly skipping already‑compressed files). It generates **one
-self‑contained file** to carry to the receiver.
+Pure PowerShell + the .NET that ships with Windows. You point it at one or more folders; it
+serves them over TLS and shuts itself down, leaving the machine exactly as it was. Transfers are
+**compressed on the fly** (skipping already‑compressed files) and **many small files are bundled**
+so they fly over high‑latency links. It generates **one self‑contained file** to carry to the
+receiver.
 
-> Status: early but functional; verified end‑to‑end on Windows 11. Do one real two‑machine
-> run before relying on it — see [Limitations](#limitations).
+> Status: young but functional; verified end‑to‑end on Windows 11 (loopback) and over a real
+> two‑machine WAN link. Still review and test it in your environment before relying on it — see
+> [Limitations](#limitations).
 
 ## Contents
 
@@ -100,8 +102,9 @@ A ready‑to‑edit **`sync.example.json`** ships alongside the scripts — copy
 | `*/cache/` | a `cache` folder exactly one level deep; `*` does not cross `/` |
 | `**/cache/` | a `cache` folder at **any** depth (`**` spans `/`) |
 
-A matched folder is skipped whole. Ignored content is **never transferred and never deleted**
-on the receiver.
+A matched folder's **files** are skipped, but the folder (and its subfolders) is still
+**recreated empty** on the receiver — some software won't start without them. Ignored content is
+**never transferred and never deleted** on the receiver.
 
 ## Parameters
 
@@ -174,10 +177,12 @@ exit. If the port is already open or managed elsewhere, pass `-NoFirewall`.
 
 ## Limitations
 
-- Verified on Windows 11 over loopback; do one real two‑machine run first.
+- Young tool: verified on Windows 11 (loopback) and over a real two‑machine WAN link, but test in
+  your environment before trusting production data.
 - The generated `.bat` holds the token in clear text — treat it as a secret and delete it after.
 - Change detection is **size + mtime, not a hash**; a same‑size corruption isn't detected.
-- A changed file is re‑fetched whole (no byte‑level resume within one huge file).
+- A changed file is re‑fetched whole (no byte‑level resume within one huge file) — over a flaky
+  WAN a very large file that drops near the end restarts from zero.
 - A new self‑signed cert each run → fingerprint changes, so an old client bat won't connect to
   a new server instance (by design).
 - **Exclusively‑locked** files are skipped for that pass (logged); files merely open for writing

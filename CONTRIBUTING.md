@@ -8,16 +8,20 @@ Thanks for your interest! folder-transfer is intentionally small and dependency�
 |------|-----------|
 | `folder-transfer.bat` | Thin launcher (`powershell -File ft-server.ps1 %*`). Edit rarely. |
 | `ft-server.ps1` | Server engine. The bulk of the logic. |
-| `ft-client.ps1` | Client engine (the server copies it next to each generated client). |
+| `ft-client.ps1` | Client engine (embedded, plain text, into each generated client `.bat`). |
+| `sync.example.json` | Commented sample `-Config` file. |
+| `release.ps1` | Maintainer tool — build the release ZIP and publish the GitHub release. |
 | `README.md` / `ARCHITECTURE.md` / `CHANGELOG.md` | Docs. |
 
-There is **no build step** — the `.bat` launchers just run the adjacent `.ps1`.
+There is **no build step** to run the tool — the `.bat` launcher just runs the adjacent `.ps1`.
+`release.ps1` only packages releases.
 
 ## Hard rules
 
 - **ASCII only in `.ps1` / `.bat`.** Windows PowerShell 5.1 reads scripts in the system
-  code page; non‑ASCII characters (e.g. Cyrillic) in a script break parsing. Keep all code
-  and code comments ASCII. Non‑English text belongs only in Markdown docs.
+  code page; non‑ASCII characters (e.g. Cyrillic) in a script break parsing. Non‑English text
+  belongs only in Markdown docs.
+- **Comments in English only** — in scripts, the JSON config/example, anywhere in the code.
 - **Keep the `.bat` files thin** (no temp extraction, no base64) so the scripts stay
   readable and AppLocker/WDAC/EDR‑friendly.
 - **No third‑party dependencies** — only built‑in Windows PowerShell + .NET.
