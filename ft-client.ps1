@@ -123,6 +123,7 @@ function Test-IgnoredRel([string]$rel, [bool]$isDir, $patterns) {
 $script:ExpectedFp = $Fingerprint.Replace(':', '').Replace('-', '').ToLower()
 
 $tcp = [System.Net.Sockets.TcpClient]::new()
+try { $tcp.NoDelay = $true } catch {}   # disable Nagle - huge win for many small files over WAN
 $tcp.Connect($Server, $Port)
 $raw = $tcp.GetStream()
 $stream = $raw

@@ -12,6 +12,15 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.9.3] — 2026-06-27
+
+### Changed
+- **Disabled Nagle's algorithm (`TCP_NODELAY`) on both sockets.** For many small files over a
+  WAN/internet link the bottleneck is per‑file round‑trips, and Nagle + delayed‑ACK was adding
+  ~40–200 ms to each one. Turning it off noticeably speeds up small‑file transfers. (The protocol
+  is still one round‑trip per file, so very small files over a high‑latency link remain
+  latency‑bound — a pipelined protocol would be the next step.)
+
 ## [0.9.2] — 2026-06-27
 
 ### Changed
@@ -265,7 +274,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/lotgon/folder-transfer/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/lotgon/folder-transfer/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/lotgon/folder-transfer/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/lotgon/folder-transfer/compare/v0.8.2...v0.9.0

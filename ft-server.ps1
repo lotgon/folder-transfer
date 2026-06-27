@@ -549,6 +549,7 @@ try {
       if ($waited -ge $IdleSeconds * 1000) { Log ("idle timeout reached ({0}s with no client) - shutting down" -f $IdleSeconds); return }
     }
     $client = $listener.AcceptTcpClient()
+    try { $client.NoDelay = $true } catch {}   # disable Nagle - huge win for many small files over WAN
     $sessionNum++
     $remote = $client.Client.RemoteEndPoint.ToString()           # IP:port
     $ip = $client.Client.RemoteEndPoint.Address.ToString()
