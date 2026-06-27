@@ -150,16 +150,15 @@ $folders = @()
 $ignorePatterns = @()
 if ($Config) {
   if (-not (Test-Path -LiteralPath $Config)) { Write-Host "ERROR: -Config file not found: $Config"; return }
-  $cfgRaw = Get-Content -Raw -LiteralPath $Config -Encoding UTF8
-  $cfg = $null
-  try { $cfg = $cfgRaw | ConvertFrom-Json }
+  # Strict JSON - no auto-correction. Valid paths: forward slashes "C:/path" or doubled
+  # backslashes "C:\\path". A single backslash (or a trailing comma) is invalid JSON and is
+  # reported, not silently fixed.
+  try { $cfg = (Get-Content -Raw -LiteralPath $Config -Encoding UTF8) | ConvertFrom-Json }
   catch {
-    # Forgiving retry for hand-edited configs: (1) double un-escaped Windows backslashes so
-    # "C:\Data", "C:\\Data" and "C:/Data" all work; (2) drop trailing commas before ] or }.
-    $fixed = $cfgRaw -replace '\\', '\\'
-    $fixed = $fixed -replace ',(\s*[\]}])', '$1'
-    try { $cfg = $fixed | ConvertFrom-Json }
-    catch { Write-Host "ERROR: could not parse JSON in $Config -- $_"; return }
+    Write-Host "ERROR: invalid JSON in $Config"
+    Write-Host ("  " + $_.Exception.Message)
+    Write-Host '  Tip: use forward slashes "C:/path" or DOUBLED backslashes "C:\\path", and no trailing commas.'
+    return
   }
   if ($cfg.folders) { $folders += @($cfg.folders) }
   if ($cfg.folder) { $folders += @($cfg.folder) }

@@ -79,8 +79,8 @@ A ready‑to‑edit **`sync.example.json`** ships alongside the scripts — copy
 ```
 
 - `folders` — each is shared and arrives under its own name (`<dest>\Bars\…`, `<dest>\Ticks\…`).
-  Paths are lenient: backslashes (single `C:\path` or doubled `C:\\path`) **or** forward slashes
-  all work, and a **trailing comma** after the last item is tolerated.
+  It's standard JSON: in paths use **forward slashes** (`C:/path`) **or doubled backslashes**
+  (`C:\\path`). A single backslash or a trailing comma is invalid and is reported (not auto‑fixed).
 - `ignore` — patterns (see below); the rest of the keys are the same options as the command line
   (command‑line options override the JSON). `"compress": false` turns off compression.
 - A ready `sync.example.json` with **every** key ships in the release — copy and trim it.

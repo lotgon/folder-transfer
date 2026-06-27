@@ -12,6 +12,14 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.8.1] — 2026-06-27
+
+### Changed
+- **Config parsing is strict JSON — no auto‑correction.** Forward slashes (`C:/path`) and doubled
+  backslashes (`C:\\path`) both work (valid JSON); a single backslash or a trailing comma is now
+  reported as an invalid config (with a short tip) instead of being silently "fixed". Auto‑repair
+  could mask real mistakes, so it was removed.
+
 ## [0.8.0] — 2026-06-27
 
 ### Added
@@ -222,7 +230,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/lotgon/folder-transfer/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/lotgon/folder-transfer/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/lotgon/folder-transfer/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/lotgon/folder-transfer/compare/v0.7.0...v0.7.1

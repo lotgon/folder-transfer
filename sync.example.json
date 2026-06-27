@@ -1,5 +1,5 @@
 {
-  "_comment": "folder-transfer config. Run:  folder-transfer.bat -Config sync.json   Paths accept backslashes (single or doubled) or forward slashes; trailing commas are tolerated. Only 'folders' is required - the rest are optional and shown here with their defaults.",
+  "_comment": "folder-transfer config. Run:  folder-transfer.bat -Config sync.json   This is standard JSON: in paths use forward slashes C:/path OR doubled backslashes C:\\path (a single backslash or a trailing comma is an error). Only 'folders' is required - the rest are optional and shown here with their defaults.",
 
   "folders": [
     "C:\\Data\\ProjectA",
