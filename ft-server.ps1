@@ -142,11 +142,12 @@ function Show-ServeHelp {
   Write-Host '  (default)           single-phase sync - copy the folder; re-run to sync changes'
   Write-Host '  -Cutover            two-phase sync - pass 1 (DB live), you stop the DB, pass 2 (final). Implies -Once.'
   Write-Host ''
-  Write-Host 'REQUIRED (positional - just the path, first argument):'
-  Write-Host '  <FOLDER>            folder to share, read-only   e.g.  folder-transfer.bat D:\data'
+  Write-Host 'REQUIRED (positional, first argument) - a folder OR a .json config:'
+  Write-Host '  <FOLDER>           folder to share, read-only   e.g.  folder-transfer.bat D:\data'
+  Write-Host '  <config.json>      a JSON config (auto-detected)  e.g.  folder-transfer.bat sync.json'
   Write-Host ''
   Write-Host 'OPTIONAL:'
-  Write-Host '  -Config <path>      JSON with folders[], ignore[], and any of the options below'
+  Write-Host '  -Config <path>      JSON config (same as passing the .json as the first argument)'
   Write-Host '  -Ignore <list>      ignore name patterns, comma/semicolon separated (e.g. log/,*.log,mtlog)'
   Write-Host '                      a trailing / means directory-only; wildcards * and ? are allowed'
   Write-Host '  -NoCompress         disable on-the-fly compression (ON by default; already-compressed'
@@ -168,7 +169,7 @@ function Show-ServeHelp {
   Write-Host '  folder-transfer.bat D:\data -ServerHost 10.0.0.5 -Once       (single-phase sync)'
   Write-Host '  folder-transfer.bat D:\db   -ServerHost 10.0.0.5 -Cutover    (two-phase DB sync)'
   Write-Host '  folder-transfer.bat D:\data -Ignore log/,*.log              (skip log dirs and *.log files)'
-  Write-Host '  folder-transfer.bat -Config sync.json                       (many folders + ignore, from JSON)'
+  Write-Host '  folder-transfer.bat sync.json                               (many folders + ignore, from JSON)'
   Write-Host ''
   Write-Host 'The token (client secret) is auto-generated and baked into the client - you'
   Write-Host 'never set it. Parameter names are case-insensitive; the folder is positional.'
@@ -176,6 +177,12 @@ function Show-ServeHelp {
 }
 
 if ($Help) { Show-ServeHelp; return }
+
+# A positional argument that is a .json file (or any existing file) is taken as the config, so you
+# can just run "folder-transfer.bat sync.json" instead of "folder-transfer.bat -Config sync.json".
+if (-not $Config -and $Folder -and ($Folder -match '\.json$' -or (Test-Path -LiteralPath $Folder -PathType Leaf))) {
+  $Config = $Folder; $Folder = ''
+}
 
 # ---- assemble the folder list + ignore patterns from -Config (JSON), CLI, or the prompt ----
 $folders = @()

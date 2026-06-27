@@ -1,7 +1,7 @@
 {
   // EXAMPLE: copy your main folders to a new PC.
   //   1) edit the paths below (replace YourName)
-  //   2) on the OLD pc run:  folder-transfer.bat -Config sync.json
+  //   2) on the OLD pc run:  folder-transfer.bat sync.json
   //   3) copy the generated download-scripts file to the NEW pc and run it
   // Paths: forward slashes "C:/path" OR doubled backslashes "C:\\path". Comments (// and /* */) are allowed.
 

@@ -67,7 +67,8 @@ files removed on the source are deleted on the receiver, unchanged files are ski
 ## Many folders and ignoring
 
 For a bigger job — several source folders and paths you want to skip (big log dirs, temp
-files) — put everything in a **JSON config** and run `folder-transfer.bat -Config sync.json`.
+files) — put everything in a **JSON config** and run `folder-transfer.bat sync.json` (a `.json`
+first argument is auto‑detected as the config; `-Config sync.json` also works).
 A ready‑to‑edit **`sync.example.json`** ships alongside the scripts — copy it and adjust:
 
 ```json
@@ -118,7 +119,7 @@ case‑insensitive:
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `<folder>` (positional) | required (or via `-Config`) | Folder to share, read‑only. |
-| `-Config <file.json>` | — | JSON with `folders`, `ignore`, and any options below. |
+| `<config.json>` / `-Config <file.json>` | — | JSON config (folders, ignore, options). A `.json` first argument is auto‑detected. |
 | `-Ignore <list>` | none | Ignore name patterns, comma/semicolon separated (`log/,*.tmp`). |
 | `-Cutover` | off | Two‑phase sync for a live DB (implies `-Once`). |
 | `-AllowIp <ip>` | any | Serve only this client IP. |
