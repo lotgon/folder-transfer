@@ -10,7 +10,9 @@
 #    -Plain        disable TLS (loopback testing only)
 # ====================================================================
 param(
-  [Parameter(Position = 0)] [string]$Folder = '',   # REQUIRED, positional: folder-transfer.bat <folder> ...
+  [Parameter(Position = 0)] [string]$Folder = '',   # positional: folder-transfer.bat <folder> ...
+  [string]$Config = '',         # JSON config: folders[], ignore[], and any of the options below
+  [string]$Ignore = '',         # ignore patterns (comma/semicolon separated), e.g. log/,*.log,mtlog
   [int]$Port = 8722,
   [string]$AllowIp = '',
   [int]$IdleSeconds = 600,
@@ -31,6 +33,18 @@ function Format-Span($sec) {
   if ($sec -lt 0 -or $sec -gt 359999) { return '?' }
   return ('{0:hh\:mm\:ss}' -f [TimeSpan]::FromSeconds([int]$sec))
 }
+function Test-Ignored([string]$name, [bool]$isDir, $patterns) {
+  # Match one path-segment NAME against ignore patterns (wildcards * and ?).
+  # A pattern ending in / or \ matches directories only. Case-insensitive.
+  foreach ($p in $patterns) {
+    $pat = $p; $dirOnly = $false
+    if ($pat.EndsWith('/') -or $pat.EndsWith('\')) { $dirOnly = $true; $pat = $pat.TrimEnd('/', '\') }
+    if ($pat -eq '') { continue }
+    if ($dirOnly -and -not $isDir) { continue }
+    if ($name -like $pat) { return $true }
+  }
+  return $false
+}
 
 function Show-ServeHelp {
   Write-Host ''
@@ -45,6 +59,9 @@ function Show-ServeHelp {
   Write-Host '  <FOLDER>            folder to share, read-only   e.g.  folder-transfer.bat D:\data'
   Write-Host ''
   Write-Host 'OPTIONAL:'
+  Write-Host '  -Config <path>      JSON with folders[], ignore[], and any of the options below'
+  Write-Host '  -Ignore <list>      ignore name patterns, comma/semicolon separated (e.g. log/,*.log,mtlog)'
+  Write-Host '                      a trailing / means directory-only; wildcards * and ? are allowed'
   Write-Host '  -ServerHost <addr>  source address baked into the client   (default: auto IPv4)'
   Write-Host '  -Port <n>           TCP port                               (default: 8722)'
   Write-Host '  -AllowIp <ip>       allow only this client IP              (default: any)'
@@ -60,6 +77,8 @@ function Show-ServeHelp {
   Write-Host '  folder-transfer.bat D:\data                                 (simplest - just the folder)'
   Write-Host '  folder-transfer.bat D:\data -ServerHost 10.0.0.5 -Once       (single-phase sync)'
   Write-Host '  folder-transfer.bat D:\db   -ServerHost 10.0.0.5 -Cutover    (two-phase DB sync)'
+  Write-Host '  folder-transfer.bat D:\data -Ignore log/,*.log              (skip log dirs and *.log files)'
+  Write-Host '  folder-transfer.bat -Config sync.json                       (many folders + ignore, from JSON)'
   Write-Host ''
   Write-Host 'The token (client secret) is auto-generated and baked into the client - you'
   Write-Host 'never set it. Parameter names are case-insensitive; the folder is positional.'
@@ -67,21 +86,59 @@ function Show-ServeHelp {
 }
 
 if ($Help) { Show-ServeHelp; return }
-if (-not $Folder) {
-  # No folder on the command line (e.g. double-clicked) - ask a couple of questions,
-  # the same way the generated client asks for its destination.
+
+# ---- assemble the folder list + ignore patterns from -Config (JSON), CLI, or the prompt ----
+$folders = @()
+$ignorePatterns = @()
+if ($Config) {
+  if (-not (Test-Path -LiteralPath $Config)) { Write-Host "ERROR: -Config file not found: $Config"; return }
+  try { $cfg = (Get-Content -Raw -LiteralPath $Config -Encoding UTF8) | ConvertFrom-Json }
+  catch { Write-Host "ERROR: could not parse JSON in $Config -- $_"; return }
+  if ($cfg.folders) { $folders += @($cfg.folders) }
+  if ($cfg.folder) { $folders += @($cfg.folder) }
+  if ($cfg.ignore) { $ignorePatterns += @($cfg.ignore) }
+  # JSON also sets the other options; anything given on the command line wins.
+  if ($null -ne $cfg.port -and -not $PSBoundParameters.ContainsKey('Port')) { $Port = [int]$cfg.port }
+  if ($null -ne $cfg.allowIp -and -not $PSBoundParameters.ContainsKey('AllowIp')) { $AllowIp = [string]$cfg.allowIp }
+  if ($null -ne $cfg.serverHost -and -not $PSBoundParameters.ContainsKey('ServerHost')) { $ServerHost = [string]$cfg.serverHost }
+  if ($null -ne $cfg.idleSeconds -and -not $PSBoundParameters.ContainsKey('IdleSeconds')) { $IdleSeconds = [int]$cfg.idleSeconds }
+  if ($null -ne $cfg.stallTimeout -and -not $PSBoundParameters.ContainsKey('StallTimeout')) { $StallTimeout = [int]$cfg.stallTimeout }
+  if ($null -ne $cfg.clientOut -and -not $PSBoundParameters.ContainsKey('ClientOut')) { $ClientOut = [string]$cfg.clientOut }
+  if ($null -ne $cfg.cutover -and -not $PSBoundParameters.ContainsKey('Cutover')) { $Cutover = [bool]$cfg.cutover }
+  if ($null -ne $cfg.once -and -not $PSBoundParameters.ContainsKey('Once')) { $Once = [bool]$cfg.once }
+  if ($null -ne $cfg.noFirewall -and -not $PSBoundParameters.ContainsKey('NoFirewall')) { $NoFirewall = [bool]$cfg.noFirewall }
+  if ($Cutover) { $Once = $true }
+}
+if ($Folder) { $folders += $Folder }                 # positional folder (allowed with or without -Config)
+if ($Ignore) { $ignorePatterns += ($Ignore -split '[;,]') }
+
+if (@($folders).Count -eq 0) {
+  # nothing given (e.g. double-clicked) - ask, the same way the client asks for its destination.
   Write-Host ''
   Write-Host 'No folder given - a couple of quick questions (press Enter for the default).'
   Write-Host ''
-  $Folder = (Read-Host '1) Folder to share / sync (full path)').Trim().Trim('"')
+  $ans = (Read-Host '1) Folder to share / sync (full path)').Trim().Trim('"')
   $modeAns = (Read-Host '2) Mode: [1] single-phase sync (default) or [2] cutover (two-phase, for a live DB)').Trim()
   if ($modeAns -eq '2') { $Cutover = $true; $Once = $true; Write-Host '   -> cutover mode (two passes; implies -Once)' }
   else { Write-Host '   -> single-phase sync' }
   Write-Host ''
+  if ($ans) { $folders += $ans }
 }
-if (-not $Folder) { Write-Host 'ERROR: a folder is required (the folder to share).'; Show-ServeHelp; return }
-if (-not (Test-Path -LiteralPath $Folder)) { Write-Host "ERROR: folder path not found: $Folder"; return }
-$Folder = (Resolve-Path -LiteralPath $Folder).Path
+
+# normalise ignore patterns (trim, drop blanks)
+$ignorePatterns = @($ignorePatterns | ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne '' })
+
+# validate + resolve every folder
+if (@($folders).Count -eq 0) { Write-Host 'ERROR: at least one folder is required (the folder to share).'; Show-ServeHelp; return }
+$resolved = @()
+foreach ($f in $folders) {
+  $f = "$f".Trim().Trim('"')
+  if (-not $f) { continue }
+  if (-not (Test-Path -LiteralPath $f)) { Write-Host "ERROR: folder not found: $f"; return }
+  $resolved += (Resolve-Path -LiteralPath $f).Path
+}
+$folders = @($resolved)
+if ($ignorePatterns.Count) { Log ("ignore patterns: {0}" -f ($ignorePatterns -join ', ')) }
 
 function Write-Line($s, [string]$t) { $b = [Text.Encoding]::UTF8.GetBytes($t + "`n"); $s.Write($b, 0, $b.Length); $s.Flush() }
 function Read-Line($s) {
@@ -94,7 +151,7 @@ function Read-Line($s) {
   }
   return [Text.Encoding]::UTF8.GetString($ms.ToArray())
 }
-function Write-ClientBat($OutPath, $Hostt, $Portt, $Tok, $Fpr, $FetchSrc) {
+function Write-ClientBat($OutPath, $Hostt, $Portt, $Tok, $Fpr, $FetchSrc, $IgnoreSpec) {
   # Generate a SINGLE self-contained client .bat (the only file you carry to the
   # receiver): a batch header with the baked connection details, then the PLAIN
   # PowerShell client body after a marker. The header writes that body to a temp
@@ -113,6 +170,7 @@ set "SERVER=__HOST__"
 set "PORT=__PORT__"
 set "TOKEN=__TOKEN__"
 set "FP=__FP__"
+set "IGNORE=__IGNORE__"
 set "DEST=%~1"
 if not "%DEST%"=="" goto :gotdest
 echo Destination folder not given. Where should the folder be synced to?
@@ -122,7 +180,7 @@ if "%DEST%"=="" set "DEST=%CD%"
 echo Downloading from %SERVER%:%PORT% into "%DEST%" ...
 set "PS1=%TEMP%\ftdl_%RANDOM%%RANDOM%.ps1"
 powershell -NoProfile -Command "$c=Get-Content -Raw -LiteralPath '%~f0'; $m='#'+'FTPSBODY#'; [IO.File]::WriteAllText($env:PS1, $c.Substring($c.IndexOf($m)+$m.Length))"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Server "%SERVER%" -Port %PORT% -Token "%TOKEN%" -ToFolder "%DEST%" -Fingerprint "%FP%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Server "%SERVER%" -Port %PORT% -Token "%TOKEN%" -ToFolder "%DEST%" -Fingerprint "%FP%" -Ignore "%IGNORE%"
 set "RC=%errorlevel%"
 del "%PS1%" >nul 2>&1
 if not "%RC%"=="0" ( echo [ERROR] Download failed ^(code %RC%^). Re-run to resume. ) else ( echo [OK] Done -^> %DEST% )
@@ -132,47 +190,59 @@ pause
 endlocal & exit /b %RC%
 #FTPSBODY#
 '@
-  $bat = $tpl.Replace('__HOST__', $Hostt).Replace('__PORT__', [string]$Portt).Replace('__TOKEN__', $Tok).Replace('__FP__', $Fpr)
+  $bat = $tpl.Replace('__HOST__', $Hostt).Replace('__PORT__', [string]$Portt).Replace('__TOKEN__', $Tok).Replace('__FP__', $Fpr).Replace('__IGNORE__', [string]$IgnoreSpec)
   $bat = ($bat + "`r`n" + $FetchSrc) -replace "`r?`n", "`r`n"
   Set-Content -LiteralPath $OutPath -Value $bat -Encoding ASCII
 }
 
-function Get-FileCount($root) {
+function Get-FileCount($roots, $ignore) {
   # Cheap count-only walk (no per-file stat, no I/O) so we can show "x of N"
-  # progress. Constant memory, like Send-Pass. Best-effort: unreadable dirs are skipped.
+  # progress. Constant memory, like Send-Pass. Honours ignore patterns so the
+  # total matches what is actually offered. Best-effort: unreadable dirs skipped.
   $n = 0
-  $stack = New-Object System.Collections.Stack
-  $stack.Push($root)
-  while ($stack.Count -gt 0) {
-    $dir = $stack.Pop()
-    try { foreach ($sd in [IO.Directory]::EnumerateDirectories($dir)) { $stack.Push($sd) } } catch {}
-    try { foreach ($f in [IO.Directory]::EnumerateFiles($dir)) { $n++ } } catch {}
+  foreach ($root in $roots) {
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($root)
+    while ($stack.Count -gt 0) {
+      $dir = $stack.Pop()
+      try { foreach ($sd in [IO.Directory]::EnumerateDirectories($dir)) {
+          if (-not (Test-Ignored (Split-Path $sd -Leaf) $true $ignore)) { $stack.Push($sd) }
+        } } catch {}
+      try { foreach ($f in [IO.Directory]::EnumerateFiles($dir)) {
+          if (-not (Test-Ignored ([IO.Path]::GetFileName($f)) $false $ignore)) { $n++ }
+        } } catch {}
+    }
   }
   return $n
 }
 
-function Send-Pass($s, $root, $total) {
-  # One lazy walk of the tree. For each file: send "F <size> <mtimeTicks> <rel>",
+function Send-Pass($s, $roots, $total, $ignore) {
+  # One lazy walk of each shared folder. For each file: send "F <size> <mtime> <rel>",
   # read the client's reply (byte offset to start at, or -1 to skip), send the
-  # remaining bytes. Paths are relative to the PARENT of the shared folder so the
-  # folder's own name is preserved on the client. Returns a stats object; .Ok is
-  # $false if the client disconnected mid-pass. The client never sends a path ->
-  # no traversal / reserved device names by construction.
+  # remaining bytes. Paths are relative to the PARENT of each folder so its own
+  # name is preserved on the client. Directories/files whose name matches an
+  # ignore pattern are skipped (a matched directory is pruned whole). Returns a
+  # stats object; .Ok is $false if the client disconnected mid-pass. The client
+  # never sends a path -> no traversal / reserved device names by construction.
   $st = [pscustomobject]@{ Ok = $true; Offered = 0; Sent = 0; Skipped = 0; Bytes = [int64]0 }
-  $base = Split-Path $root -Parent
-  if (-not $base) { $base = $root }
   Write-Line $s ("T {0}" -f $total)   # tell the client the file count for its own progress
   $passStart = Get-Date; $lastProg = $passStart; $lastBytes = [int64]0
+  foreach ($root in $roots) {
+  $base = Split-Path $root -Parent
+  if (-not $base) { $base = $root }
   $stack = New-Object System.Collections.Stack
   $stack.Push($root)
   while ($stack.Count -gt 0) {
     $dir = $stack.Pop()
-    try { foreach ($sd in [IO.Directory]::EnumerateDirectories($dir)) { $stack.Push($sd) } } catch {}
+    try { foreach ($sd in [IO.Directory]::EnumerateDirectories($dir)) {
+        if (-not (Test-Ignored (Split-Path $sd -Leaf) $true $ignore)) { $stack.Push($sd) }
+      } } catch {}
     $en = $null
     try { $en = [IO.Directory]::EnumerateFiles($dir).GetEnumerator() } catch { $en = $null }
     if (-not $en) { continue }
     while ($en.MoveNext()) {
       $full = $en.Current
+      if (Test-Ignored ([IO.Path]::GetFileName($full)) $false $ignore) { continue }
       $fi = $null
       try { $fi = [IO.FileInfo]::new($full) } catch { $fi = $null }
       if (-not $fi) { continue }
@@ -224,6 +294,7 @@ function Send-Pass($s, $root, $total) {
         $st.Sent++; $st.Bytes += $remain
       } finally { $fs.Close() }
     }
+  }
   }
   return $st
 }
@@ -289,8 +360,10 @@ if (-not $ServerHost) {
 }
 if (-not $ClientOut) {
   # default: a 'download-scripts' subfolder NEXT TO this tool (where you run
-  # from). One bat per shared folder accumulates here, reusable later.
-  $leaf = Split-Path $Folder -Leaf
+  # from). One bat per share accumulates here, reusable later.
+  $leaf = if (@($folders).Count -eq 1) { Split-Path $folders[0] -Leaf }
+  elseif ($Config) { [IO.Path]::GetFileNameWithoutExtension($Config) }
+  else { 'multi' }
   if (-not $leaf) { $leaf = 'Share' }
   $ClientOut = Join-Path (Join-Path $PSScriptRoot 'download-scripts') ("ft-download-{0}.bat" -f $leaf)
 }
@@ -300,8 +373,11 @@ if ($outDir -and -not (Test-Path -LiteralPath $outDir)) {
   catch { Log "WARN: could not create $outDir : $_" }
 }
 $fetchPath = Join-Path $PSScriptRoot 'ft-client.ps1'
+# bake ignore patterns into the client (so it won't delete ignored paths when mirroring);
+# join with ';' and use '/' for the dir-only marker to stay safe inside a .bat argument.
+$ignoreSpec = (($ignorePatterns | ForEach-Object { ($_ -replace '\\', '/') }) -join ';')
 if (Test-Path -LiteralPath $fetchPath) {
-  Write-ClientBat $ClientOut $ServerHost $Port $Token $fp (Get-Content -Raw -LiteralPath $fetchPath)
+  Write-ClientBat $ClientOut $ServerHost $Port $Token $fp (Get-Content -Raw -LiteralPath $fetchPath) $ignoreSpec
   $modeLabel = if ($Cutover) { 'two-phase sync (cutover)' } else { 'single-phase sync' }
   Log "CLIENT WRITTEN ($modeLabel) -> $ClientOut"
   Log "    this is ONE self-contained file - copy just it to the receiver"
@@ -331,7 +407,7 @@ if ($doFirewall) {
 
 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $Port)
 $listener.Start()
-Log ("listening 0.0.0.0:{0}  root={1}  idle={2}s  once={3}" -f $Port, $Folder, $IdleSeconds, [bool]$Once)
+Log ("listening 0.0.0.0:{0}  folders={1}  idle={2}s  once={3}" -f $Port, ($folders -join '; '), $IdleSeconds, [bool]$Once)
 
 $sessionNum = 0
 try {
@@ -368,10 +444,10 @@ try {
           # Single pass = offer every file (size+mtime); the client fetches only
           # changed/new ones and deletes local files no longer offered (mirror).
           # With -Cutover a second pass runs after the operator stops the database.
-          Log ("session #{0}: sync pass 1 - scanning {1}" -f $sessionNum, $Folder)
-          $tot1 = Get-FileCount $Folder
+          Log ("session #{0}: sync pass 1 - scanning {1} folder(s)" -f $sessionNum, @($folders).Count)
+          $tot1 = Get-FileCount $folders $ignorePatterns
           Log ("session #{0}: pass 1 - {1} files to check" -f $sessionNum, $tot1)
-          $p1 = Send-Pass $stream $Folder $tot1
+          $p1 = Send-Pass $stream $folders $tot1 $ignorePatterns
           if (-not $p1.Ok) { Log ("session #{0}: client dropped during pass 1" -f $sessionNum); break }
           Write-Line $stream 'PASS-END'
           Log ("session #{0}: pass 1 done - changed/new {1}, unchanged {2}, {3:N0} bytes" -f $sessionNum, $p1.Sent, $p1.Skipped, $p1.Bytes)
@@ -379,10 +455,10 @@ try {
             Log ("session #{0}: cutover - WAITING for you to stop the database and signal (keypress or ft-cutover.go)" -f $sessionNum)
             Wait-Cutover $stream
             Write-Line $stream 'GO'
-            Log ("session #{0}: pass 2 (final, DB stopped) - scanning {1}" -f $sessionNum, $Folder)
-            $tot2 = Get-FileCount $Folder
+            Log ("session #{0}: pass 2 (final, DB stopped) - scanning {1} folder(s)" -f $sessionNum, @($folders).Count)
+            $tot2 = Get-FileCount $folders $ignorePatterns
             Log ("session #{0}: pass 2 - {1} files to check" -f $sessionNum, $tot2)
-            $p2 = Send-Pass $stream $Folder $tot2
+            $p2 = Send-Pass $stream $folders $tot2 $ignorePatterns
             if (-not $p2.Ok) { Log ("session #{0}: client dropped during pass 2" -f $sessionNum); break }
             Write-Line $stream 'PASS-END'
             Log ("session #{0}: pass 2 done - changed/new {1}, unchanged {2}, {3:N0} bytes" -f $sessionNum, $p2.Sent, $p2.Skipped, $p2.Bytes)

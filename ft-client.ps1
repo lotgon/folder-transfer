@@ -13,9 +13,11 @@ param(
   [string]$Token = '',
   [string]$ToFolder = '',
   [string]$Fingerprint = '',
+  [string]$Ignore = '',          # same ignore patterns as the server (baked in) - so mirror won't delete them
   [switch]$Help
 )
 $ErrorActionPreference = 'Stop'
+$ignorePatterns = @($Ignore -split '[;,]' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 
 function Show-FetchHelp {
   Write-Host ''
@@ -55,6 +57,24 @@ function Format-Span($sec) {
   if ($sec -lt 0 -or $sec -gt 359999) { return '?' }
   return ('{0:hh\:mm\:ss}' -f [TimeSpan]::FromSeconds([int]$sec))
 }
+function Test-IgnoredRel([string]$rel, $patterns) {
+  # Does any segment of this destination-relative path match an ignore pattern?
+  # Used so the mirror never deletes ignored content. A pattern ending in / or \
+  # matches directory segments only (not the final file name). Mirrors the server.
+  if (-not $patterns -or $patterns.Count -eq 0) { return $false }
+  $segs = $rel -split '[\\/]' | Where-Object { $_ -ne '' }
+  for ($i = 0; $i -lt $segs.Count; $i++) {
+    $isLast = ($i -eq $segs.Count - 1)   # the file itself
+    foreach ($p in $patterns) {
+      $pat = $p; $dirOnly = $false
+      if ($pat.EndsWith('/') -or $pat.EndsWith('\')) { $dirOnly = $true; $pat = $pat.TrimEnd('/', '\') }
+      if ($pat -eq '') { continue }
+      if ($dirOnly -and $isLast) { continue }
+      if ($segs[$i] -like $pat) { return $true }
+    }
+  }
+  return $false
+}
 
 $script:ExpectedFp = $Fingerprint.Replace(':', '').Replace('-', '').ToLower()
 
@@ -77,7 +97,7 @@ try {
   Write-Host "[fetch] sync -> $ToFolder"
   $got = 0; $skipped = 0; $bytes = 0; $pass = 0; $deleted = 0
   $seen = New-Object 'System.Collections.Generic.HashSet[string]'
-  $mirrorRoot = $null      # <ToFolder>\<FolderName>, derived from the offered paths
+  $mirrorRoots = New-Object 'System.Collections.Generic.HashSet[string]'   # <ToFolder>\<top> per shared folder
   $more = $true; $syncOk = $false
   $runStart = Get-Date
 
@@ -99,10 +119,8 @@ try {
       if (-not ($target.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase))) {
         Write-Host ("  skip unsafe path from server: {0}" -f $rel); Write-Line $stream '-1'; continue
       }
-      if (-not $mirrorRoot) {
-        $top = ($rel -split '[\\/]')[0]
-        if ($top) { $mirrorRoot = [IO.Path]::GetFullPath((Join-Path $ToFolder $top)) }
-      }
+      $top = ($rel -split '[\\/]')[0]
+      if ($top) { [void]$mirrorRoots.Add([IO.Path]::GetFullPath((Join-Path $ToFolder $top))) }
       [void]$seen.Add($target.ToLowerInvariant())
       $nowt = Get-Date
       if (($nowt - $lastProg).TotalSeconds -ge 2) {
@@ -150,14 +168,20 @@ try {
 
   # Mirror: delete local files no longer on the source. Only after a CLEAN finish
   # and only against the LAST pass's file set, so a drop never deletes wrongly.
-  if ($syncOk -and $mirrorRoot -and (Test-Path -LiteralPath $mirrorRoot)) {
-    Get-ChildItem -LiteralPath $mirrorRoot -Recurse -File | ForEach-Object {
-      if (-not $seen.Contains($_.FullName.ToLowerInvariant())) {
-        Remove-Item -LiteralPath $_.FullName -Force -EA SilentlyContinue; $deleted++
+  # Ignored content is never deleted. Runs per shared folder (its own subtree).
+  if ($syncOk) {
+    foreach ($mr in $mirrorRoots) {
+      if (-not (Test-Path -LiteralPath $mr)) { continue }
+      Get-ChildItem -LiteralPath $mr -Recurse -File | ForEach-Object {
+        $rel2 = $_.FullName.Substring($rootPrefix.Length)
+        if (Test-IgnoredRel $rel2 $ignorePatterns) { return }       # never delete ignored content
+        if (-not $seen.Contains($_.FullName.ToLowerInvariant())) {
+          Remove-Item -LiteralPath $_.FullName -Force -EA SilentlyContinue; $deleted++
+        }
       }
     }
   }
-  elseif (-not $syncOk) { Write-Host '[fetch] sync did not finish cleanly - nothing deleted' }
+  else { Write-Host '[fetch] sync did not finish cleanly - nothing deleted' }
 
   Write-Line $stream 'BYE'
   $secs = ((Get-Date) - $runStart).TotalSeconds

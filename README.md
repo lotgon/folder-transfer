@@ -19,6 +19,7 @@ folder over TLS and shuts itself down, leaving the machine exactly as it was. It
 
 - [Quick start](#quick-start)
 - [Modes](#modes)
+- [Many folders and ignoring](#many-folders-and-ignoring)
 - [Parameters](#parameters)
 - [Progress and logs](#progress-and-logs)
 - [Security](#security)
@@ -60,17 +61,51 @@ files removed on the source are deleted on the receiver, unchanged files are ski
   or create the printed `ft-cutover.go` file); pass 2 transfers only the delta. `-Cutover`
   implies `-Once`. Consistency depends on stopping the DB cleanly before pass 2.
 
+## Many folders and ignoring
+
+For a bigger job — several source folders and paths you want to skip (big log dirs, temp
+files) — put everything in a **JSON config** and run `folder-transfer.bat -Config sync.json`:
+
+```json
+{
+  "folders": ["H:/FTHistory/Quote/Bars", "H:/FTHistory/Quote/Ticks"],
+  "ignore":  ["log/", "*.tmp", "mtlog"],
+  "once": true,
+  "allowIp": "10.0.0.7"
+}
+```
+
+- `folders` — each is shared and arrives under its own name (`<dest>\Bars\…`, `<dest>\Ticks\…`).
+  Use forward slashes (or escaped `\\`).
+- `ignore` — name patterns; the rest of the keys are the same options as the command line
+  (command‑line options override the JSON).
+- You can also ignore from the command line: `-Ignore log/,*.tmp,mtlog`.
+
+**Ignore pattern rules** (like `.gitignore`, matched by name at any depth):
+
+| Pattern | Matches |
+|---------|---------|
+| `log` | a file **or** folder named `log` |
+| `log/` | only a **folder** named `log` (a file named `log` is kept) — trailing `/` = directory‑only |
+| `*.tmp` | anything ending in `.tmp` (wildcards `*` `?`, case‑insensitive) |
+
+A matched folder is skipped whole. Ignored content is **never transferred and never deleted**
+on the receiver.
+
 ## Parameters
 
 Two separate programs: the **sender** (`folder-transfer.bat`) which you configure, and the
 **receiver** (`ft-download-<name>.bat`) which the sender generates with everything baked in.
 The token is auto‑generated and baked in — you never set it. Help: `folder-transfer.bat --help`.
 
-**Sender** — only the folder is required (positional, first arg); names are case‑insensitive:
+**Sender** — give a folder (positional, first arg) *or* `-Config` with `folders`; names are
+case‑insensitive:
 
 | Option | Default | Meaning |
 |--------|---------|---------|
-| `<folder>` (positional) | required | Folder to share, read‑only. |
+| `<folder>` (positional) | required (or via `-Config`) | Folder to share, read‑only. |
+| `-Config <file.json>` | — | JSON with `folders`, `ignore`, and any options below. |
+| `-Ignore <list>` | none | Ignore name patterns, comma/semicolon separated (`log/,*.tmp`). |
 | `-Cutover` | off | Two‑phase sync for a live DB (implies `-Once`). |
 | `-AllowIp <ip>` | any | Serve only this client IP. |
 | `-Once` | off | Close after one successful transfer. |

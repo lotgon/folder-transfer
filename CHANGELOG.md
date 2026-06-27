@@ -12,7 +12,22 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
-## [0.5.2] — 2026-06-18
+## [0.6.0] — 2026-06-18
+
+### Added
+- **Multiple folders, ignore patterns, and a JSON config.** Share several folders in one run
+  and skip paths you don't want (big log dirs, temp files):
+  - `-Config <file.json>` — put it all in JSON: `folders` (list), `ignore` (list), and any of
+    the usual options (`port`, `allowIp`, `serverHost`, `cutover`, `once`, …). Use forward
+    slashes or escaped `\\` in paths. Command‑line options override JSON.
+  - `-Ignore <list>` — ignore patterns on the command line (comma/semicolon separated).
+  - **Pattern rules:** matched against each path‑segment **name**, wildcards `*` and `?`,
+    case‑insensitive, at any depth. A **trailing `/` means directory‑only** (`log/` skips
+    folders named `log` but keeps a file named `log`); without it, both. A matched directory is
+    pruned whole.
+  - Ignored content is **never transferred and never deleted** on the receiver (patterns are
+    baked into the generated client so its mirror step skips them).
+  - Each shared folder still arrives under its own name (`<dest>\Bars\…`, `<dest>\Ticks\…`).
 
 ### Docs
 - README trimmed to the essentials with a **Contents** (table of contents) at the top for quick
@@ -168,8 +183,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.5.2...HEAD
-[0.5.2]: https://github.com/lotgon/folder-transfer/compare/v0.5.1...v0.5.2
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/lotgon/folder-transfer/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/lotgon/folder-transfer/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/lotgon/folder-transfer/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/lotgon/folder-transfer/compare/v0.4.0...v0.4.1
