@@ -12,6 +12,21 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.8.0] — 2026-06-27
+
+### Added
+- **Path-aware ignore patterns.** A pattern containing `/` is now matched against the relative
+  path (anchored at the shared‑folder name), so `AdminEye/Reports/` skips just that subfolder and
+  `*/cache/` / `**/cache/` target a depth or any depth. Patterns without `/` still match a name at
+  any depth. `*` and `?` stay within a segment; `**` spans `/`. Applied identically on the client
+  so the mirror never deletes ignored paths.
+- **Forgiving JSON config.** Paths may use single backslashes (`C:\Data`), doubled (`C:\\Data`) or
+  forward slashes — all parsed correctly — and a **trailing comma** after the last list item is
+  tolerated. A folder path with a trailing slash now resolves correctly too.
+- **`sync.example.json` lists every parameter** (folders, ignore, compress, cutover, once, allowIp,
+  serverHost, clientOut, port, idleSeconds, stallTimeout, noFirewall) so the full format ships in
+  the release.
+
 ## [0.7.2] — 2026-06-27
 
 ### Changed
@@ -207,7 +222,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/lotgon/folder-transfer/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/lotgon/folder-transfer/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/lotgon/folder-transfer/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/lotgon/folder-transfer/compare/v0.6.0...v0.7.0

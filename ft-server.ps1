@@ -34,15 +34,54 @@ function Format-Span($sec) {
   if ($sec -lt 0 -or $sec -gt 359999) { return '?' }
   return ('{0:hh\:mm\:ss}' -f [TimeSpan]::FromSeconds([int]$sec))
 }
-function Test-Ignored([string]$name, [bool]$isDir, $patterns) {
-  # Match one path-segment NAME against ignore patterns (wildcards * and ?).
-  # A pattern ending in / or \ matches directories only. Case-insensitive.
+$script:RxCache = @{}
+function Convert-GlobToRegex([string]$glob) {
+  # glob with '/' separators -> anchored regex. * = within a segment, ** = any depth, ? = one char.
+  if ($script:RxCache.ContainsKey($glob)) { return $script:RxCache[$glob] }
+  $sb = New-Object Text.StringBuilder; [void]$sb.Append('^'); $i = 0
+  while ($i -lt $glob.Length) {
+    $c = $glob[$i]
+    if ($c -eq '*') {
+      if (($i + 1) -lt $glob.Length -and $glob[$i + 1] -eq '*') { [void]$sb.Append('.*'); $i += 2 }
+      else { [void]$sb.Append('[^/]*'); $i++ }
+    }
+    elseif ($c -eq '?') { [void]$sb.Append('[^/]'); $i++ }
+    else { [void]$sb.Append([Regex]::Escape([string]$c)); $i++ }
+  }
+  [void]$sb.Append('$')
+  $rx = New-Object Text.RegularExpressions.Regex($sb.ToString(), [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+  $script:RxCache[$glob] = $rx
+  return $rx
+}
+function Test-IgnoredRel([string]$rel, [bool]$isDir, $patterns) {
+  # Is this item (or any ancestor dir of it) ignored? rel is relative to the shared folder's
+  # parent (its first segment is the shared folder's own name). Pattern rules:
+  #   - trailing '/' => directories only
+  #   - no '/' in the body  => NAME pattern: matches any path segment (wildcards * ?)
+  #   - '/' in the body     => PATH pattern: anchored at the root; * stays within a segment,
+  #                            ** spans any depth.  e.g. AdminEye/Reports/ , */ttscache/ , **/cache/
+  if (-not $patterns -or @($patterns).Count -eq 0) { return $false }
+  $rel = ($rel -replace '\\', '/').Trim('/')
+  if (-not $rel) { return $false }
+  $segs = $rel -split '/'
   foreach ($p in $patterns) {
-    $pat = $p; $dirOnly = $false
-    if ($pat.EndsWith('/') -or $pat.EndsWith('\')) { $dirOnly = $true; $pat = $pat.TrimEnd('/', '\') }
-    if ($pat -eq '') { continue }
-    if ($dirOnly -and -not $isDir) { continue }
-    if ($name -like $pat) { return $true }
+    $body = ($p -replace '\\', '/'); $dirOnly = $body.EndsWith('/'); $body = $body.Trim('/')
+    if (-not $body) { continue }
+    if ($body.Contains('/')) {
+      $rx = Convert-GlobToRegex $body
+      for ($i = 1; $i -le $segs.Count; $i++) {
+        $isSegDir = ($i -lt $segs.Count) -or $isDir
+        if ($dirOnly -and -not $isSegDir) { continue }
+        if ($rx.IsMatch(($segs[0..($i - 1)] -join '/'))) { return $true }
+      }
+    }
+    else {
+      for ($i = 0; $i -lt $segs.Count; $i++) {
+        $isSegDir = ($i -lt ($segs.Count - 1)) -or $isDir
+        if ($dirOnly -and -not $isSegDir) { continue }
+        if ($segs[$i] -like $body) { return $true }
+      }
+    }
   }
   return $false
 }
@@ -111,8 +150,17 @@ $folders = @()
 $ignorePatterns = @()
 if ($Config) {
   if (-not (Test-Path -LiteralPath $Config)) { Write-Host "ERROR: -Config file not found: $Config"; return }
-  try { $cfg = (Get-Content -Raw -LiteralPath $Config -Encoding UTF8) | ConvertFrom-Json }
-  catch { Write-Host "ERROR: could not parse JSON in $Config -- $_"; return }
+  $cfgRaw = Get-Content -Raw -LiteralPath $Config -Encoding UTF8
+  $cfg = $null
+  try { $cfg = $cfgRaw | ConvertFrom-Json }
+  catch {
+    # Forgiving retry for hand-edited configs: (1) double un-escaped Windows backslashes so
+    # "C:\Data", "C:\\Data" and "C:/Data" all work; (2) drop trailing commas before ] or }.
+    $fixed = $cfgRaw -replace '\\', '\\'
+    $fixed = $fixed -replace ',(\s*[\]}])', '$1'
+    try { $cfg = $fixed | ConvertFrom-Json }
+    catch { Write-Host "ERROR: could not parse JSON in $Config -- $_"; return }
+  }
   if ($cfg.folders) { $folders += @($cfg.folders) }
   if ($cfg.folder) { $folders += @($cfg.folder) }
   if ($cfg.ignore) { $ignorePatterns += @($cfg.ignore) }
@@ -159,7 +207,9 @@ foreach ($f in $folders) {
   $f = "$f".Trim().Trim('"')
   if (-not $f) { continue }
   if (-not (Test-Path -LiteralPath $f)) { Write-Host "ERROR: folder not found: $f"; return }
-  $resolved += (Resolve-Path -LiteralPath $f).Path
+  $rp = (Resolve-Path -LiteralPath $f).Path.TrimEnd('\', '/')   # drop trailing slash so the
+  if ($rp -match '^[A-Za-z]:$') { $rp += '\' }                  # folder name resolves correctly
+  $resolved += $rp
 }
 $folders = @($resolved)
 if ($ignorePatterns.Count) { Log ("ignore patterns: {0}" -f ($ignorePatterns -join ', ')) }
@@ -226,15 +276,16 @@ function Get-FileCount($roots, $ignore) {
   # total matches what is actually offered. Best-effort: unreadable dirs skipped.
   $n = 0
   foreach ($root in $roots) {
+    $base = Split-Path $root -Parent; if (-not $base) { $base = $root }
     $stack = New-Object System.Collections.Stack
     $stack.Push($root)
     while ($stack.Count -gt 0) {
       $dir = $stack.Pop()
       try { foreach ($sd in [IO.Directory]::EnumerateDirectories($dir)) {
-          if (-not (Test-Ignored (Split-Path $sd -Leaf) $true $ignore)) { $stack.Push($sd) }
+          if (-not (Test-IgnoredRel ($sd.Substring($base.Length)) $true $ignore)) { $stack.Push($sd) }
         } } catch {}
       try { foreach ($f in [IO.Directory]::EnumerateFiles($dir)) {
-          if (-not (Test-Ignored ([IO.Path]::GetFileName($f)) $false $ignore)) { $n++ }
+          if (-not (Test-IgnoredRel ($f.Substring($base.Length)) $false $ignore)) { $n++ }
         } } catch {}
     }
   }
@@ -260,14 +311,14 @@ function Send-Pass($s, $roots, $total, $ignore) {
   while ($stack.Count -gt 0) {
     $dir = $stack.Pop()
     try { foreach ($sd in [IO.Directory]::EnumerateDirectories($dir)) {
-        if (-not (Test-Ignored (Split-Path $sd -Leaf) $true $ignore)) { $stack.Push($sd) }
+        if (-not (Test-IgnoredRel ($sd.Substring($base.Length)) $true $ignore)) { $stack.Push($sd) }
       } } catch {}
     $en = $null
     try { $en = [IO.Directory]::EnumerateFiles($dir).GetEnumerator() } catch { $en = $null }
     if (-not $en) { continue }
     while ($en.MoveNext()) {
       $full = $en.Current
-      if (Test-Ignored ([IO.Path]::GetFileName($full)) $false $ignore) { continue }
+      if (Test-IgnoredRel ($full.Substring($base.Length)) $false $ignore) { continue }
       $fi = $null
       try { $fi = [IO.FileInfo]::new($full) } catch { $fi = $null }
       if (-not $fi) { continue }

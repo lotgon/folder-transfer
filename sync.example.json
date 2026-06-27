@@ -1,16 +1,17 @@
 {
-  "_comment": "folder-transfer config. Run:  folder-transfer.bat -Config sync.json   Windows paths: double the backslashes as shown below (forward slashes also work). Command-line options override these. All keys except 'folders' are optional.",
+  "_comment": "folder-transfer config. Run:  folder-transfer.bat -Config sync.json   Paths accept backslashes (single or doubled) or forward slashes; trailing commas are tolerated. Only 'folders' is required - the rest are optional and shown here with their defaults.",
 
   "folders": [
-    "H:\\Data\\ProjectA",
-    "H:\\Data\\ProjectB"
+    "C:\\Data\\ProjectA",
+    "C:\\Data\\ProjectB"
   ],
 
   "ignore": [
     "log/",
+    "*logs/",
     "*.tmp",
-    "*.log",
-    "mtlog"
+    "ProjectA/Reports/",
+    "**/ttscache/"
   ],
 
   "compress": true,
@@ -19,6 +20,7 @@
 
   "allowIp": "",
   "serverHost": "",
+  "clientOut": "",
   "port": 8722,
   "idleSeconds": 600,
   "stallTimeout": 120,

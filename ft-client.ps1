@@ -57,20 +57,51 @@ function Format-Span($sec) {
   if ($sec -lt 0 -or $sec -gt 359999) { return '?' }
   return ('{0:hh\:mm\:ss}' -f [TimeSpan]::FromSeconds([int]$sec))
 }
-function Test-IgnoredRel([string]$rel, $patterns) {
-  # Does any segment of this destination-relative path match an ignore pattern?
-  # Used so the mirror never deletes ignored content. A pattern ending in / or \
-  # matches directory segments only (not the final file name). Mirrors the server.
-  if (-not $patterns -or $patterns.Count -eq 0) { return $false }
-  $segs = $rel -split '[\\/]' | Where-Object { $_ -ne '' }
-  for ($i = 0; $i -lt $segs.Count; $i++) {
-    $isLast = ($i -eq $segs.Count - 1)   # the file itself
-    foreach ($p in $patterns) {
-      $pat = $p; $dirOnly = $false
-      if ($pat.EndsWith('/') -or $pat.EndsWith('\')) { $dirOnly = $true; $pat = $pat.TrimEnd('/', '\') }
-      if ($pat -eq '') { continue }
-      if ($dirOnly -and $isLast) { continue }
-      if ($segs[$i] -like $pat) { return $true }
+$script:RxCache = @{}
+function Convert-GlobToRegex([string]$glob) {
+  # glob with '/' separators -> anchored regex. * = within a segment, ** = any depth, ? = one char.
+  if ($script:RxCache.ContainsKey($glob)) { return $script:RxCache[$glob] }
+  $sb = New-Object Text.StringBuilder; [void]$sb.Append('^'); $i = 0
+  while ($i -lt $glob.Length) {
+    $c = $glob[$i]
+    if ($c -eq '*') {
+      if (($i + 1) -lt $glob.Length -and $glob[$i + 1] -eq '*') { [void]$sb.Append('.*'); $i += 2 }
+      else { [void]$sb.Append('[^/]*'); $i++ }
+    }
+    elseif ($c -eq '?') { [void]$sb.Append('[^/]'); $i++ }
+    else { [void]$sb.Append([Regex]::Escape([string]$c)); $i++ }
+  }
+  [void]$sb.Append('$')
+  $rx = New-Object Text.RegularExpressions.Regex($sb.ToString(), [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+  $script:RxCache[$glob] = $rx
+  return $rx
+}
+function Test-IgnoredRel([string]$rel, [bool]$isDir, $patterns) {
+  # Is this item (or any ancestor dir) ignored? Mirrors the server so the client's mirror
+  # step never deletes ignored content. Same rules: trailing '/' = dirs only; a body without
+  # '/' is a NAME pattern (any segment); a body with '/' is a PATH pattern anchored at the root
+  # (* within a segment, ** any depth).
+  if (-not $patterns -or @($patterns).Count -eq 0) { return $false }
+  $rel = ($rel -replace '\\', '/').Trim('/')
+  if (-not $rel) { return $false }
+  $segs = $rel -split '/'
+  foreach ($p in $patterns) {
+    $body = ($p -replace '\\', '/'); $dirOnly = $body.EndsWith('/'); $body = $body.Trim('/')
+    if (-not $body) { continue }
+    if ($body.Contains('/')) {
+      $rx = Convert-GlobToRegex $body
+      for ($i = 1; $i -le $segs.Count; $i++) {
+        $isSegDir = ($i -lt $segs.Count) -or $isDir
+        if ($dirOnly -and -not $isSegDir) { continue }
+        if ($rx.IsMatch(($segs[0..($i - 1)] -join '/'))) { return $true }
+      }
+    }
+    else {
+      for ($i = 0; $i -lt $segs.Count; $i++) {
+        $isSegDir = ($i -lt ($segs.Count - 1)) -or $isDir
+        if ($dirOnly -and -not $isSegDir) { continue }
+        if ($segs[$i] -like $body) { return $true }
+      }
     }
   }
   return $false
@@ -199,7 +230,7 @@ try {
       if (-not (Test-Path -LiteralPath $mr)) { continue }
       Get-ChildItem -LiteralPath $mr -Recurse -File | ForEach-Object {
         $rel2 = $_.FullName.Substring($rootPrefix.Length)
-        if (Test-IgnoredRel $rel2 $ignorePatterns) { return }       # never delete ignored content
+        if (Test-IgnoredRel $rel2 $false $ignorePatterns) { return } # never delete ignored content
         if (-not $seen.Contains($_.FullName.ToLowerInvariant())) {
           Remove-Item -LiteralPath $_.FullName -Force -EA SilentlyContinue; $deleted++
         }

@@ -79,18 +79,23 @@ A ready‑to‑edit **`sync.example.json`** ships alongside the scripts — copy
 ```
 
 - `folders` — each is shared and arrives under its own name (`<dest>\Bars\…`, `<dest>\Ticks\…`).
-  In JSON, double the backslashes (`C:\\path`) — or use forward slashes; both work on Windows.
-- `ignore` — name patterns; the rest of the keys are the same options as the command line
+  Paths are lenient: backslashes (single `C:\path` or doubled `C:\\path`) **or** forward slashes
+  all work, and a **trailing comma** after the last item is tolerated.
+- `ignore` — patterns (see below); the rest of the keys are the same options as the command line
   (command‑line options override the JSON). `"compress": false` turns off compression.
+- A ready `sync.example.json` with **every** key ships in the release — copy and trim it.
 - You can also ignore from the command line: `-Ignore log/,*.tmp,mtlog`.
 
-**Ignore pattern rules** (like `.gitignore`, matched by name at any depth):
+**Ignore pattern rules** (like `.gitignore`, case‑insensitive):
 
 | Pattern | Matches |
 |---------|---------|
-| `log` | a file **or** folder named `log` |
+| `log` | a file **or** folder named `log`, at any depth |
 | `log/` | only a **folder** named `log` (a file named `log` is kept) — trailing `/` = directory‑only |
-| `*.tmp` | anything ending in `.tmp` (wildcards `*` `?`, case‑insensitive) |
+| `*.tmp` | anything ending in `.tmp` (`*` `?` are wildcards within a name) |
+| `Bars/Reports/` | the `Reports` folder directly under the shared `Bars` (a pattern with `/` is a **path**, anchored at the shared‑folder name) |
+| `*/cache/` | a `cache` folder exactly one level deep; `*` does not cross `/` |
+| `**/cache/` | a `cache` folder at **any** depth (`**` spans `/`) |
 
 A matched folder is skipped whole. Ignored content is **never transferred and never deleted**
 on the receiver.
