@@ -12,6 +12,14 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.10.4] — 2026-06-27
+
+### Changed
+- **Simplified `--help`.** It now leads with the folder‑or‑config entry and just the few common
+  options (`-Once`, `-AllowIp`, `-ServerHost`, `-Ignore`), with the rest under a one‑line
+  **ADVANCED** pointer (and a note that everything can also go in the JSON config). No behaviour
+  change — all options still work.
+
 ## [0.10.3] — 2026-06-27
 
 ### Changed
@@ -308,7 +316,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.10.3...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.10.4...HEAD
+[0.10.4]: https://github.com/lotgon/folder-transfer/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/lotgon/folder-transfer/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/lotgon/folder-transfer/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/lotgon/folder-transfer/compare/v0.10.0...v0.10.1
