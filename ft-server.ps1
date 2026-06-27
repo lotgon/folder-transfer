@@ -312,7 +312,7 @@ endlocal & exit /b %RC%
 }
 
 $script:SmallFile = 65536    # files <= this are batched into one bundle (cuts per-file round-trips)
-$script:BundleMax = 256      # flush a bundle after this many small files
+$script:BundleMax = 1024     # flush a bundle after this many small files (fewer round-trips over WAN)
 function Send-Bundle($s, $bundle, $st, $total) {
   # Send many small files with ONE round-trip instead of one per file. Protocol:
   #   server: "B <count>" then <count> manifest lines "<size> <mtime> <rel>"

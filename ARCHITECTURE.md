@@ -80,7 +80,7 @@ Key points:
   add a silent delay and a second full walk), so the transfer starts at once and memory stays flat
   even for millions of files. `T` therefore carries `0` (total unknown), and progress shows
   running counts + speed without an "x of N" or ETA.
-- **Small files are bundled.** Files ≤ 64 KB are batched (up to 256 per bundle) and exchanged in
+- **Small files are bundled.** Files ≤ 64 KB are batched (up to 1024 per bundle) and exchanged in
   **one round‑trip per bundle** instead of one per file: manifest → want‑mask → only the wanted
   files stream back. Over a high‑latency link this is the difference between minutes and hours.
 - **Large files are streamed individually**, optionally **compressed**: each is Deflate‑compressed
@@ -200,7 +200,7 @@ lingering exposure (one‑shot / idle auto‑shutdown + cleanup).
   constant memory. (The only up‑front pass is a cheap count for the progress bar.)
 - **Why bundle small files?** The protocol is one round‑trip per item; over a high‑latency link
   thousands of tiny files are latency‑bound, not bandwidth‑bound. Bundling amortises the round‑trip
-  over up to 256 files while still preserving the per‑file delta via the want‑mask.
+  over up to 1024 files while still preserving the per‑file delta via the want‑mask.
 - **Why compress per‑block, and skip some files?** Per‑block deflate keeps memory constant and lets
   the receiver frame each chunk exactly; already‑compressed types (and tiny files) are sent raw so
   no CPU is wasted where it can't help.

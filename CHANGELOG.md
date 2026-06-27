@@ -12,6 +12,13 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.11.1] — 2026-06-27
+
+### Changed
+- **Bundle size raised 256 → 1024 small files.** Fewer round‑trips for trees with lots of small
+  files over a high‑latency/WAN link (e.g. ~1M tiny files now take ~4× fewer exchanges). Memory
+  is just per‑bundle metadata, so it stays negligible.
+
 ## [0.11.0] — 2026-06-27
 
 ### Changed
@@ -326,7 +333,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/lotgon/folder-transfer/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/lotgon/folder-transfer/compare/v0.10.4...v0.11.0
 [0.10.4]: https://github.com/lotgon/folder-transfer/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/lotgon/folder-transfer/compare/v0.10.2...v0.10.3
