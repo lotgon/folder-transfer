@@ -1,17 +1,20 @@
 {
-  "_comment": "folder-transfer config. Run:  folder-transfer.bat -Config sync.json   This is standard JSON: in paths use forward slashes C:/path OR doubled backslashes C:\\path (a single backslash or a trailing comma is an error). Only 'folders' is required - the rest are optional and shown here with their defaults.",
+  "_comment": "EXAMPLE: copy your main folders to a new PC. Steps: (1) replace YourName below, (2) run on the OLD pc:  folder-transfer.bat -Config sync.json  (3) copy the generated download-scripts file to the NEW pc and run it. Standard JSON: in paths use forward slashes C:/path or doubled backslashes C:\\path. Ignore rules: a bare name (no slash) matches at ANY depth; '*' matches inside one name; '**' matches across folders (any depth); a trailing '/' means folders only. Only 'folders' is required; the rest are optional and shown with their defaults.",
 
   "folders": [
-    "C:\\Data\\ProjectA",
-    "C:\\Data\\ProjectB"
+    "C:/Users/YourName/Documents",
+    "C:/Users/YourName/Pictures",
+    "C:/Users/YourName/Desktop",
+    "C:/Users/YourName/Downloads"
   ],
 
   "ignore": [
-    "log/",
-    "*logs/",
     "*.tmp",
-    "ProjectA/Reports/",
-    "**/ttscache/"
+    "~$*",
+    "Thumbs.db",
+    "desktop.ini",
+    "**/node_modules/",
+    "**/cache/"
   ],
 
   "compress": true,

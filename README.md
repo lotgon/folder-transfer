@@ -70,13 +70,15 @@ A ready‑to‑edit **`sync.example.json`** ships alongside the scripts — copy
 
 ```json
 {
-  "folders": ["H:\\FTHistory\\Quote\\Bars", "H:\\FTHistory\\Quote\\Ticks"],
-  "ignore":  ["log/", "*.tmp", "mtlog"],
+  "folders": ["C:/Users/YourName/Documents", "C:/Users/YourName/Pictures"],
+  "ignore":  ["*.tmp", "~$*", "**/node_modules/", "**/cache/"],
   "once": true,
-  "allowIp": "10.0.0.7",
   "compress": true
 }
 ```
+
+(A migration example — copying your folders to a new PC. `*` matches within a name (`*.tmp`,
+`~$*`); `**/node_modules/` and `**/cache/` skip those folders at **any** depth.)
 
 - `folders` — each is shared and arrives under its own name (`<dest>\Bars\…`, `<dest>\Ticks\…`).
   It's standard JSON: in paths use **forward slashes** (`C:/path`) **or doubled backslashes**

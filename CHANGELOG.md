@@ -12,6 +12,13 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.8.2] — 2026-06-27
+
+### Changed
+- **`sync.example.json` is now a relatable "move to a new PC" example** — copies Documents /
+  Pictures / Desktop / Downloads and shows the ignore syntax by example, including both `*`
+  (`*.tmp`, `~$*`) and `**` (`**/node_modules/`, `**/cache/`). README example matched.
+
 ## [0.8.1] — 2026-06-27
 
 ### Changed
@@ -230,7 +237,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/lotgon/folder-transfer/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/lotgon/folder-transfer/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/lotgon/folder-transfer/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/lotgon/folder-transfer/compare/v0.7.1...v0.7.2
