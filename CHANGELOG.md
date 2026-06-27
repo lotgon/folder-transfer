@@ -12,6 +12,14 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.10.1] — 2026-06-27
+
+### Changed
+- **Ignored directories are recreated empty on the receiver** (with their subdirectory tree),
+  instead of being skipped entirely. Their files are still not transferred — but the folders now
+  exist, because some software won't start without them. (New one‑way `D <rel>` protocol message;
+  the empty dirs aren't touched by the mirror.)
+
 ## [0.10.0] — 2026-06-27
 
 ### Added
@@ -285,7 +293,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/lotgon/folder-transfer/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/lotgon/folder-transfer/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/lotgon/folder-transfer/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/lotgon/folder-transfer/compare/v0.9.1...v0.9.2

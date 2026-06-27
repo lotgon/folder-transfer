@@ -158,6 +158,17 @@ try {
       if ($null -eq $h) { $more = $false; break }
       if ($h -eq 'PASS-END') { break }
       if ($h -match '^T (\d+)$') { $total = [int64]$matches[1]; continue }   # server's file count
+      if ($h -match '^D (.+)$') {
+        # create an (empty) directory - used for ignored folders so the structure still exists
+        $drel = $matches[1]
+        $dt = [IO.Path]::GetFullPath((Join-Path $ToFolder $drel))
+        if ($dt.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+          if (-not (Test-Path -LiteralPath $dt)) { New-Item -ItemType Directory -Path $dt -Force | Out-Null }
+          $top = ($drel -split '[\\/]')[0]
+          if ($top) { [void]$mirrorRoots.Add([IO.Path]::GetFullPath((Join-Path $ToFolder $top))) }
+        }
+        continue
+      }
       if ($h -match '^B (\d+)$') {
         # bundle of small files: read the manifest, reply with a want-mask, receive the wanted ones
         $bcount = [int]$matches[1]

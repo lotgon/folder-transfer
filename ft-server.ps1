@@ -385,11 +385,21 @@ function Send-Pass($s, $roots, $total, $ignore) {
   $base = Split-Path $root -Parent
   if (-not $base) { $base = $root }
   $stack = New-Object System.Collections.Stack
-  $stack.Push($root)
+  $stack.Push([pscustomobject]@{ Dir = $root; DirsOnly = $false })
   while ($stack.Count -gt 0) {
-    $dir = $stack.Pop()
+    $it = $stack.Pop()
+    $dir = $it.Dir
+    if ($it.DirsOnly) {
+      # ignored subtree: recreate the (empty) directory on the client and recurse into its
+      # subdirs, but send NO files - some software won't start without the folders existing.
+      $relDir = $dir.Substring($base.Length).TrimStart('\', '/')
+      if ($relDir) { Write-Line $s ("D {0}" -f $relDir) }
+      try { foreach ($sd in [IO.Directory]::EnumerateDirectories($dir)) { $stack.Push([pscustomobject]@{ Dir = $sd; DirsOnly = $true }) } } catch {}
+      continue
+    }
     try { foreach ($sd in [IO.Directory]::EnumerateDirectories($dir)) {
-        if (-not (Test-IgnoredRel ($sd.Substring($base.Length)) $true $ignore)) { $stack.Push($sd) }
+        $ig = Test-IgnoredRel ($sd.Substring($base.Length)) $true $ignore
+        $stack.Push([pscustomobject]@{ Dir = $sd; DirsOnly = $ig })
       } } catch {}
     $en = $null
     try { $en = [IO.Directory]::EnumerateFiles($dir).GetEnumerator() } catch { $en = $null }
