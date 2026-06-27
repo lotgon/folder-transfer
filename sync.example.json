@@ -1,0 +1,26 @@
+{
+  "_comment": "folder-transfer config. Run:  folder-transfer.bat -Config sync.json   Use forward slashes in paths. Command-line options override these values. Delete any keys you do not need (all except 'folders' are optional).",
+
+  "folders": [
+    "H:/Data/ProjectA",
+    "H:/Data/ProjectB"
+  ],
+
+  "ignore": [
+    "log/",
+    "*.tmp",
+    "*.log",
+    "mtlog"
+  ],
+
+  "compress": true,
+  "cutover": false,
+  "once": true,
+
+  "allowIp": "",
+  "serverHost": "",
+  "port": 8722,
+  "idleSeconds": 600,
+  "stallTimeout": 120,
+  "noFirewall": false
+}

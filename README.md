@@ -65,7 +65,8 @@ files removed on the source are deleted on the receiver, unchanged files are ski
 ## Many folders and ignoring
 
 For a bigger job — several source folders and paths you want to skip (big log dirs, temp
-files) — put everything in a **JSON config** and run `folder-transfer.bat -Config sync.json`:
+files) — put everything in a **JSON config** and run `folder-transfer.bat -Config sync.json`.
+A ready‑to‑edit **`sync.example.json`** ships alongside the scripts — copy it and adjust:
 
 ```json
 {
@@ -197,6 +198,7 @@ Keep the three sender files together. `folder-transfer.bat` is a thin launcher f
 | `folder-transfer.bat` | sender | Thin launcher you run (asks interactively if given no args). |
 | `ft-server.ps1` | sender | Server engine. |
 | `ft-client.ps1` | sender | Client engine, embedded into the generated client. |
+| `sync.example.json` | sender | Sample `-Config` file — copy, edit, and pass with `-Config`. |
 | `download-scripts/ft-download-<name>.bat` | receiver | Generated single self‑contained file — the only thing you carry over. |
 
 ## License

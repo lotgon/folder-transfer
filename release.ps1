@@ -49,7 +49,7 @@ $title = "folder-transfer $tag"
 Info "version $ver  ->  tag $tag  ->  repo $Repo"
 
 # ---- payload: the sender-side files a user actually needs ----------------
-$payload = @('folder-transfer.bat', 'ft-server.ps1', 'ft-client.ps1', 'README.md', 'LICENSE')
+$payload = @('folder-transfer.bat', 'ft-server.ps1', 'ft-client.ps1', 'sync.example.json', 'README.md', 'LICENSE')
 foreach ($f in $payload) {
   if (-not (Test-Path -LiteralPath (Join-Path $root $f))) { Die "missing release file: $f" }
 }
