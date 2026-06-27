@@ -12,6 +12,14 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.9.0] — 2026-06-27
+
+### Added
+- **Comments in the JSON config.** The `-Config` file may now contain `//` line and `/* */`
+  block comments (string‑aware, so paths are untouched). `sync.example.json` is now fully
+  commented — every parameter has a short explanation inline. Genuine JSON errors (a single
+  backslash, a trailing comma) are still reported, not auto‑fixed.
+
 ## [0.8.2] — 2026-06-27
 
 ### Changed
@@ -237,7 +245,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/lotgon/folder-transfer/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/lotgon/folder-transfer/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/lotgon/folder-transfer/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/lotgon/folder-transfer/compare/v0.7.2...v0.8.0

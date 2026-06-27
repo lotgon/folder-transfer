@@ -85,7 +85,8 @@ A ready‑to‑edit **`sync.example.json`** ships alongside the scripts — copy
   (`C:\\path`). A single backslash or a trailing comma is invalid and is reported (not auto‑fixed).
 - `ignore` — patterns (see below); the rest of the keys are the same options as the command line
   (command‑line options override the JSON). `"compress": false` turns off compression.
-- A ready `sync.example.json` with **every** key ships in the release — copy and trim it.
+- A ready `sync.example.json` with **every** key ships in the release — copy and trim it. The
+  config accepts `//` and `/* */` **comments** (it's fully commented).
 - You can also ignore from the command line: `-Ignore log/,*.tmp,mtlog`.
 
 **Ignore pattern rules** (like `.gitignore`, case‑insensitive):

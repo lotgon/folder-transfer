@@ -1,31 +1,35 @@
 {
-  "_comment": "EXAMPLE: copy your main folders to a new PC. Steps: (1) replace YourName below, (2) run on the OLD pc:  folder-transfer.bat -Config sync.json  (3) copy the generated download-scripts file to the NEW pc and run it. Standard JSON: in paths use forward slashes C:/path or doubled backslashes C:\\path. Ignore rules: a bare name (no slash) matches at ANY depth; '*' matches inside one name; '**' matches across folders (any depth); a trailing '/' means folders only. Only 'folders' is required; the rest are optional and shown with their defaults.",
+  // EXAMPLE: copy your main folders to a new PC.
+  //   1) edit the paths below (replace YourName)
+  //   2) on the OLD pc run:  folder-transfer.bat -Config sync.json
+  //   3) copy the generated download-scripts file to the NEW pc and run it
+  // Paths: forward slashes "C:/path" OR doubled backslashes "C:\\path". Comments (// and /* */) are allowed.
 
-  "folders": [
+  "folders": [                 // folders to copy; each arrives under its own name on the receiver
     "C:/Users/YourName/Documents",
     "C:/Users/YourName/Pictures",
     "C:/Users/YourName/Desktop",
     "C:/Users/YourName/Downloads"
   ],
 
-  "ignore": [
-    "*.tmp",
-    "~$*",
-    "Thumbs.db",
-    "desktop.ini",
-    "**/node_modules/",
-    "**/cache/"
+  "ignore": [                  // skip these.  name (no /) = any depth;  * = within one name;  ** = any depth;  trailing / = folders only
+    "*.tmp",                   // temp files
+    "~$*",                     // Office lock files
+    "Thumbs.db",               // Explorer thumbnail cache
+    "desktop.ini",             // per-folder Explorer settings
+    "**/node_modules/",        // node_modules folder, at any depth
+    "**/cache/"                // any "cache" folder, at any depth
   ],
 
-  "compress": true,
-  "cutover": false,
-  "once": true,
+  "compress": true,            // compress on the fly (already-compressed types are skipped); false to disable
+  "cutover": false,            // true = two-phase mode for a LIVE database (implies once)
+  "once": true,                // exit after one successful transfer
 
-  "allowIp": "",
-  "serverHost": "",
-  "clientOut": "",
-  "port": 8722,
-  "idleSeconds": 600,
-  "stallTimeout": 120,
-  "noFirewall": false
+  "allowIp": "",               // only this client IP may connect (empty = any)
+  "serverHost": "",            // address baked into the client (empty = auto-detect this PC's IPv4)
+  "clientOut": "",             // where to write the client .bat (empty = .\download-scripts\...)
+  "port": 8722,                // TCP port
+  "idleSeconds": 600,          // auto-close after N seconds with no client connected
+  "stallTimeout": 120,         // abort a connected client that sends nothing for N seconds
+  "noFirewall": false          // true = do NOT open the firewall port (opening needs admin)
 }

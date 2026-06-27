@@ -34,6 +34,24 @@ function Format-Span($sec) {
   if ($sec -lt 0 -or $sec -gt 359999) { return '?' }
   return ('{0:hh\:mm\:ss}' -f [TimeSpan]::FromSeconds([int]$sec))
 }
+function Remove-JsonComments([string]$s) {
+  # Strip // line and /* */ block comments so the config can be documented (JSONC).
+  # String-aware: anything inside "double quotes" (with \" escapes) is left untouched.
+  $sb = New-Object Text.StringBuilder; $i = 0; $n = $s.Length; $inStr = $false; $esc = $false
+  while ($i -lt $n) {
+    $c = $s[$i]
+    if ($inStr) {
+      [void]$sb.Append($c)
+      if ($esc) { $esc = $false } elseif ($c -eq '\') { $esc = $true } elseif ($c -eq '"') { $inStr = $false }
+      $i++; continue
+    }
+    if ($c -eq '"') { $inStr = $true; [void]$sb.Append($c); $i++; continue }
+    if ($c -eq '/' -and ($i + 1) -lt $n -and $s[$i + 1] -eq '/') { while ($i -lt $n -and $s[$i] -ne "`n") { $i++ }; continue }
+    if ($c -eq '/' -and ($i + 1) -lt $n -and $s[$i + 1] -eq '*') { $i += 2; while (($i + 1) -lt $n -and -not ($s[$i] -eq '*' -and $s[$i + 1] -eq '/')) { $i++ }; $i += 2; continue }
+    [void]$sb.Append($c); $i++
+  }
+  return $sb.ToString()
+}
 $script:RxCache = @{}
 function Convert-GlobToRegex([string]$glob) {
   # glob with '/' separators -> anchored regex. * = within a segment, ** = any depth, ? = one char.
@@ -150,14 +168,15 @@ $folders = @()
 $ignorePatterns = @()
 if ($Config) {
   if (-not (Test-Path -LiteralPath $Config)) { Write-Host "ERROR: -Config file not found: $Config"; return }
-  # Strict JSON - no auto-correction. Valid paths: forward slashes "C:/path" or doubled
-  # backslashes "C:\\path". A single backslash (or a trailing comma) is invalid JSON and is
-  # reported, not silently fixed.
-  try { $cfg = (Get-Content -Raw -LiteralPath $Config -Encoding UTF8) | ConvertFrom-Json }
+  # JSON (with // and /* */ comments allowed). No other auto-correction: valid paths use forward
+  # slashes "C:/path" or doubled backslashes "C:\\path"; a single backslash or a trailing comma
+  # is reported, not silently fixed.
+  try { $cfg = (Remove-JsonComments (Get-Content -Raw -LiteralPath $Config -Encoding UTF8)) | ConvertFrom-Json }
   catch {
     Write-Host "ERROR: invalid JSON in $Config"
     Write-Host ("  " + $_.Exception.Message)
     Write-Host '  Tip: use forward slashes "C:/path" or DOUBLED backslashes "C:\\path", and no trailing commas.'
+    Write-Host '  ( // and /* */ comments are allowed. )'
     return
   }
   if ($cfg.folders) { $folders += @($cfg.folders) }
