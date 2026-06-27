@@ -121,7 +121,7 @@ case‑insensitive:
 | `-AllowIp <ip>` | any | Serve only this client IP. |
 | `-Once` | off | Close after one successful transfer. |
 | `-IdleSeconds <n>` | `600` | Auto‑close after N s with no client connected. |
-| `-StallTimeout <n>` | `120` | Abort a connected client silent for N s; keep listening. |
+| `-StallTimeout <n>` | `300` | Abort a connected client silent for N s; keep listening. Raise (~1200) for big files over WAN. |
 | `-Port <n>` | `8722` | TCP port. |
 | `-ServerHost <addr>` | auto IPv4 | Address baked into the generated client. |
 | `-ClientOut <path>` | `.\download-scripts\…` | Where to write the generated client. |

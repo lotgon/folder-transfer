@@ -12,6 +12,17 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.9.2] — 2026-06-27
+
+### Changed
+- **Progress updates during a single file, not just between files.** Both server and client now
+  refresh the progress line (~every 2 s) while a large file is streaming, so the megabytes and
+  speed keep climbing instead of looking frozen on a multi‑GB file.
+- **Default `-StallTimeout` raised 120 → 300 s.** A connected client now has to be silent for
+  longer before the server aborts the session, which avoids killing a transfer that is actually
+  progressing over a slow/WAN link. For very large files raise it further (e.g. `1200`) via
+  `-StallTimeout` or `"stallTimeout"` in the config.
+
 ## [0.9.1] — 2026-06-27
 
 ### Fixed
@@ -254,7 +265,8 @@ First functional release. Verified end‑to‑end on Windows 11 over loopback.
   `/?` support.
 - Documentation: `README.md`, `ARCHITECTURE.md`.
 
-[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/lotgon/folder-transfer/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/lotgon/folder-transfer/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/lotgon/folder-transfer/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/lotgon/folder-transfer/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/lotgon/folder-transfer/compare/v0.8.1...v0.8.2

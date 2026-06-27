@@ -17,7 +17,7 @@ param(
   [int]$Port = 8722,
   [string]$AllowIp = '',
   [int]$IdleSeconds = 600,
-  [int]$StallTimeout = 120,     # abort a connected client that sends no data for this many seconds
+  [int]$StallTimeout = 300,     # abort a connected client that sends no data for this many seconds
   [switch]$Once,
   [string]$ServerHost = '',     # address baked into the generated client (auto-detected if empty)
   [string]$ClientOut = '',      # where to write the client (default: .\download-scripts\ft-download-<Folder>.bat)
@@ -33,6 +33,19 @@ function Format-Span($sec) {
   # compact h:mm:ss for ETA; '?' when not meaningful
   if ($sec -lt 0 -or $sec -gt 359999) { return '?' }
   return ('{0:hh\:mm\:ss}' -f [TimeSpan]::FromSeconds([int]$sec))
+}
+function Show-ServeProgress($st, $total) {
+  # throttled (~2s) progress; called between files AND mid-file so big files don't look frozen
+  $nowt = Get-Date
+  if (($nowt - $script:lastProg).TotalSeconds -lt 2) { return }
+  $dt = ($nowt - $script:lastProg).TotalSeconds
+  $spd = if ($dt -gt 0) { (($st.Bytes - $script:lastBytes) / 1MB) / $dt } else { 0 }
+  $el = ($nowt - $script:passStart).TotalSeconds
+  $rate = if ($el -gt 0) { $st.Offered / $el } else { 0 }
+  $left = $total - $st.Offered; if ($left -lt 0) { $left = 0 }
+  $eta = if ($rate -gt 0) { Format-Span ($left / $rate) } else { '?' }
+  Log ("  progress: {0}/{1} files ({2} left) - sent {3}, unchanged {4}, {5:N1} MB @ {6:N1} MB/s, ETA {7}" -f $st.Offered, $total, $left, $st.Sent, $st.Skipped, ($st.Bytes / 1MB), $spd, $eta)
+  $script:lastProg = $nowt; $script:lastBytes = $st.Bytes
 }
 function Remove-JsonComments([string]$s) {
   # Strip // line and /* */ block comments so the config can be documented (JSONC).
@@ -142,7 +155,8 @@ function Show-ServeHelp {
   Write-Host '  -Port <n>           TCP port                               (default: 8722)'
   Write-Host '  -AllowIp <ip>       allow only this client IP              (default: any)'
   Write-Host '  -IdleSeconds <n>    auto-close after N seconds with NO client connected (default: 600)'
-  Write-Host '  -StallTimeout <n>   abort a connected client that sends nothing for N seconds (default: 120)'
+  Write-Host '  -StallTimeout <n>   abort a connected client that sends nothing for N seconds (default: 300)'
+  Write-Host '                      raise it for big files over a slow/WAN link (e.g. 1200)'
   Write-Host '  -Once               close after the first successful transfer (default: off)'
   Write-Host '  -ClientOut <path>   where to write the client bat          (default: .\download-scripts\ft-download-<Folder>.bat)'
   Write-Host '  -NoFirewall         do NOT touch Firewall (default: port IS opened on start + closed on exit; needs admin)'
@@ -325,7 +339,7 @@ function Send-Pass($s, $roots, $total, $ignore) {
   # never sends a path -> no traversal / reserved device names by construction.
   $st = [pscustomobject]@{ Ok = $true; Offered = 0; Sent = 0; Skipped = 0; Bytes = [int64]0; Wire = [int64]0 }
   Write-Line $s ("T {0}" -f $total)   # tell the client the file count for its own progress
-  $passStart = Get-Date; $lastProg = $passStart; $lastBytes = [int64]0
+  $script:passStart = Get-Date; $script:lastProg = $script:passStart; $script:lastBytes = [int64]0
   foreach ($root in $roots) {
   $base = Split-Path $root -Parent
   if (-not $base) { $base = $root }
@@ -348,17 +362,7 @@ function Send-Pass($s, $roots, $total, $ignore) {
       $rel = $full.Substring($base.Length).TrimStart('\', '/')
       Write-Line $s ("F {0} {1} {2}" -f $fi.Length, $fi.LastWriteTimeUtc.Ticks, $rel)
       $st.Offered++
-      $nowt = Get-Date
-      if (($nowt - $lastProg).TotalSeconds -ge 2) {
-        $dt = ($nowt - $lastProg).TotalSeconds
-        $spd = if ($dt -gt 0) { (($st.Bytes - $lastBytes) / 1MB) / $dt } else { 0 }
-        $el = ($nowt - $passStart).TotalSeconds
-        $rate = if ($el -gt 0) { $st.Offered / $el } else { 0 }   # files/sec over the pass
-        $left = $total - $st.Offered; if ($left -lt 0) { $left = 0 }
-        $eta = if ($rate -gt 0) { Format-Span ($left / $rate) } else { '?' }
-        Log ("  progress: {0}/{1} files ({2} left) - sent {3}, unchanged {4}, {5:N1} MB @ {6:N1} MB/s, ETA {7}" -f $st.Offered, $total, $left, $st.Sent, $st.Skipped, ($st.Bytes / 1MB), $spd, $eta)
-        $lastProg = $nowt; $lastBytes = $st.Bytes
-      }
+      Show-ServeProgress $st $total
       $resp = Read-Line $s
       if ($null -eq $resp) { $st.Ok = $false; return $st }
       $offset = [int64]0
@@ -392,6 +396,7 @@ function Send-Pass($s, $roots, $total, $ignore) {
             $n = $fs.Read($buf, 0, [Math]::Min($buf.Length, $left))
             if ($n -le 0) { break }
             $s.Write($buf, 0, $n); $left -= $n
+            $st.Bytes += $n; Show-ServeProgress $st $total
           }
           $st.Wire += $remain
         }
@@ -411,11 +416,12 @@ function Send-Pass($s, $roots, $total, $ignore) {
             Write-Line $s ("{0} {1}" -f $cb.Length, $n)
             $s.Write($cb, 0, $cb.Length)
             $st.Wire += $cb.Length
+            $st.Bytes += $n; Show-ServeProgress $st $total
           }
           Write-Line $s '0 0'
         }
         $s.Flush()
-        $st.Sent++; $st.Bytes += $remain
+        $st.Sent++
       } finally { $fs.Close() }
     }
   }

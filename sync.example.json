@@ -30,6 +30,6 @@
   "clientOut": "",             // where to write the client .bat (empty = .\download-scripts\...)
   "port": 8722,                // TCP port
   "idleSeconds": 600,          // auto-close after N seconds with no client connected
-  "stallTimeout": 120,         // abort a connected client that sends nothing for N seconds
+  "stallTimeout": 300,         // abort a connected client silent for N seconds (raise to ~1200 for big files over WAN)
   "noFirewall": false          // true = do NOT open the firewall port (opening needs admin)
 }

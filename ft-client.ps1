@@ -57,6 +57,19 @@ function Format-Span($sec) {
   if ($sec -lt 0 -or $sec -gt 359999) { return '?' }
   return ('{0:hh\:mm\:ss}' -f [TimeSpan]::FromSeconds([int]$sec))
 }
+function Show-FetchProgress($done, $total, $got, $skipped, $bytes) {
+  # throttled (~2s) progress; called between files AND mid-file so big files don't look frozen
+  $nowt = Get-Date
+  if (($nowt - $script:lastProg).TotalSeconds -lt 2) { return }
+  $dt = ($nowt - $script:lastProg).TotalSeconds
+  $spd = if ($dt -gt 0) { (($bytes - $script:lastBytes) / 1MB) / $dt } else { 0 }
+  $el = ($nowt - $script:passStart).TotalSeconds
+  $rate = if ($el -gt 0) { $done / $el } else { 0 }
+  $left = $total - $done; if ($left -lt 0) { $left = 0 }
+  $eta = if ($rate -gt 0) { Format-Span ($left / $rate) } else { '?' }
+  Write-Host ("[fetch] progress: {0}/{1} ({2} left) - fetched {3}, unchanged {4}, {5:N1} MB @ {6:N1} MB/s, ETA {7}" -f $done, $total, $left, $got, $skipped, ($bytes / 1MB), $spd, $eta)
+  $script:lastProg = $nowt; $script:lastBytes = $bytes
+}
 $script:RxCache = @{}
 function Convert-GlobToRegex([string]$glob) {
   # glob with '/' separators -> anchored regex. * = within a segment, ** = any depth, ? = one char.
@@ -136,7 +149,7 @@ try {
   while ($more) {
     $pass++
     $total = [int64]0      # file count for this pass (sent by the server as 'T <n>')
-    $passStart = Get-Date; $lastProg = $passStart; $lastBytes = 0
+    $script:passStart = Get-Date; $script:lastProg = $script:passStart; $script:lastBytes = 0
     $seen.Clear()   # mirror must reflect ONLY the latest pass, so files deleted
                     # between cutover pass 1 and pass 2 get removed on the client
     while ($true) {
@@ -153,18 +166,7 @@ try {
       $top = ($rel -split '[\\/]')[0]
       if ($top) { [void]$mirrorRoots.Add([IO.Path]::GetFullPath((Join-Path $ToFolder $top))) }
       [void]$seen.Add($target.ToLowerInvariant())
-      $nowt = Get-Date
-      if (($nowt - $lastProg).TotalSeconds -ge 2) {
-        $dt = ($nowt - $lastProg).TotalSeconds
-        $spd = if ($dt -gt 0) { (($bytes - $lastBytes) / 1MB) / $dt } else { 0 }
-        $el = ($nowt - $passStart).TotalSeconds
-        $done = $got + $skipped
-        $rate = if ($el -gt 0) { $done / $el } else { 0 }   # files/sec over the pass
-        $left = $total - $done; if ($left -lt 0) { $left = 0 }
-        $eta = if ($rate -gt 0) { Format-Span ($left / $rate) } else { '?' }
-        Write-Host ("[fetch] progress: {0}/{1} ({2} left) - fetched {3}, unchanged {4}, {5:N1} MB @ {6:N1} MB/s, ETA {7}" -f $done, $total, $left, $got, $skipped, ($bytes / 1MB), $spd, $eta)
-        $lastProg = $nowt; $lastBytes = $bytes
-      }
+      Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
       $need = $true
       if (Test-Path -LiteralPath $target) {
         $li = Get-Item -LiteralPath $target
@@ -196,6 +198,7 @@ try {
             while ($off -lt $rlen) { $n = $dz.Read($obuf, $off, $rlen - $off); if ($n -le 0) { break }; $off += $n }
             $dz.Close(); $cms.Dispose()
             $fs.Write($obuf, 0, $off); $bytes += $off
+            Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
           }
         }
         else {
@@ -205,9 +208,9 @@ try {
           while ($left -gt 0) {
             $n = $stream.Read($buf, 0, [Math]::Min($buf.Length, $left))
             if ($n -le 0) { throw "connection closed early on $rel" }
-            $fs.Write($buf, 0, $n); $left -= $n
+            $fs.Write($buf, 0, $n); $left -= $n; $bytes += $n
+            Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
           }
-          $bytes += $remain
         }
       } finally { $fs.Close() }
       try { (Get-Item -LiteralPath $target).LastWriteTimeUtc = [DateTime]::new($mt, [DateTimeKind]::Utc) } catch {}
