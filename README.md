@@ -116,18 +116,17 @@ round‑trip‑time* no matter how much bandwidth you have. Opening several conn
 that ceiling. folder-transfer uses **4 parallel streams by default** (`-Streams <n>`, or
 `"streams": <n>` in JSON; `1` restores the classic single stream).
 
-How it works: the sender puts every shared folder into a work queue; each connection pulls a
-whole folder at a time until the queue is empty, so the streams self‑balance. Small files are
-still bundled and data is still compressed within each stream.
+How it works: the sender lazily walks the source and assembles fine‑grained **work units** — a
+bundle of small files, one large file, or an empty‑dir marker — into a shared queue; the N
+connections pull units until it's drained. Because units are fine‑grained, even a **single huge
+folder spreads across all streams** automatically — no need to split it in the config. Small files
+are still bundled and data is still compressed within each stream.
 
-- **Balance is per shared folder.** A single huge folder is handled by one connection and is
-  *not* split across streams. To parallelize one big tree, list its subfolders as separate
-  `folders` entries (e.g. `Ticks/2023`, `Ticks/2024`, … instead of just `Ticks`).
-- **Mirror caveat (parallel only).** Files removed *inside* a folder are mirror‑deleted on the
-  receiver as usual. But a **whole top‑level folder that you delete on the source is _not_
-  auto‑removed** on the receiver in parallel mode (no stream walks a path that no longer exists).
-  To prune such folders, run once with `-Streams 1`, or delete them by hand. `-Cutover` always
-  uses a single stream, so it is unaffected.
+Mirror stays exact. Every connection records what it received into one shared set; after **all**
+streams finish cleanly, the receiver makes a single pass and deletes any local file the source no
+longer has — including files under a whole top‑level folder you deleted. (Like single‑stream, it
+deletes files, not directories, so an emptied folder may remain.) If any stream drops, the run is
+considered incomplete and **nothing is deleted** that time — just re‑run.
 
 ## Parameters
 
@@ -213,10 +212,9 @@ exit. If the port is already open or managed elsewhere, pass `-NoFirewall`.
   a new server instance (by design).
 - **Exclusively‑locked** files are skipped for that pass (logged); files merely open for writing
   (e.g. DB logs) are read fine. Use `-Cutover` for a consistent live‑DB copy.
-- **Parallel mode (`-Streams > 1`, the default)** balances per shared folder, so one giant folder
-  isn't split across streams; and a whole top‑level folder deleted on the source is not
-  auto‑removed on the receiver. See [Parallel streams](#parallel-streams). Run `-Streams 1` for
-  the classic behavior.
+- **Parallel mode (`-Streams > 1`, the default)** deletes files, not directories, so a folder that
+  becomes empty on the source may remain as an empty folder on the receiver (same as single‑stream).
+  See [Parallel streams](#parallel-streams).
 - Symlinks/junctions inside the shared folder are followed — don't share untrusted links.
 
 ## Troubleshooting

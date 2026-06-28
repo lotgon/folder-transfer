@@ -11,7 +11,24 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - VSS snapshot serving for zero‑downtime consistent database copies.
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
-- Reconcile vanished top‑level folders in parallel mode (so `-Streams > 1` can prune them too).
+
+## [0.13.0] — 2026-06-28
+
+### Changed
+- **Parallel mode now shards by fine‑grained work units (bundles / large files), not whole
+  folders.** A single producer lazily walks the source and feeds a bounded shared queue; the N
+  connections pull units until it's drained. Result: even **one giant folder now spreads across all
+  streams** automatically — no need to split it into separate `folders` entries for balance.
+- **Mirror is exact again in parallel mode.** All streams record what they received into one shared
+  set; after every stream finishes cleanly, the receiver does a single reconciliation pass and
+  deletes any local file the source no longer has — **including files under a whole top‑level folder
+  removed on the source**. This removes the v0.12.0 limitation where vanished top‑level folders were
+  not pruned in parallel mode. If any stream drops, the run is treated as incomplete and nothing is
+  deleted that time (re‑run to complete). As before, the mirror deletes files, not directories.
+
+### Fixed
+- Parallel server handlers initialise their progress timers before sending, fixing an
+  `op_Subtraction` error that could abort sends (and write 0‑byte files) under the new unit model.
 
 ## [0.12.0] — 2026-06-28
 

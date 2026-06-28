@@ -495,25 +495,90 @@ function Send-Pass($s, $roots, $total, $ignore) {
 }
 
 function Invoke-ParallelServe($listener, $cert, $token, $allowIp, $stallTimeout, $useCompress, $ignore, $folders, $idleSeconds, $streams) {
-  # Parallel mode: a shared queue of whole folders; each accepted connection runs in its own
-  # runspace and pulls folders until the queue is empty. One folder is handled entirely by one
-  # connection, so the existing per-folder mirror stays correct. Helper functions are injected
-  # into each runspace by prepending their definitions to the connection script.
-  $queue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
-  foreach ($f in $folders) { $queue.Enqueue($f) }
+  # Parallel mode (bundle/file units). A single PRODUCER runspace lazily walks the source and
+  # assembles work UNITS into a shared bounded queue: a bundle of small files (K=B), one large
+  # file (K=F), or an empty-dir marker for ignored folders (K=D). N accepted connections each run
+  # in their own HANDLER runspace and pull units until the producer is done and the queue is empty.
+  # Because units are fine-grained (not whole folders), even one giant folder spreads across all
+  # streams. The client unions everything offered and does ONE mirror pass at the end, so deletes
+  # stay fully correct. Helper functions are injected by prepending their definitions; param()
+  # must come first, so it is prepended ahead of the function text.
+  $queue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+  $flags = [hashtable]::Synchronized(@{ Done = $false })   # producer sets Done when the walk finishes
   $logq = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
   $statq = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
 
-  $fnNames = 'Write-Line', 'Read-Line', 'Test-IgnoredRel', 'Convert-GlobToRegex', 'Test-Incompressible', 'Format-Span', 'Send-Bundle', 'Send-LargeFile', 'Send-Pass', 'Show-ServeProgress'
-  $fnText = ''
-  foreach ($n in $fnNames) { $fnText += ("function $n {`r`n" + (Get-Command $n).Definition + "`r`n}`r`n") }
+  # ---- producer: walk + assemble units --------------------------------------------------------
+  $prodFnText = ''
+  foreach ($n in 'Test-IgnoredRel', 'Convert-GlobToRegex') { $prodFnText += ("function $n {`r`n" + (Get-Command $n).Definition + "`r`n}`r`n") }
+  $prodParam = 'param($folders, $ignore, $queue, $flags, $logq, $smallFile, $bundleBytes, $bundleMaxCount)'
+  $producer = {
+    $script:SmallFile = $smallFile; $script:BundleBytes = $bundleBytes; $script:BundleMaxCount = $bundleMaxCount; $script:RxCache = @{}
+    $cap = 256                                   # backpressure: don't let the queue grow without bound
+    $bundle = New-Object System.Collections.Generic.List[object]; $bbytes = [int64]0
+    $flush = {
+      if ($bundle.Count -gt 0) {
+        while ($queue.Count -ge $cap) { Start-Sleep -Milliseconds 20 }
+        $queue.Enqueue([pscustomobject]@{ K = 'B'; Items = $bundle.ToArray() })
+        $bundle.Clear(); $bbytes = [int64]0
+      }
+    }
+    try {
+      foreach ($root in $folders) {
+        $base = Split-Path $root -Parent; if (-not $base) { $base = $root }
+        $stack = New-Object System.Collections.Stack
+        $stack.Push([pscustomobject]@{ Dir = $root; DirsOnly = $false })
+        while ($stack.Count -gt 0) {
+          $it = $stack.Pop(); $dir = $it.Dir
+          if ($it.DirsOnly) {
+            $relDir = $dir.Substring($base.Length).TrimStart('\', '/')
+            if ($relDir) { while ($queue.Count -ge $cap) { Start-Sleep -Milliseconds 20 }; $queue.Enqueue([pscustomobject]@{ K = 'D'; Rel = $relDir }) }
+            try { foreach ($sd in [IO.Directory]::EnumerateDirectories($dir)) { $stack.Push([pscustomobject]@{ Dir = $sd; DirsOnly = $true }) } } catch {}
+            continue
+          }
+          try { foreach ($sd in [IO.Directory]::EnumerateDirectories($dir)) {
+              $ig = Test-IgnoredRel ($sd.Substring($base.Length)) $true $ignore
+              $stack.Push([pscustomobject]@{ Dir = $sd; DirsOnly = $ig })
+            } } catch {}
+          $en = $null; try { $en = [IO.Directory]::EnumerateFiles($dir).GetEnumerator() } catch { $en = $null }
+          if (-not $en) { continue }
+          while ($en.MoveNext()) {
+            $full = $en.Current
+            if (Test-IgnoredRel ($full.Substring($base.Length)) $false $ignore) { continue }
+            $fi = $null; try { $fi = [IO.FileInfo]::new($full) } catch { $fi = $null }
+            if (-not $fi) { continue }
+            $rel = $full.Substring($base.Length).TrimStart('\', '/')
+            if ($fi.Length -le $script:SmallFile) {
+              [void]$bundle.Add([pscustomobject]@{ Full = $full; Rel = $rel; Size = $fi.Length; Mtime = $fi.LastWriteTimeUtc.Ticks })
+              $bbytes += $fi.Length
+              if ($bbytes -ge $script:BundleBytes -or $bundle.Count -ge $script:BundleMaxCount) { . $flush }
+              continue
+            }
+            . $flush
+            while ($queue.Count -ge $cap) { Start-Sleep -Milliseconds 20 }
+            $queue.Enqueue([pscustomobject]@{ K = 'F'; Full = $full; Rel = $rel; Size = $fi.Length; Mtime = $fi.LastWriteTimeUtc.Ticks })
+          }
+        }
+      }
+      . $flush
+    }
+    catch { $logq.Enqueue("[serve] producer error: $($_.Exception.Message)") }
+    finally { $flags.Done = $true }     # always signal done, so handlers never hang
+  }
+  $prodScript = $prodParam + "`r`n" + $prodFnText + "`r`n" + $producer.ToString()
+  $prs = [runspacefactory]::CreateRunspace(); $prs.Open()
+  $pps = [powershell]::Create(); $pps.Runspace = $prs
+  [void]$pps.AddScript($prodScript).AddArgument($folders).AddArgument($ignore).AddArgument($queue).AddArgument($flags).AddArgument($logq).AddArgument($script:SmallFile).AddArgument($script:BundleBytes).AddArgument($script:BundleMaxCount)
+  $prodHandle = $pps.BeginInvoke()
 
-  # NB: param() must be the FIRST statement, so it is prepended (below) ahead of the helper
-  # function text - the handler body here deliberately has no param() block of its own.
-  $handlerParam = 'param($rawClient, $cert, $token, $allowIp, $stallTimeout, $useCompress, $ignore, $queue, $logq, $statq, $smallFile, $bundleBytes, $bundleMaxCount, $incompExt)'
+  # ---- handlers: one per connection, pull units and send ---------------------------------------
+  $hFnText = ''
+  foreach ($n in 'Write-Line', 'Read-Line', 'Send-Bundle', 'Send-LargeFile', 'Test-Incompressible', 'Show-ServeProgress', 'Format-Span', 'Format-Saved') { $hFnText += ("function $n {`r`n" + (Get-Command $n).Definition + "`r`n}`r`n") }
+  $handlerParam = 'param($rawClient, $cert, $token, $allowIp, $stallTimeout, $useCompress, $queue, $flags, $logq, $statq, $smallFile, $bundleBytes, $bundleMaxCount, $incompExt)'
   $handler = {
     $script:SmallFile = $smallFile; $script:BundleBytes = $bundleBytes; $script:BundleMaxCount = $bundleMaxCount
-    $script:IncompressibleExt = $incompExt; $script:RxCache = @{}; $UseCompress = $useCompress
+    $script:IncompressibleExt = $incompExt; $UseCompress = $useCompress
+    $script:passStart = Get-Date; $script:lastProg = $script:passStart; $script:lastBytes = [int64]0   # Show-ServeProgress needs these
     function Log($m) { $logq.Enqueue(("[serve {0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m)) }
     $remote = $rawClient.Client.RemoteEndPoint.ToString(); $ip = $rawClient.Client.RemoteEndPoint.Address.ToString()
     $ssl = $null
@@ -525,49 +590,66 @@ function Invoke-ParallelServe($listener, $cert, $token, $allowIp, $stallTimeout,
       $line = Read-Line $ssl
       if ($line -notmatch '^AUTH (.*)$' -or ($token -and $matches[1] -ne $token)) { Write-Line $ssl 'ERR auth'; Log "parallel conn BAD AUTH from $remote"; return }
       Write-Line $ssl 'OK'
-      if ((Read-Line $ssl) -ne 'PSYNC') { Write-Line $ssl 'ERR cmd'; return }
+      if ((Read-Line $ssl) -ne 'QSYNC') { Write-Line $ssl 'ERR cmd'; return }
       Log "parallel conn from $remote (TLS ok)"
-      $sent = 0; $skip = 0; $bytes = [int64]0
+      $st = [pscustomobject]@{ Ok = $true; Offered = 0; Sent = 0; Skipped = 0; Bytes = [int64]0; Wire = [int64]0 }
       while ($true) {
-        $f = $null
-        if (-not $queue.TryDequeue([ref]$f)) { Write-Line $ssl 'NOUNIT'; break }
-        $leaf = Split-Path $f -Leaf
-        Write-Line $ssl ("U {0}" -f $leaf)
-        $st = Send-Pass $ssl @($f) 0 $ignore
-        if (-not $st.Ok) { Log "parallel conn $remote dropped during $leaf"; break }
-        Write-Line $ssl 'PASS-END'
-        $sent += $st.Sent; $skip += $st.Skipped; $bytes += $st.Bytes
-        Log ("  {0} [{1}]: sent {2}, unchanged {3}, {4:N0} bytes" -f $leaf, $remote, $st.Sent, $st.Skipped, $st.Bytes)
+        $u = $null
+        if (-not $queue.TryDequeue([ref]$u)) {
+          if ($flags.Done) { Write-Line $ssl 'NOUNIT'; break }   # producer finished and nothing left
+          Start-Sleep -Milliseconds 15; continue                # producer still walking - wait for more
+        }
+        switch ($u.K) {
+          'D' { Write-Line $ssl ("D {0}" -f $u.Rel) }
+          'B' { [void](Send-Bundle $ssl $u.Items $st 0); if (-not $st.Ok) { throw "client dropped (bundle)" } }
+          'F' {
+            Write-Line $ssl ("F {0} {1} {2}" -f $u.Size, $u.Mtime, $u.Rel); $st.Offered++
+            $resp = Read-Line $ssl
+            if ($null -eq $resp) { throw "client dropped (offer)" }
+            $offset = [int64]0; if (-not [int64]::TryParse($resp, [ref]$offset)) { $offset = [int64](-1) }
+            if ($offset -lt 0) { $st.Skipped++ }
+            else {
+              $fsr = $null
+              try { $fsr = New-Object IO.FileStream($u.Full, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]'ReadWrite, Delete')) }
+              catch { Log ("cannot read (in use?), skipped: {0} -- {1}" -f $u.Rel, $_.Exception.Message); Write-Line $ssl '-1'; $st.Skipped++; $fsr = $null }
+              if ($fsr) { try { Send-LargeFile $ssl $fsr $offset ([IO.Path]::GetExtension($u.Full)) $st 0 $UseCompress } finally { $fsr.Close() } }
+            }
+          }
+        }
       }
-      $statq.Enqueue([pscustomobject]@{ Sent = $sent; Skipped = $skip; Bytes = $bytes })
+      $statq.Enqueue([pscustomobject]@{ Sent = $st.Sent; Skipped = $st.Skipped; Bytes = $st.Bytes })
     }
     catch { Log ("parallel conn {0} ABORTED: {1}" -f $remote, $_.Exception.Message) }
     finally { if ($ssl) { $ssl.Dispose() }; $rawClient.Close() }
   }
-  $connScript = $handlerParam + "`r`n" + $fnText + "`r`n" + $handler.ToString()
+  $connScript = $handlerParam + "`r`n" + $hFnText + "`r`n" + $handler.ToString()
 
   $running = New-Object System.Collections.ArrayList
-  $idle = 0
-  Log ("PARALLEL: up to {0} streams, {1} folder unit(s) queued" -f $streams, $queue.Count)
-  while ($queue.Count -gt 0 -or $running.Count -gt 0) {
+  $idle = 0; $connectedAny = $false
+  Log ("PARALLEL (bundle/file units): up to {0} streams" -f $streams)
+  while ($true) {
     $m = $null; while ($logq.TryDequeue([ref]$m)) { Write-Host $m }
     if ($listener.Pending()) {
       $c = $listener.AcceptTcpClient(); try { $c.NoDelay = $true } catch {}
       $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
       $ps = [powershell]::Create(); $ps.Runspace = $rs
-      [void]$ps.AddScript($connScript).AddArgument($c).AddArgument($cert).AddArgument($token).AddArgument($allowIp).AddArgument($stallTimeout).AddArgument($useCompress).AddArgument($ignore).AddArgument($queue).AddArgument($logq).AddArgument($statq).AddArgument($script:SmallFile).AddArgument($script:BundleBytes).AddArgument($script:BundleMaxCount).AddArgument($script:IncompressibleExt)
+      [void]$ps.AddScript($connScript).AddArgument($c).AddArgument($cert).AddArgument($token).AddArgument($allowIp).AddArgument($stallTimeout).AddArgument($useCompress).AddArgument($queue).AddArgument($flags).AddArgument($logq).AddArgument($statq).AddArgument($script:SmallFile).AddArgument($script:BundleBytes).AddArgument($script:BundleMaxCount).AddArgument($script:IncompressibleExt)
       [void]$running.Add([pscustomobject]@{ ps = $ps; h = $ps.BeginInvoke(); rs = $rs })
-      $idle = 0
+      $connectedAny = $true; $idle = 0
     }
-    else {
-      Start-Sleep -Milliseconds 150; $idle += 150
-      if ($running.Count -eq 0 -and $idle -ge $idleSeconds * 1000) { Write-Host ("[serve] idle timeout ({0}s, no client) - shutting down" -f $idleSeconds); break }
-    }
+    else { Start-Sleep -Milliseconds 150; $idle += 150 }
     foreach ($r in @($running | Where-Object { $_.h.IsCompleted })) {
       try { [void]$r.ps.EndInvoke($r.h) } catch { Write-Host "[serve] conn error: $_" }
       $r.ps.Dispose(); $r.rs.Dispose(); [void]$running.Remove($r)
     }
+    if ($connectedAny -and $running.Count -eq 0) {
+      if ($flags.Done -and $queue.Count -eq 0) { break }                 # clean finish
+      if ($idle -ge 5000) { Write-Host '[serve] all clients gone - stopping'; break }   # clients left, work may remain
+    }
+    if (-not $connectedAny -and $idle -ge $idleSeconds * 1000) { Write-Host ("[serve] idle timeout ({0}s, no client) - shutting down" -f $idleSeconds); break }
   }
+  try { [void]$pps.EndInvoke($prodHandle) } catch { Write-Host "[serve] producer join error: $_" }
+  $pps.Dispose(); $prs.Dispose()
   foreach ($r in @($running)) { try { [void]$r.ps.EndInvoke($r.h) } catch {}; $r.ps.Dispose(); $r.rs.Dispose() }
   $m = $null; while ($logq.TryDequeue([ref]$m)) { Write-Host $m }
   $all = @($statq); $sw = 0; $sk = 0; $by = [int64]0; foreach ($x in $all) { $sw += $x.Sent; $sk += $x.Skipped; $by += $x.Bytes }
@@ -687,8 +769,7 @@ Log ("listening 0.0.0.0:{0}  folders={1}  idle={2}s  once={3}" -f $Port, ($folde
 $sessionNum = 0
 try {
   if ($Streams -gt 1) {
-    Log ("PARALLEL mode ({0} streams). NOTE: a top-level folder removed on the source is NOT auto-deleted" -f $Streams)
-    Log "      on the receiver in parallel mode - run once with -Streams 1 to prune, or delete manually."
+    Log ("PARALLEL mode ({0} streams, bundle/file units - even one big folder spreads across streams)" -f $Streams)
     Invoke-ParallelServe $listener $cert $Token $AllowIp $StallTimeout $UseCompress $ignorePatterns $folders $IdleSeconds $Streams
     return
   }

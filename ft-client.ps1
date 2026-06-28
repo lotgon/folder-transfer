@@ -129,20 +129,25 @@ function Test-IgnoredRel([string]$rel, [bool]$isDir, $patterns) {
 $script:ExpectedFp = $Fingerprint.Replace(':', '').Replace('-', '').ToLower()
 
 # ---------------------------------------------------------------------------
-# PARALLEL mode (-Streams > 1): open N connections, each pulls whole folders
-# from the server ("U <leaf>" / "NOUNIT") and syncs them. One folder is handled
-# entirely by one connection, so the per-folder mirror below stays correct.
-# NOTE: balance is per shared folder - a single giant folder is not split across
-# streams; list its subfolders as separate "folders" entries to parallelize it.
+# PARALLEL mode (-Streams > 1): open N connections that pull fine-grained units
+# (a bundle of small files, one large file, or an empty-dir marker) until the
+# server says NOUNIT. All streams share one "seen" set; after every stream
+# finishes cleanly, ONE mirror pass deletes local files the source no longer has
+# - so deletes are fully correct, including a whole removed top-level folder.
 # ---------------------------------------------------------------------------
 if ($Streams -gt 1) {
-  $fnNames = 'Write-Line', 'Read-Line', 'Format-Span', 'Convert-GlobToRegex', 'Test-IgnoredRel'
+  $fnNames = 'Write-Line', 'Read-Line'
   $fnText = ''
   foreach ($n in $fnNames) { $fnText += ("function $n {`r`n" + (Get-Command $n).Definition + "`r`n}`r`n") }
 
+  $seen = [System.Collections.Concurrent.ConcurrentDictionary[string, byte]]::new()        # all offered files (union)
+  $mirrorRoots = [System.Collections.Concurrent.ConcurrentDictionary[string, byte]]::new() # <dest>\<top> per offered path
+  $logq = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+  $statq = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+
   # NB: param() must be the FIRST statement, so it is prepended (below) ahead of the helper
   # function text - the worker body here deliberately has no param() block of its own.
-  $workerParam = 'param($cid, $server, $port, $token, $expFp, $toFolder, $rootPrefix, $ignorePatterns, $logq, $statq)'
+  $workerParam = 'param($cid, $server, $port, $token, $expFp, $toFolder, $rootPrefix, $seen, $mirrorRoots, $logq, $statq)'
   $worker = {
     $ErrorActionPreference = 'Stop'
     $script:ExpectedFp = $expFp; $script:RxCache = @{}
@@ -174,29 +179,19 @@ if ($Streams -gt 1) {
       $ssl.AuthenticateAsClient('ft-onetime')
       Write-Line $ssl ("AUTH " + $token)
       if ((Read-Line $ssl) -ne 'OK') { throw 'auth failed / rejected by server' }
-      Write-Line $ssl 'PSYNC'
-      $got = 0; $skipped = 0; $bytes = [int64]0; $deleted = 0; $units = 0
-      while ($true) {
-        $u = Read-Line $ssl
-        if ($null -eq $u -or $u -eq 'NOUNIT') { break }
-        if ($u -notmatch '^U (.+)$') { continue }
-        $units++
-        $seen = New-Object 'System.Collections.Generic.HashSet[string]'
-        $mirrorRoots = New-Object 'System.Collections.Generic.HashSet[string]'
-        $script:passStart = Get-Date; $script:lastProg = $script:passStart; $script:lastBytes = $bytes
-        $total = [int64]0; $ok = $true
+      Write-Line $ssl 'QSYNC'
+      $got = 0; $skipped = 0; $bytes = [int64]0; $total = 0; $ok = $false
         while ($true) {
           $h = Read-Line $ssl
-          if ($null -eq $h) { $ok = $false; break }
-          if ($h -eq 'PASS-END') { break }
-          if ($h -match '^T (\d+)$') { $total = [int64]$matches[1]; continue }
+          if ($null -eq $h) { throw 'connection closed mid-transfer' }
+          if ($h -eq 'NOUNIT') { $ok = $true; break }
           if ($h -match '^D (.+)$') {
             $drel = $matches[1]
             $dt = [IO.Path]::GetFullPath((Join-Path $toFolder $drel))
             if ($dt.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
               if (-not (Test-Path -LiteralPath $dt)) { New-Item -ItemType Directory -Path $dt -Force | Out-Null }
               $top = ($drel -split '[\\/]')[0]
-              if ($top) { [void]$mirrorRoots.Add([IO.Path]::GetFullPath((Join-Path $toFolder $top))) }
+              if ($top) { [void]$mirrorRoots.TryAdd([IO.Path]::GetFullPath((Join-Path $toFolder $top)), [byte]0) }
             }
             continue
           }
@@ -215,8 +210,8 @@ if ($Streams -gt 1) {
               $bt = [IO.Path]::GetFullPath((Join-Path $toFolder $it.Rel))
               if (-not ($bt.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase))) { [void]$sbm.Append('0'); $btargets.Add($null); continue }
               $top = ($it.Rel -split '[\\/]')[0]
-              if ($top) { [void]$mirrorRoots.Add([IO.Path]::GetFullPath((Join-Path $toFolder $top))) }
-              [void]$seen.Add($bt.ToLowerInvariant())
+              if ($top) { [void]$mirrorRoots.TryAdd([IO.Path]::GetFullPath((Join-Path $toFolder $top)), [byte]0) }
+              [void]$seen.TryAdd($bt.ToLowerInvariant(), [byte]0)
               $need = $true
               if (Test-Path -LiteralPath $bt) { $li = Get-Item -LiteralPath $bt; if ($li.Length -eq $it.Size -and $li.LastWriteTimeUtc.Ticks -eq $it.Mt) { $need = $false } }
               if ($need) { [void]$sbm.Append('1'); $btargets.Add($bt) } else { [void]$sbm.Append('0'); $skipped++; $btargets.Add($null) }
@@ -251,8 +246,8 @@ if ($Streams -gt 1) {
             $logq.Enqueue("[s$cid] skip unsafe path from server: $rel"); Write-Line $ssl '-1'; continue
           }
           $top = ($rel -split '[\\/]')[0]
-          if ($top) { [void]$mirrorRoots.Add([IO.Path]::GetFullPath((Join-Path $toFolder $top))) }
-          [void]$seen.Add($target.ToLowerInvariant())
+          if ($top) { [void]$mirrorRoots.TryAdd([IO.Path]::GetFullPath((Join-Path $toFolder $top)), [byte]0) }
+          [void]$seen.TryAdd($target.ToLowerInvariant(), [byte]0)
           Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
           $need = $true
           if (Test-Path -LiteralPath $target) {
@@ -305,32 +300,21 @@ if ($Streams -gt 1) {
           try { (Get-Item -LiteralPath $target).LastWriteTimeUtc = [DateTime]::new($mt, [DateTimeKind]::Utc) } catch {}
           $got++
         }
-        if (-not $ok) { $logq.Enqueue("[s$cid] connection dropped - folder left unmirrored"); break }
-        foreach ($mr in $mirrorRoots) {
-          if (-not (Test-Path -LiteralPath $mr)) { continue }
-          foreach ($f in @(Get-ChildItem -LiteralPath $mr -Recurse -File)) {
-            $rel2 = $f.FullName.Substring($rootPrefix.Length)
-            if (Test-IgnoredRel $rel2 $false $ignorePatterns) { continue }
-            if (-not $seen.Contains($f.FullName.ToLowerInvariant())) { Remove-Item -LiteralPath $f.FullName -Force -EA SilentlyContinue; $deleted++ }
-          }
-        }
-      }
       Write-Line $ssl 'BYE'
-      $statq.Enqueue([pscustomobject]@{ Got = $got; Skipped = $skipped; Bytes = $bytes; Deleted = $deleted; Units = $units })
     }
+    catch { $logq.Enqueue("[s$cid] stream error: $($_.Exception.Message)") }
     finally { if ($ssl) { $ssl.Dispose() }; $tcp.Close() }
+    $statq.Enqueue([pscustomobject]@{ Ok = $ok; Got = $got; Skipped = $skipped; Bytes = $bytes })
   }
   $connScript = $workerParam + "`r`n" + $fnText + "`r`n" + $worker.ToString()
 
   Write-Host ("[fetch] sync -> {0}  ({1} parallel streams)" -f $ToFolder, $Streams)
-  $logq = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
-  $statq = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
   $runStart = Get-Date
   $running = @()
   for ($i = 1; $i -le $Streams; $i++) {
     $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
     $ps = [powershell]::Create(); $ps.Runspace = $rs
-    [void]$ps.AddScript($connScript).AddArgument($i).AddArgument($Server).AddArgument($Port).AddArgument($Token).AddArgument($script:ExpectedFp).AddArgument($ToFolder).AddArgument($rootPrefix).AddArgument($ignorePatterns).AddArgument($logq).AddArgument($statq)
+    [void]$ps.AddScript($connScript).AddArgument($i).AddArgument($Server).AddArgument($Port).AddArgument($Token).AddArgument($script:ExpectedFp).AddArgument($ToFolder).AddArgument($rootPrefix).AddArgument($seen).AddArgument($mirrorRoots).AddArgument($logq).AddArgument($statq)
     $running += [pscustomobject]@{ ps = $ps; h = $ps.BeginInvoke(); rs = $rs }
   }
   while (@($running | Where-Object { -not $_.h.IsCompleted }).Count -gt 0) {
@@ -339,12 +323,29 @@ if ($Streams -gt 1) {
   }
   foreach ($r in $running) { try { [void]$r.ps.EndInvoke($r.h) } catch { Write-Host "[fetch] stream error: $($_.Exception.Message)" }; $r.ps.Dispose(); $r.rs.Dispose() }
   $m = $null; while ($logq.TryDequeue([ref]$m)) { Write-Host $m }
+
   $all = @($statq)
   if ($all.Count -eq 0) { throw "could not connect to server $Server`:$Port (no stream reached it)" }
-  $g = 0; $sk = 0; $d = 0; $b = [int64]0; $u = 0
-  foreach ($x in $all) { $g += $x.Got; $sk += $x.Skipped; $d += $x.Deleted; $b += $x.Bytes; $u += $x.Units }
+  $g = 0; $sk = 0; $b = [int64]0; $clean = $true
+  foreach ($x in $all) { $g += $x.Got; $sk += $x.Skipped; $b += $x.Bytes; if (-not $x.Ok) { $clean = $false } }
+
+  # Mirror: ONE pass over everything offered (the union across all streams). Only after EVERY
+  # stream finished cleanly - a drop leaves the offered set incomplete, so we must not delete.
+  $deleted = 0
+  if ($clean) {
+    foreach ($mr in $mirrorRoots.Keys) {
+      if (-not (Test-Path -LiteralPath $mr)) { continue }
+      foreach ($f in @(Get-ChildItem -LiteralPath $mr -Recurse -File)) {
+        $rel2 = $f.FullName.Substring($rootPrefix.Length)
+        if (Test-IgnoredRel $rel2 $false $ignorePatterns) { continue }   # never delete ignored content
+        if (-not $seen.ContainsKey($f.FullName.ToLowerInvariant())) { Remove-Item -LiteralPath $f.FullName -Force -EA SilentlyContinue; $deleted++ }
+      }
+    }
+  }
+  else { Write-Host '[fetch] a stream did not finish cleanly - nothing deleted (re-run to complete)' }
+
   $secs = ((Get-Date) - $runStart).TotalSeconds; $avg = if ($secs -gt 0) { ($b / 1MB) / $secs } else { 0 }
-  Write-Host ("[fetch] sync done. streams={0} folders={1} fetched={2} unchanged={3} deleted={4} bytes={5:N0} in {6} @ {7:N1} MB/s avg" -f $Streams, $u, $g, $sk, $d, $b, (Format-Span $secs), $avg)
+  Write-Host ("[fetch] sync done. streams={0} fetched={1} unchanged={2} deleted={3} bytes={4:N0} in {5} @ {6:N1} MB/s avg" -f $Streams, $g, $sk, $deleted, $b, (Format-Span $secs), $avg)
   return
 }
 

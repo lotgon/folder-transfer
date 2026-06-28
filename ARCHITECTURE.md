@@ -123,37 +123,42 @@ Key points:
 
 A single TCP connection is throughput‑bound to ~`window / RTT`; on a high‑latency link that leaves
 most of the bandwidth idle. With `-Streams > 1` the client opens **n connections** and the work is
-spread across them. Per connection the handshake is identical (`AUTH`/`OK`), then the command is
-**`PSYNC`** instead of `SYNC`, and the body is a loop of folder units:
+spread across them at the granularity of **work units** (a bundle of small files, one large file,
+or an empty‑dir marker). Per connection the handshake is identical (`AUTH`/`OK`), then the command
+is **`QSYNC`** instead of `SYNC`, and the body is a flat stream of units:
 
 ```
-client → PSYNC
-server →   U <leaf>           a folder unit follows (its pass: T/D/B/F … exactly as above)
-server →   …one pass…  PASS-END
-        (repeat U + pass until the queue is empty)
+client → QSYNC
+server →   D <rel>            empty-dir marker (ignored folders), or
+server →   B <n> + manifest   a bundle of small files (then want-mask + wanted bytes), or
+server →   F <size> <mtime> <rel> + (0/-1) + R|Z|-1   one large file
+        (repeat until the producer is done and the queue is empty)
 server →   NOUNIT             no work left → this connection is done
 client → BYE
 ```
 
-- **Server side.** A shared `System.Collections.Concurrent.ConcurrentQueue` is seeded with the
-  shared folders. Each accepted connection runs in its own **runspace** (helper functions are
-  injected by prepending their definitions; `param()` is emitted first so arguments bind) and pulls
-  one folder at a time with `TryDequeue` until empty — so connections **self‑balance** without a
-  scheduler. The accept loop runs until the queue is drained and all connection runspaces finish.
-- **Client side.** `n` runspaces each reconnect, send `PSYNC`, and process the units they receive;
-  progress lines funnel back through a concurrent queue to the main thread. A connection that finds
-  the queue already empty (small/fast jobs) closes quietly; if **no** stream connects at all that is
-  a real error.
-- **Unit = whole folder, on purpose.** Sharding by whole folder means one folder is handled
-  end‑to‑end by one connection, so **the existing per‑folder mirror stays exactly correct**
-  (deletes within a folder still propagate). Bundling and adaptive compression are unchanged inside
-  each unit. The cost is that balance is per folder — a single giant folder isn't split (list its
-  subfolders as separate `folders` entries to spread it).
-- **Mirror limitation (parallel only).** Because a connection only ever walks folders that still
-  exist, **a whole top‑level folder deleted on the source has no unit and is therefore not
-  auto‑removed on the receiver.** This is the deliberate trade‑off for the simple, always‑correct
-  per‑folder mirror. Prune with a one‑off `-Streams 1` run (the classic full‑tree walk) or by hand.
-  `-Cutover` forces `-Streams 1`, so it is never affected.
+- **Server side — producer + handlers.** One **producer** runspace lazily walks the source (the
+  same stack walk + ignore handling as `Send-Pass`), groups small files into bundles and classifies
+  large files, and pushes units into a **bounded** `ConcurrentQueue` (a `cap` with sleep gives
+  backpressure so memory stays flat). N **handler** runspaces — one per accepted connection —
+  `TryDequeue` units and send them (reusing `Send-Bundle` / `Send-LargeFile`), so they **self‑balance**
+  and a single giant folder spreads across all streams. A synchronized flag tells handlers when the
+  producer is done so they can emit `NOUNIT`. Helper functions are injected into each runspace by
+  prepending their definitions, with `param()` emitted first so arguments bind.
+- **Client side — shared set + barrier.** `n` runspaces each connect, send `QSYNC`, and write the
+  units they receive, recording every offered path into **one shared** `ConcurrentDictionary`
+  (`seen`) plus the set of top‑level mirror roots. Progress funnels back through a concurrent queue.
+  A connection that finds the server already finished closes quietly; if **no** stream connects, that
+  is a real error.
+- **Mirror = one global reconciliation, after a barrier.** Because no single connection sees a whole
+  folder, the per‑connection mirror is gone. Instead, once **every** stream has finished cleanly, the
+  client makes **one** pass over each mirror root on its own disk and deletes any file **not** in the
+  shared `seen` set (skipping ignored content). This is an O(1) hash lookup per local file — purely
+  local, no per‑file chatter with the server — and it reproduces single‑stream semantics exactly,
+  **including pruning files under a whole top‑level folder removed on the source**. If any stream
+  dropped, `seen` is incomplete, so the run is marked unclean and **nothing is deleted** that time
+  (re‑run to complete). Like single‑stream, it deletes files, not directories. `-Cutover` forces
+  `-Streams 1` and uses the classic single‑pass path.
 
 ---
 
@@ -224,9 +229,8 @@ lingering exposure (one‑shot / idle auto‑shutdown + cleanup).
 - A changed file is re‑fetched whole — no byte‑level resume within one huge file. Over a flaky
   WAN a very large file that drops near the end restarts from zero.
 - Symlinks/junctions inside a shared folder are followed and could escape it.
-- In **parallel mode** (`-Streams > 1`, default) a whole top‑level folder deleted on the source is
-  not auto‑removed on the receiver, and balance is per folder (a single giant folder isn't split).
-  See §2.1; run `-Streams 1` for the classic full‑tree behavior.
+- The mirror deletes files, not directories, so a folder emptied on the source may remain as an
+  empty folder on the receiver (true for single‑ and multi‑stream alike).
 - Token is compared non‑constant‑time (negligible over TLS on a short‑lived server).
 - Verified end‑to‑end on Windows 11 (loopback) and over a real two‑machine WAN link; still a young
   tool — review and test in your environment before production use.
