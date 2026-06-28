@@ -40,12 +40,15 @@ if (-not $Server) { Write-Host 'ERROR: -Server is required.'; Show-FetchHelp; re
 if (-not $ToFolder) { Write-Host 'ERROR: -ToFolder is required.'; Show-FetchHelp; return }
 if (-not $Fingerprint) { throw '-Fingerprint is required (the generated bat passes it automatically).' }
 if (-not (Test-Path -LiteralPath $ToFolder)) { New-Item -ItemType Directory -Path $ToFolder | Out-Null }
-$ToFolder = (Resolve-Path -LiteralPath $ToFolder).Path
+# Normalize through GetFullPath (same call used for every target path below) so an 8.3 short
+# destination (e.g. C:\Users\PETROS~1\...) matches the expanded target paths - otherwise the
+# rootPrefix safety check rejects every file as "unsafe" and nothing syncs.
+$ToFolder = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $ToFolder).Path)
 $rootPrefix = $ToFolder.TrimEnd('\') + '\'
 
 function Write-Line($s, [string]$t) { $b = [Text.Encoding]::UTF8.GetBytes($t + "`n"); $s.Write($b, 0, $b.Length); $s.Flush() }
 function Read-Line($s) {
-  $ms = New-Object IO.MemoryStream
+  $ms = [IO.MemoryStream]::new()
   while ($true) {
     $ch = $s.ReadByte()
     if ($ch -lt 0) { if ($ms.Length -eq 0) { return $null } else { break } }
@@ -60,7 +63,7 @@ function Format-Span($sec) {
 }
 function Show-FetchProgress($done, $total, $got, $skipped, $bytes) {
   # throttled (~2s) progress; called between files AND mid-file so big files don't look frozen
-  $nowt = Get-Date
+  $nowt = [DateTime]::UtcNow
   if (($nowt - $script:lastProg).TotalSeconds -lt 2) { return }
   $dt = ($nowt - $script:lastProg).TotalSeconds
   $spd = if ($dt -gt 0) { (($bytes - $script:lastBytes) / 1MB) / $dt } else { 0 }
@@ -126,6 +129,17 @@ function Test-IgnoredRel([string]$rel, [bool]$isDir, $patterns) {
   return $false
 }
 
+# Hot-path helpers using .NET statics instead of cmdlets (Test-Path/Get-Item/New-Item/Set are
+# ~ms each; these are ~us). Used by both the single-stream path and the parallel worker.
+function Need-Fetch($path, $size, $mt) {
+  $fi = [IO.FileInfo]::new($path)
+  return (-not ($fi.Exists -and $fi.Length -eq $size -and $fi.LastWriteTimeUtc.Ticks -eq $mt))
+}
+function Confirm-Dir($d, $cache) {
+  if (-not $cache.ContainsKey($d)) { [void][IO.Directory]::CreateDirectory($d); $cache[$d] = $true }
+}
+function Set-Mtime($path, $mt) { try { [IO.File]::SetLastWriteTimeUtc($path, [DateTime]::new($mt, [DateTimeKind]::Utc)) } catch {} }
+
 $script:ExpectedFp = $Fingerprint.Replace(':', '').Replace('-', '').ToLower()
 
 # ---------------------------------------------------------------------------
@@ -136,7 +150,7 @@ $script:ExpectedFp = $Fingerprint.Replace(':', '').Replace('-', '').ToLower()
 # - so deletes are fully correct, including a whole removed top-level folder.
 # ---------------------------------------------------------------------------
 if ($Streams -gt 1) {
-  $fnNames = 'Write-Line', 'Read-Line'
+  $fnNames = 'Write-Line', 'Read-Line', 'Need-Fetch', 'Confirm-Dir', 'Set-Mtime'
   $fnText = ''
   foreach ($n in $fnNames) { $fnText += ("function $n {`r`n" + (Get-Command $n).Definition + "`r`n}`r`n") }
 
@@ -151,9 +165,9 @@ if ($Streams -gt 1) {
   $worker = {
     $ErrorActionPreference = 'Stop'
     $script:ExpectedFp = $expFp; $script:RxCache = @{}
-    $script:passStart = Get-Date; $script:lastProg = $script:passStart; $script:lastBytes = [int64]0
+    $script:passStart = [DateTime]::UtcNow; $script:lastProg = $script:passStart; $script:lastBytes = [int64]0
     function Show-FetchProgress($done, $total, $got, $skipped, $bytes) {
-      $now = Get-Date; if (($now - $script:lastProg).TotalSeconds -lt 2) { return }
+      $now = [DateTime]::UtcNow; if (($now - $script:lastProg).TotalSeconds -lt 2) { return }
       $dt = ($now - $script:lastProg).TotalSeconds
       $spd = if ($dt -gt 0) { (($bytes - $script:lastBytes) / 1MB) / $dt } else { 0 }
       $logq.Enqueue(("[s{0}] {1} files - fetched {2}, unchanged {3}, {4:N1} MB @ {5:N1} MB/s" -f $cid, $done, $got, $skipped, ($bytes / 1MB), $spd))
@@ -175,21 +189,22 @@ if ($Streams -gt 1) {
       return ((([BitConverter]::ToString($h)).Replace('-', '').ToLower()) -eq $script:ExpectedFp)
     }
     $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, $cb)
+    $got = 0; $skipped = 0; $bytes = [int64]0; $total = 0; $ok = $false; $units = 0; $mkdirs = @{}
     try {
       $ssl.AuthenticateAsClient('ft-onetime')
       Write-Line $ssl ("AUTH " + $token)
       if ((Read-Line $ssl) -ne 'OK') { throw 'auth failed / rejected by server' }
       Write-Line $ssl 'QSYNC'
-      $got = 0; $skipped = 0; $bytes = [int64]0; $total = 0; $ok = $false
         while ($true) {
           $h = Read-Line $ssl
           if ($null -eq $h) { throw 'connection closed mid-transfer' }
           if ($h -eq 'NOUNIT') { $ok = $true; break }
+          $units++
           if ($h -match '^D (.+)$') {
             $drel = $matches[1]
             $dt = [IO.Path]::GetFullPath((Join-Path $toFolder $drel))
             if ($dt.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-              if (-not (Test-Path -LiteralPath $dt)) { New-Item -ItemType Directory -Path $dt -Force | Out-Null }
+              Confirm-Dir $dt $mkdirs
               $top = ($drel -split '[\\/]')[0]
               if ($top) { [void]$mirrorRoots.TryAdd([IO.Path]::GetFullPath((Join-Path $toFolder $top)), [byte]0) }
             }
@@ -213,27 +228,28 @@ if ($Streams -gt 1) {
               if ($top) { [void]$mirrorRoots.TryAdd([IO.Path]::GetFullPath((Join-Path $toFolder $top)), [byte]0) }
               [void]$seen.TryAdd($bt.ToLowerInvariant(), [byte]0)
               $need = $true
-              if (Test-Path -LiteralPath $bt) { $li = Get-Item -LiteralPath $bt; if ($li.Length -eq $it.Size -and $li.LastWriteTimeUtc.Ticks -eq $it.Mt) { $need = $false } }
+              $need = Need-Fetch $bt $it.Size $it.Mt
               if ($need) { [void]$sbm.Append('1'); $btargets.Add($bt) } else { [void]$sbm.Append('0'); $skipped++; $btargets.Add($null) }
             }
             Write-Line $ssl $sbm.ToString()
+            $buf = [byte[]]::new(65536)   # reused across all files in the bundle (no per-file alloc)
             for ($k = 0; $k -lt $bcount; $k++) {
               if ($null -eq $btargets[$k]) { continue }
               $len = [int64](Read-Line $ssl)
               if ($len -lt 0) { continue }
               $bt = $btargets[$k]
-              $bdir = Split-Path $bt -Parent
-              if (-not (Test-Path -LiteralPath $bdir)) { New-Item -ItemType Directory -Path $bdir -Force | Out-Null }
+              $bdir = [IO.Path]::GetDirectoryName($bt)
+              Confirm-Dir $bdir $mkdirs
               $bfs = [IO.File]::Open($bt, [IO.FileMode]::Create, [IO.FileAccess]::Write)
               try {
-                $buf = New-Object byte[] 65536; $left = $len
+                $left = $len
                 while ($left -gt 0) {
-                  $n = $ssl.Read($buf, 0, [Math]::Min($buf.Length, $left))
+                  $n = $ssl.Read($buf, 0, [Math]::Min([int64]$buf.Length, $left))
                   if ($n -le 0) { throw "connection closed early (bundle) on $($bitems[$k].Rel)" }
                   $bfs.Write($buf, 0, $n); $left -= $n; $bytes += $n
                 }
               } finally { $bfs.Close() }
-              try { (Get-Item -LiteralPath $bt).LastWriteTimeUtc = [DateTime]::new($bitems[$k].Mt, [DateTimeKind]::Utc) } catch {}
+              Set-Mtime $bt $bitems[$k].Mt
               $got++
               Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
             }
@@ -250,16 +266,13 @@ if ($Streams -gt 1) {
           [void]$seen.TryAdd($target.ToLowerInvariant(), [byte]0)
           Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
           $need = $true
-          if (Test-Path -LiteralPath $target) {
-            $li = Get-Item -LiteralPath $target
-            if ($li.Length -eq $size -and $li.LastWriteTimeUtc.Ticks -eq $mt) { $need = $false }
-          }
+          $need = Need-Fetch $target $size $mt
           if (-not $need) { Write-Line $ssl '-1'; $skipped++; continue }
           Write-Line $ssl '0'
           $hdr = Read-Line $ssl
           if ($hdr -eq '-1') { continue }
-          $dir = Split-Path $target -Parent
-          if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+          $dir = [IO.Path]::GetDirectoryName($target)
+          Confirm-Dir $dir $mkdirs
           $fs = [IO.File]::Open($target, [IO.FileMode]::Create, [IO.FileAccess]::Write)
           try {
             if ($hdr -eq 'Z') {
@@ -290,19 +303,25 @@ if ($Streams -gt 1) {
               $remain = [int64](($hdr -split ' ')[1])
               $buf = New-Object byte[] 1048576; $left = $remain
               while ($left -gt 0) {
-                $n = $ssl.Read($buf, 0, [Math]::Min($buf.Length, $left))
+                $n = $ssl.Read($buf, 0, [Math]::Min([int64]$buf.Length, $left))
                 if ($n -le 0) { throw "connection closed early on $rel" }
                 $fs.Write($buf, 0, $n); $left -= $n; $bytes += $n
                 Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
               }
             }
           } finally { $fs.Close() }
-          try { (Get-Item -LiteralPath $target).LastWriteTimeUtc = [DateTime]::new($mt, [DateTimeKind]::Utc) } catch {}
+          Set-Mtime $target $mt
           $got++
         }
       Write-Line $ssl 'BYE'
     }
-    catch { $logq.Enqueue("[s$cid] stream error: $($_.Exception.Message)") }
+    catch {
+      # A stream that received NO units just lost the connect race (server finished/busy) or the
+      # server was unreachable - it moved no data, so it cannot make the mirror incomplete: treat
+      # it as benign. Only a stream that dropped AFTER receiving units marks the sync unclean.
+      if ($units -gt 0) { $logq.Enqueue("[s$cid] DROPPED after $units units - sync incomplete: $($_.Exception.Message)") }
+      else { $ok = $true; $logq.Enqueue("[s$cid] idle stream (no work claimed - server busy or finished)") }
+    }
     finally { if ($ssl) { $ssl.Dispose() }; $tcp.Close() }
     $statq.Enqueue([pscustomobject]@{ Ok = $ok; Got = $got; Skipped = $skipped; Bytes = $bytes })
   }
@@ -334,11 +353,11 @@ if ($Streams -gt 1) {
   $deleted = 0
   if ($clean) {
     foreach ($mr in $mirrorRoots.Keys) {
-      if (-not (Test-Path -LiteralPath $mr)) { continue }
-      foreach ($f in @(Get-ChildItem -LiteralPath $mr -Recurse -File)) {
-        $rel2 = $f.FullName.Substring($rootPrefix.Length)
+      if (-not [IO.Directory]::Exists($mr)) { continue }
+      foreach ($fp in [IO.Directory]::EnumerateFiles($mr, '*', [IO.SearchOption]::AllDirectories)) {
+        $rel2 = $fp.Substring($rootPrefix.Length)
         if (Test-IgnoredRel $rel2 $false $ignorePatterns) { continue }   # never delete ignored content
-        if (-not $seen.ContainsKey($f.FullName.ToLowerInvariant())) { Remove-Item -LiteralPath $f.FullName -Force -EA SilentlyContinue; $deleted++ }
+        if (-not $seen.ContainsKey($fp.ToLowerInvariant())) { try { [IO.File]::Delete($fp) } catch {}; $deleted++ }
       }
     }
   }
@@ -367,7 +386,7 @@ try {
   if ((Read-Line $stream) -ne 'OK') { throw 'auth failed / rejected by server' }
 
   Write-Host "[fetch] sync -> $ToFolder"
-  $got = 0; $skipped = 0; $bytes = 0; $pass = 0; $deleted = 0
+  $got = 0; $skipped = 0; $bytes = 0; $pass = 0; $deleted = 0; $mkdirs = @{}
   $seen = New-Object 'System.Collections.Generic.HashSet[string]'
   $mirrorRoots = New-Object 'System.Collections.Generic.HashSet[string]'   # <ToFolder>\<top> per shared folder
   $more = $true; $syncOk = $false
@@ -377,7 +396,7 @@ try {
   while ($more) {
     $pass++
     $total = [int64]0      # file count for this pass (sent by the server as 'T <n>')
-    $script:passStart = Get-Date; $script:lastProg = $script:passStart; $script:lastBytes = 0
+    $script:passStart = [DateTime]::UtcNow; $script:lastProg = $script:passStart; $script:lastBytes = 0
     $seen.Clear()   # mirror must reflect ONLY the latest pass, so files deleted
                     # between cutover pass 1 and pass 2 get removed on the client
     while ($true) {
@@ -390,7 +409,7 @@ try {
         $drel = $matches[1]
         $dt = [IO.Path]::GetFullPath((Join-Path $ToFolder $drel))
         if ($dt.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-          if (-not (Test-Path -LiteralPath $dt)) { New-Item -ItemType Directory -Path $dt -Force | Out-Null }
+          Confirm-Dir $dt $mkdirs
           $top = ($drel -split '[\\/]')[0]
           if ($top) { [void]$mirrorRoots.Add([IO.Path]::GetFullPath((Join-Path $ToFolder $top))) }
         }
@@ -415,27 +434,28 @@ try {
           if ($top) { [void]$mirrorRoots.Add([IO.Path]::GetFullPath((Join-Path $ToFolder $top))) }
           [void]$seen.Add($bt.ToLowerInvariant())
           $need = $true
-          if (Test-Path -LiteralPath $bt) { $li = Get-Item -LiteralPath $bt; if ($li.Length -eq $it.Size -and $li.LastWriteTimeUtc.Ticks -eq $it.Mt) { $need = $false } }
+          $need = Need-Fetch $bt $it.Size $it.Mt
           if ($need) { [void]$sbm.Append('1'); $btargets.Add($bt) } else { [void]$sbm.Append('0'); $skipped++; $btargets.Add($null) }
         }
         Write-Line $stream $sbm.ToString()
+        $buf = [byte[]]::new(65536)   # reused across all files in the bundle (no per-file alloc)
         for ($k = 0; $k -lt $bcount; $k++) {
           if ($null -eq $btargets[$k]) { continue }
           $len = [int64](Read-Line $stream)
           if ($len -lt 0) { continue }   # server could not provide it (locked) -> keep our copy
           $bt = $btargets[$k]
-          $bdir = Split-Path $bt -Parent
-          if (-not (Test-Path -LiteralPath $bdir)) { New-Item -ItemType Directory -Path $bdir -Force | Out-Null }
+          $bdir = [IO.Path]::GetDirectoryName($bt)
+          Confirm-Dir $bdir $mkdirs
           $bfs = [IO.File]::Open($bt, [IO.FileMode]::Create, [IO.FileAccess]::Write)
           try {
-            $buf = New-Object byte[] 65536; $left = $len
+            $left = $len
             while ($left -gt 0) {
-              $n = $stream.Read($buf, 0, [Math]::Min($buf.Length, $left))
+              $n = $stream.Read($buf, 0, [Math]::Min([int64]$buf.Length, $left))
               if ($n -le 0) { throw "connection closed early (bundle) on $($bitems[$k].Rel)" }
               $bfs.Write($buf, 0, $n); $left -= $n; $bytes += $n
             }
           } finally { $bfs.Close() }
-          try { (Get-Item -LiteralPath $bt).LastWriteTimeUtc = [DateTime]::new($bitems[$k].Mt, [DateTimeKind]::Utc) } catch {}
+          Set-Mtime $bt $bitems[$k].Mt
           $got++
           Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
         }
@@ -452,16 +472,13 @@ try {
       [void]$seen.Add($target.ToLowerInvariant())
       Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
       $need = $true
-      if (Test-Path -LiteralPath $target) {
-        $li = Get-Item -LiteralPath $target
-        if ($li.Length -eq $size -and $li.LastWriteTimeUtc.Ticks -eq $mt) { $need = $false }
-      }
+      $need = Need-Fetch $target $size $mt
       if (-not $need) { Write-Line $stream '-1'; $skipped++; continue }
       Write-Line $stream '0'                       # changed/new -> full fetch (overwrite)
       $hdr = Read-Line $stream
       if ($hdr -eq '-1') { continue }              # server can't provide it (locked) -> keep our copy
-      $dir = Split-Path $target -Parent
-      if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+      $dir = [IO.Path]::GetDirectoryName($target)
+      Confirm-Dir $dir $mkdirs
       $fs = [IO.File]::Open($target, [IO.FileMode]::Create, [IO.FileAccess]::Write)
       try {
         if ($hdr -eq 'Z') {
@@ -502,14 +519,14 @@ try {
           $remain = [int64](($hdr -split ' ')[1])
           $buf = New-Object byte[] 1048576; $left = $remain
           while ($left -gt 0) {
-            $n = $stream.Read($buf, 0, [Math]::Min($buf.Length, $left))
+            $n = $stream.Read($buf, 0, [Math]::Min([int64]$buf.Length, $left))
             if ($n -le 0) { throw "connection closed early on $rel" }
             $fs.Write($buf, 0, $n); $left -= $n; $bytes += $n
             Show-FetchProgress ($got + $skipped) $total $got $skipped $bytes
           }
         }
       } finally { $fs.Close() }
-      try { (Get-Item -LiteralPath $target).LastWriteTimeUtc = [DateTime]::new($mt, [DateTimeKind]::Utc) } catch {}
+      Set-Mtime $target $mt
       $got++
     }
     if (-not $more) { break }
@@ -526,13 +543,11 @@ try {
   # Ignored content is never deleted. Runs per shared folder (its own subtree).
   if ($syncOk) {
     foreach ($mr in $mirrorRoots) {
-      if (-not (Test-Path -LiteralPath $mr)) { continue }
-      Get-ChildItem -LiteralPath $mr -Recurse -File | ForEach-Object {
-        $rel2 = $_.FullName.Substring($rootPrefix.Length)
-        if (Test-IgnoredRel $rel2 $false $ignorePatterns) { return } # never delete ignored content
-        if (-not $seen.Contains($_.FullName.ToLowerInvariant())) {
-          Remove-Item -LiteralPath $_.FullName -Force -EA SilentlyContinue; $deleted++
-        }
+      if (-not [IO.Directory]::Exists($mr)) { continue }
+      foreach ($fp in [IO.Directory]::EnumerateFiles($mr, '*', [IO.SearchOption]::AllDirectories)) {
+        $rel2 = $fp.Substring($rootPrefix.Length)
+        if (Test-IgnoredRel $rel2 $false $ignorePatterns) { continue } # never delete ignored content
+        if (-not $seen.Contains($fp.ToLowerInvariant())) { try { [IO.File]::Delete($fp) } catch {}; $deleted++ }
       }
     }
   }

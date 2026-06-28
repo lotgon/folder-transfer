@@ -10,9 +10,10 @@
 
 Pure PowerShell + the .NET that ships with Windows. You point it at one or more folders; it
 serves them over TLS and shuts itself down, leaving the machine exactly as it was. Transfers are
-**compressed on the fly** (skipping already‑compressed files), **many small files are bundled**,
-and **several connections run in parallel** so transfers fly over high‑latency links. It
-generates **one self‑contained file** to carry to the receiver.
+**compressed on the fly only when it actually speeds things up** (adaptive — it measures the link
+and stays raw on fast links or incompressible data), **many small files are bundled**, and
+**several connections run in parallel** so transfers fly over high‑latency links. It generates
+**one self‑contained file** to carry to the receiver.
 
 > Status: young but functional; verified end‑to‑end on Windows 11 (loopback) and over a real
 > two‑machine WAN link. Still review and test it in your environment before relying on it — see
@@ -24,6 +25,7 @@ generates **one self‑contained file** to carry to the receiver.
 - [Modes](#modes)
 - [Many folders and ignoring](#many-folders-and-ignoring)
 - [Parallel streams](#parallel-streams)
+- [Performance](#performance)
 - [Parameters](#parameters)
 - [Progress and logs](#progress-and-logs)
 - [Security](#security)
@@ -120,13 +122,38 @@ How it works: the sender lazily walks the source and assembles fine‑grained **
 bundle of small files, one large file, or an empty‑dir marker — into a shared queue; the N
 connections pull units until it's drained. Because units are fine‑grained, even a **single huge
 folder spreads across all streams** automatically — no need to split it in the config. Small files
-are still bundled and data is still compressed within each stream.
+are still bundled and data is still compressed (adaptively) within each stream.
 
 Mirror stays exact. Every connection records what it received into one shared set; after **all**
 streams finish cleanly, the receiver makes a single pass and deletes any local file the source no
 longer has — including files under a whole top‑level folder you deleted. (Like single‑stream, it
 deletes files, not directories, so an emptied folder may remain.) If any stream drops, the run is
 considered incomplete and **nothing is deleted** that time — just re‑run.
+
+## Performance
+
+**Efficiency = goodput / channel capacity** — how much of the link the transfer actually uses.
+Above 100% means adaptive compression delivered *more* original data than the wire physically
+carried. Measured with the defaults (4 parallel streams + adaptive compression) over an emulated
+WAN link, at 0 ms and at 150 ms round‑trip:
+
+<!-- BENCH:TABLE START -->
+| data type | 20 Mbit | 20 Mbit +150ms | 100 Mbit | 100 Mbit +150ms | 200 Mbit | 200 Mbit +150ms |
+|---|---|---|---|---|---|---|
+| small files (10000 x 4 KB) | 92% | 88% | 69% | 59% | 40% | 33% |
+| large, incompressible (4 MB files, random) | 96% | 92% | 94% | 84% | 81% | 76% |
+| large, compressible (4 MB files, text 3.73x) | 252% | 216% | 290% | 209% | 270% | 169% |
+<!-- BENCH:TABLE END -->
+
+- **Compressible** data goes *above 100%* — compression delivers several times the wire's raw rate.
+- **Incompressible** data is link‑bound (~100%) — nothing to compress, so the link is saturated.
+- **Small files** are bound by file creation on the receiver (NTFS metadata + antivirus), not the link.
+- **High ping** (+150 ms) costs little; the gap only grows on the fastest links, where each transfer
+  is so short that the few fixed round‑trips become a visible slice of it.
+
+Absolute numbers are machine‑specific; efficiency (%) is largely transferable. Full report and the
+test machine are in [BENCHMARKS.md](BENCHMARKS.md). Reproduce on your own hardware with
+`powershell -ExecutionPolicy Bypass -File bench\bench.ps1` — method in [bench/README.md](bench/README.md).
 
 ## Parameters
 
@@ -152,7 +179,7 @@ case‑insensitive:
 | `-ServerHost <addr>` | auto IPv4 | Address baked into the generated client. |
 | `-ClientOut <path>` | `.\download-scripts\…` | Where to write the generated client. |
 | `-NoFirewall` | off | Don't touch the firewall (opening it otherwise needs admin). |
-| `-NoCompress` | off | Disable streaming compression (it is **on by default**). |
+| `-NoCompress` | off | Force compression **off**. Default is **adaptive**: the server compresses only when it measures it to be faster (see [Performance](#performance)). |
 | `-Help` | — | Show help. |
 
 **Receiver** — one optional argument:

@@ -13,7 +13,7 @@ param(
   [Parameter(Position = 0)] [string]$Folder = '',   # positional: folder-transfer.bat <folder> ...
   [string]$Config = '',         # JSON config: folders[], ignore[], and any of the options below
   [string]$Ignore = '',         # ignore patterns (comma/semicolon separated), e.g. log/,*.log,mtlog
-  [switch]$NoCompress,          # disable on-the-fly compression (it is ON by default)
+  [switch]$NoCompress,          # force compression OFF (default is adaptive: on only when it pays)
   [int]$Streams = 4,            # parallel connections (1 = classic single-stream; >1 = parallel, per-folder)
   [int]$Port = 8722,
   [string]$AllowIp = '',
@@ -37,7 +37,7 @@ function Format-Span($sec) {
 }
 function Show-ServeProgress($st, $total) {
   # throttled (~2s) progress; called between files AND mid-file so big files don't look frozen
-  $nowt = Get-Date
+  $nowt = [DateTime]::UtcNow
   if (($nowt - $script:lastProg).TotalSeconds -lt 2) { return }
   $dt = ($nowt - $script:lastProg).TotalSeconds
   $spd = if ($dt -gt 0) { (($st.Bytes - $script:lastBytes) / 1MB) / $dt } else { 0 }
@@ -255,11 +255,11 @@ foreach ($f in $folders) {
 }
 $folders = @($resolved)
 if ($ignorePatterns.Count) { Log ("ignore patterns: {0}" -f ($ignorePatterns -join ', ')) }
-Log ("compression: {0}" -f $(if ($UseCompress) { 'on (skips already-compressed file types)' } else { 'off' }))
+Log ("compression: {0}" -f $(if ($UseCompress) { 'adaptive (per block; on only when >= 25% faster than raw; skips already-compressed types)' } else { 'off' }))
 
 function Write-Line($s, [string]$t) { $b = [Text.Encoding]::UTF8.GetBytes($t + "`n"); $s.Write($b, 0, $b.Length); $s.Flush() }
 function Read-Line($s) {
-  $ms = New-Object IO.MemoryStream
+  $ms = [IO.MemoryStream]::new()
   while ($true) {
     $ch = $s.ReadByte()
     if ($ch -lt 0) { if ($ms.Length -eq 0) { return $null } else { break } }
@@ -328,16 +328,22 @@ function Send-Bundle($s, $bundle, $st, $total) {
   #   server: for each wanted file in order: "<len>" + len bytes  (or "-1" if it is locked)
   # Returns $false if the client disconnected. Bundled files (<= 1 MB) are sent raw.
   if ($bundle.Count -eq 0) { return $true }
-  Write-Line $s ("B {0}" -f $bundle.Count)
-  foreach ($b in $bundle) { Write-Line $s ("{0} {1} {2}" -f $b.Size, $b.Mtime, $b.Rel) }
+  # send the "B <count>" header + the whole manifest in ONE write (one TLS record) instead of
+  # one Write-Line+Flush per file - a big win when a bundle holds thousands of tiny files.
+  $sb = New-Object Text.StringBuilder
+  [void]$sb.Append("B " + $bundle.Count + "`n")
+  foreach ($b in $bundle) { [void]$sb.Append(("{0} {1} {2}`n" -f $b.Size, $b.Mtime, $b.Rel)) }
+  $hb = [Text.Encoding]::UTF8.GetBytes($sb.ToString())
+  $s.Write($hb, 0, $hb.Length); $s.Flush()
   $mask = Read-Line $s
   if ($null -eq $mask) { $st.Ok = $false; return $false }
+  $buf = [byte[]]::new(65536)   # reused across all files in the bundle (no per-file alloc)
   for ($i = 0; $i -lt $bundle.Count; $i++) {
     $st.Offered++
     if (-not ($i -lt $mask.Length -and $mask[$i] -eq '1')) { $st.Skipped++; continue }
     $b = $bundle[$i]
     $fs = $null
-    try { $fs = New-Object IO.FileStream($b.Full, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]'ReadWrite, Delete')) }
+    try { $fs = [IO.FileStream]::new($b.Full, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]'ReadWrite, Delete')) }
     catch {
       Log ("session: cannot read (in use?), skipping this pass: {0} -- {1}" -f $b.Rel, $_.Exception.Message)
       Write-Line $s '-1'; $st.Skipped++; continue
@@ -345,9 +351,9 @@ function Send-Bundle($s, $bundle, $st, $total) {
     try {
       $len = $fs.Length
       Write-Line $s ([string]$len)
-      $buf = New-Object byte[] 65536; $left = $len
+      $left = $len
       while ($left -gt 0) {
-        $n = $fs.Read($buf, 0, [Math]::Min($buf.Length, $left))
+        $n = $fs.Read($buf, 0, [Math]::Min([int64]$buf.Length, $left))
         if ($n -le 0) { break }
         $s.Write($buf, 0, $n); $left -= $n; $st.Bytes += $n
       }
@@ -369,7 +375,7 @@ function Send-LargeFile($s, $fs, $offset, $ext, $st, $total, $useCompress) {
     Write-Line $s ("R {0}" -f $remain)
     $buf = New-Object byte[] 1048576; $left = $remain
     while ($left -gt 0) {
-      $n = $fs.Read($buf, 0, [Math]::Min($buf.Length, $left))
+      $n = $fs.Read($buf, 0, [Math]::Min([int64]$buf.Length, $left))
       if ($n -le 0) { break }
       $s.Write($buf, 0, $n); $left -= $n
       $st.Bytes += $n; Show-ServeProgress $st $total
@@ -377,26 +383,69 @@ function Send-LargeFile($s, $fs, $offset, $ext, $st, $total, $useCompress) {
     $st.Wire += $remain
   }
   else {
-    # adaptive: try each 1 MB block; "Z <clen> <rlen>" if it shrinks, else "R <rlen>" raw;
-    # after a few poor blocks stop trying for a while, then re-probe. Ended by "E".
+    # Adaptive per-block compression with a 25% margin, decided by direct A/B measurement.
+    # Each ~1 MB block is sent compressed ("Z <clen> <rlen>") or raw ("R <rlen>"); the client
+    # decodes either, ended by "E". We cannot infer the raw channel capacity while compressing
+    # (the compressed pipeline has its own bottleneck - the receiver's decompression), so instead
+    # we MEASURE both modes end to end and compare them directly:
+    #     Tr = original bytes/sec achieved when sending raw
+    #     Tc = original bytes/sec achieved when sending compressed (deflate time included)
+    # Compress only when it actually moves data at least 25% faster:  Tc >= 1.25 * Tr.
+    # On a fast link raw writes are near-instant so Tr is huge -> send raw (compression is pure
+    # cost); on a slow link the smaller payload wins. The estimates live on $st so they persist
+    # across files in the connection. We seed one sample of each mode, then re-probe the opposite
+    # mode every $reprobe blocks so the decision tracks a changing channel or changing data.
     Write-Line $s 'Z'
-    $buf = New-Object byte[] 1048576
-    $bad = 0; $skip = 0
+    $buf = [byte[]]::new(1048576)
+    $reprobe = 64
+    $freq = [double][Diagnostics.Stopwatch]::Frequency
     while ($true) {
       $n = $fs.Read($buf, 0, $buf.Length)
       if ($n -le 0) { break }
-      $cb = $null
-      if ($skip -le 0) {
-        $cms = New-Object IO.MemoryStream
-        $dz = New-Object IO.Compression.DeflateStream($cms, [IO.Compression.CompressionLevel]::Fastest, $true)
-        $dz.Write($buf, 0, $n); $dz.Close()
-        $cb = $cms.ToArray(); $cms.Dispose()
-        if ($cb.Length -ge ($n * 0.95)) { $cb = $null; $bad++; if ($bad -ge 3) { $skip = 64; $bad = 0 } }
-        else { $bad = 0 }
+      $haveR = $st.CzRawSec -gt 0
+      $haveC = $st.CzCmpSec -gt 0
+      $Tr = if ($haveR) { $st.CzRawBytes / $st.CzRawSec } else { 0 }
+      $Tc = if ($haveC) { $st.CzCmpBytes / $st.CzCmpSec } else { 0 }
+      $incomp = ($st.CzRatio -gt 0) -and ($st.CzRatio -lt 1.05)   # last probe showed it does not shrink
+      $doComp = $false; $reprobeNow = $false
+      if ($n -ge 256) {
+        if (-not $haveC) { $doComp = $true }              # seed a compressed sample
+        elseif (-not $haveR) { $doComp = $false }         # seed a raw sample
+        else {
+          $decided = (-not $incomp) -and ($Tc -ge (1.25 * $Tr))
+          if ($st.CzSince -ge $reprobe) { $doComp = (-not $decided); $reprobeNow = $true }  # refresh other mode
+          else { $doComp = $decided }
+        }
       }
-      else { $skip-- }
-      if ($null -ne $cb) { Write-Line $s ("Z {0} {1}" -f $cb.Length, $n); $s.Write($cb, 0, $cb.Length); $st.Wire += $cb.Length }
-      else { Write-Line $s ("R {0}" -f $n); $s.Write($buf, 0, $n); $st.Wire += $n }
+      if ($doComp) {
+        $t0 = [Diagnostics.Stopwatch]::GetTimestamp()
+        $cms = [IO.MemoryStream]::new()
+        $dz = [IO.Compression.DeflateStream]::new($cms, [IO.Compression.CompressionLevel]::Fastest, $true)
+        $dz.Write($buf, 0, $n); $dz.Close()
+        $tc = ([Diagnostics.Stopwatch]::GetTimestamp() - $t0) / $freq
+        $cbuf = $cms.ToArray(); $cms.Dispose()
+        $st.CzRatio = $n / [double]$cbuf.Length
+        if ($cbuf.Length -lt ($n * 0.95)) {
+          $t1 = [Diagnostics.Stopwatch]::GetTimestamp()
+          Write-Line $s ("Z {0} {1}" -f $cbuf.Length, $n); $s.Write($cbuf, 0, $cbuf.Length)
+          $tw = ([Diagnostics.Stopwatch]::GetTimestamp() - $t1) / $freq
+          $st.Wire += $cbuf.Length; $st.CzCmpBytes += $n; $st.CzCmpSec += ($tc + $tw)
+        }
+        else {
+          # content does not compress: send raw, record it as a raw sample (write time only)
+          $t1 = [Diagnostics.Stopwatch]::GetTimestamp()
+          Write-Line $s ("R {0}" -f $n); $s.Write($buf, 0, $n)
+          $tw = ([Diagnostics.Stopwatch]::GetTimestamp() - $t1) / $freq
+          $st.Wire += $n; $st.CzRawBytes += $n; $st.CzRawSec += $tw
+        }
+      }
+      else {
+        $t1 = [Diagnostics.Stopwatch]::GetTimestamp()
+        Write-Line $s ("R {0}" -f $n); $s.Write($buf, 0, $n)
+        $tw = ([Diagnostics.Stopwatch]::GetTimestamp() - $t1) / $freq
+        $st.Wire += $n; $st.CzRawBytes += $n; $st.CzRawSec += $tw
+      }
+      if ($reprobeNow) { $st.CzSince = 0 } else { $st.CzSince++ }
       $st.Bytes += $n; Show-ServeProgress $st $total
     }
     Write-Line $s 'E'
@@ -414,9 +463,9 @@ function Send-Pass($s, $roots, $total, $ignore) {
   # ignore pattern are skipped (a matched directory is pruned whole). Returns a
   # stats object; .Ok is $false if the client disconnected mid-pass. The client
   # never sends a path -> no traversal / reserved device names by construction.
-  $st = [pscustomobject]@{ Ok = $true; Offered = 0; Sent = 0; Skipped = 0; Bytes = [int64]0; Wire = [int64]0 }
+  $st = [pscustomobject]@{ Ok = $true; Offered = 0; Sent = 0; Skipped = 0; Bytes = [int64]0; Wire = [int64]0; CzRawBytes = [int64]0; CzRawSec = [double]0; CzCmpBytes = [int64]0; CzCmpSec = [double]0; CzRatio = [double]0; CzSince = 0 }
   Write-Line $s ("T {0}" -f $total)   # tell the client the file count for its own progress
-  $script:passStart = Get-Date; $script:lastProg = $script:passStart; $script:lastBytes = [int64]0
+  $script:passStart = [DateTime]::UtcNow; $script:lastProg = $script:passStart; $script:lastBytes = [int64]0
   $bundle = New-Object System.Collections.Generic.List[object]
   $bundleBytes = [int64]0
   foreach ($root in $roots) {
@@ -578,7 +627,7 @@ function Invoke-ParallelServe($listener, $cert, $token, $allowIp, $stallTimeout,
   $handler = {
     $script:SmallFile = $smallFile; $script:BundleBytes = $bundleBytes; $script:BundleMaxCount = $bundleMaxCount
     $script:IncompressibleExt = $incompExt; $UseCompress = $useCompress
-    $script:passStart = Get-Date; $script:lastProg = $script:passStart; $script:lastBytes = [int64]0   # Show-ServeProgress needs these
+    $script:passStart = [DateTime]::UtcNow; $script:lastProg = $script:passStart; $script:lastBytes = [int64]0   # Show-ServeProgress needs these
     function Log($m) { $logq.Enqueue(("[serve {0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m)) }
     $remote = $rawClient.Client.RemoteEndPoint.ToString(); $ip = $rawClient.Client.RemoteEndPoint.Address.ToString()
     $ssl = $null
@@ -592,7 +641,7 @@ function Invoke-ParallelServe($listener, $cert, $token, $allowIp, $stallTimeout,
       Write-Line $ssl 'OK'
       if ((Read-Line $ssl) -ne 'QSYNC') { Write-Line $ssl 'ERR cmd'; return }
       Log "parallel conn from $remote (TLS ok)"
-      $st = [pscustomobject]@{ Ok = $true; Offered = 0; Sent = 0; Skipped = 0; Bytes = [int64]0; Wire = [int64]0 }
+      $st = [pscustomobject]@{ Ok = $true; Offered = 0; Sent = 0; Skipped = 0; Bytes = [int64]0; Wire = [int64]0; CzRawBytes = [int64]0; CzRawSec = [double]0; CzCmpBytes = [int64]0; CzCmpSec = [double]0; CzRatio = [double]0; CzSince = 0 }
       while ($true) {
         $u = $null
         if (-not $queue.TryDequeue([ref]$u)) {

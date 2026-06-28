@@ -12,6 +12,35 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.14.0] — 2026-06-28
+
+### Added
+- **Adaptive compression.** Compression is no longer all‑or‑nothing: the server measures, per
+  connection, how fast it actually moves data raw vs compressed and only compresses when that is at
+  least **25% faster** end‑to‑end. On a fast LAN it sends raw (compression there is pure CPU cost
+  and roughly halved throughput); on a slow or compressible link it compresses and effective
+  throughput rises by about the compression ratio. Fully automatic — `-NoCompress` still forces it
+  off. The wire format is unchanged (the receiver already decodes mixed raw/compressed blocks).
+- **Benchmark suite (`bench/`).** `bench\bench.ps1` builds corpora, drives real transfers through a
+  bandwidth/latency‑emulating proxy (`bench\bench-proxy.ps1`), and writes `BENCHMARKS.md`; method
+  and reproduction steps in `bench/README.md`. A results table is shown on the project home page.
+
+### Changed
+- **Hot path moved from cmdlets to .NET** on both sides (file existence/size/mtime checks, directory
+  creation, timestamps, line timing) — a measurable speed‑up on many‑small‑file transfers, in both
+  single‑stream and parallel modes.
+
+### Fixed
+- **Destination on an 8.3 short path synced nothing.** If `-ToFolder` resolved to a short path
+  (e.g. `C:\Users\RUNNER~1\...`), the receiver's path‑safety check compared a short root against
+  expanded target paths and rejected **every** file as unsafe. The destination is now normalised the
+  same way as the targets.
+- **Files >= 2 GB in the raw (uncompressed) path** crashed with an Int32 overflow in the read loop;
+  the byte count is now 64‑bit throughout.
+- **Small parallel jobs could skip the mirror delete.** A stream that lost the connect race and
+  claimed no work was treated as a failed stream, marking the whole run incomplete so nothing was
+  deleted; such idle streams are now benign and the reconciliation pass runs as intended.
+
 ## [0.13.0] — 2026-06-28
 
 ### Changed
