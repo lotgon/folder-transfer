@@ -1,0 +1,800 @@
+//! The serve side (`ft serve`). Milestone 3: single-stream `SYNC` — a lazy walk
+//! that bundles small files, offers large files individually with raw or adaptive
+//! per-block compression, honours ignore patterns, and supports two-phase cutover.
+//! The classic accept loop enforces idle and stall timeouts and `--once`.
+
+use std::collections::VecDeque;
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
+
+use crate::compress::{deflate_raw, AdaptiveState, BLOCK_SIZE};
+use crate::ignore::IgnoreSet;
+use crate::mtime;
+use crate::paths::is_incompressible;
+use crate::tls::ServerIdentity;
+use crate::wire::Conn;
+use crate::BoxError;
+
+/// Files <= 1 MiB are batched into bundles.
+const SMALL_FILE: u64 = 1_048_576;
+/// Flush a bundle once it reaches ~10 MiB of files...
+const BUNDLE_BYTES: u64 = 10_485_760;
+/// ...or this many files.
+const BUNDLE_MAX_COUNT: usize = 4096;
+
+#[derive(Default)]
+struct SendStats {
+    offered: u64,
+    sent: u64,
+    skipped: u64,
+    bytes: u64,
+    wire: u64,
+}
+
+struct BundleItem {
+    full: PathBuf,
+    rel: String,
+    size: u64,
+    mtime: i64,
+}
+
+/// `full` relative to `base`, with the leading separator trimmed (matches the
+/// PowerShell `full.Substring(base.Length).TrimStart('\','/')`).
+fn rel_to_base(base: &Path, full: &Path) -> String {
+    let b = base.to_string_lossy();
+    let f = full.to_string_lossy();
+    let r = f.get(b.len()..).unwrap_or("");
+    r.trim_start_matches(['\\', '/']).to_string()
+}
+
+/// Read up to `buf.len()` bytes, looping over short reads; returns bytes read.
+fn read_block(f: &mut File, buf: &mut [u8]) -> io::Result<usize> {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = f.read(&mut buf[off..])?;
+        if n == 0 {
+            break;
+        }
+        off += n;
+    }
+    Ok(off)
+}
+
+/// Send a bundle of small files. Returns `false` if the client dropped.
+fn send_bundle<S: Read + Write>(
+    conn: &mut Conn<S>,
+    bundle: &[BundleItem],
+    stats: &mut SendStats,
+) -> io::Result<bool> {
+    if bundle.is_empty() {
+        return Ok(true);
+    }
+    // Header + manifest in one write (one TLS record).
+    let mut header = format!("B {}\n", bundle.len());
+    for b in bundle {
+        header.push_str(&format!("{} {} {}\n", b.size, b.mtime, b.rel));
+    }
+    conn.put_bytes(header.as_bytes());
+    conn.flush()?;
+
+    let mask = match conn.read_line()? {
+        Some(m) => m,
+        None => return Ok(false),
+    };
+    let mask_bytes = mask.as_bytes();
+    for (i, b) in bundle.iter().enumerate() {
+        stats.offered += 1;
+        let wanted = i < mask_bytes.len() && mask_bytes[i] == b'1';
+        if !wanted {
+            stats.skipped += 1;
+            continue;
+        }
+        let mut f = match File::open(&b.full) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[ft] cannot read (in use?), skipping: {} -- {e}", b.rel);
+                conn.send_line("-1")?;
+                stats.skipped += 1;
+                continue;
+            }
+        };
+        let len = f.metadata()?.len();
+        conn.put_line(&len.to_string());
+        let sent = conn.send_from_reader(&mut f, len)?;
+        conn.flush()?; // ensure the len line is flushed even for empty files
+        stats.sent += 1;
+        stats.bytes += sent;
+        stats.wire += len;
+    }
+    Ok(true)
+}
+
+/// Send one already-opened large file: raw (`R <bytes>`) or adaptive (`Z` ... `E`).
+fn send_large_file<S: Read + Write>(
+    conn: &mut Conn<S>,
+    file: &mut File,
+    offset: i64,
+    ext: &str,
+    stats: &mut SendStats,
+    use_compress: bool,
+    adaptive: &mut AdaptiveState,
+) -> io::Result<()> {
+    let file_len = file.metadata()?.len() as i64;
+    let mut remain = file_len - offset;
+    if remain < 0 {
+        remain = 0;
+    }
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset as u64))?;
+    }
+    let zip = use_compress && remain >= 256 && !is_incompressible(ext);
+    if !zip {
+        conn.put_line(&format!("R {remain}"));
+        let sent = conn.send_from_reader(file, remain as u64)?;
+        conn.flush()?;
+        stats.bytes += sent;
+        stats.wire += remain as u64;
+    } else {
+        conn.send_line("Z")?;
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        loop {
+            let n = read_block(file, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let (do_comp, reprobe_now) = adaptive.decide(n);
+            if do_comp {
+                let t0 = Instant::now();
+                let cbuf = deflate_raw(&buf[..n]);
+                let tc = t0.elapsed().as_secs_f64();
+                adaptive.cz_ratio = n as f64 / cbuf.len() as f64;
+                if (cbuf.len() as f64) < (n as f64 * 0.95) {
+                    let t1 = Instant::now();
+                    conn.put_line(&format!("Z {} {}", cbuf.len(), n));
+                    conn.put_bytes(&cbuf);
+                    conn.flush()?;
+                    let tw = t1.elapsed().as_secs_f64();
+                    stats.wire += cbuf.len() as u64;
+                    adaptive.cz_cmp_bytes += n as i64;
+                    adaptive.cz_cmp_sec += tc + tw;
+                } else {
+                    // does not compress: send raw, record as a raw sample (write time only)
+                    let t1 = Instant::now();
+                    conn.put_line(&format!("R {n}"));
+                    conn.put_bytes(&buf[..n]);
+                    conn.flush()?;
+                    let tw = t1.elapsed().as_secs_f64();
+                    stats.wire += n as u64;
+                    adaptive.cz_raw_bytes += n as i64;
+                    adaptive.cz_raw_sec += tw;
+                }
+            } else {
+                let t1 = Instant::now();
+                conn.put_line(&format!("R {n}"));
+                conn.put_bytes(&buf[..n]);
+                conn.flush()?;
+                let tw = t1.elapsed().as_secs_f64();
+                stats.wire += n as u64;
+                adaptive.cz_raw_bytes += n as i64;
+                adaptive.cz_raw_sec += tw;
+            }
+            if reprobe_now {
+                adaptive.cz_since = 0;
+            } else {
+                adaptive.cz_since += 1;
+            }
+            stats.bytes += n as u64;
+        }
+        conn.send_line("E")?;
+    }
+    stats.sent += 1;
+    Ok(())
+}
+
+/// One lazy walk of each shared folder. Returns `false` if the client dropped.
+fn send_pass<S: Read + Write>(
+    conn: &mut Conn<S>,
+    roots: &[PathBuf],
+    ignore: &IgnoreSet,
+    use_compress: bool,
+) -> io::Result<(bool, SendStats)> {
+    let mut stats = SendStats::default();
+    conn.send_line("T 0")?; // no up-front count
+    let mut adaptive = AdaptiveState::new();
+    let mut bundle: Vec<BundleItem> = Vec::new();
+    let mut bundle_bytes: u64 = 0;
+
+    for root in roots {
+        let base: PathBuf = root.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| root.clone());
+        let mut stack: Vec<(PathBuf, bool)> = vec![(root.clone(), false)];
+        while let Some((dir, dirs_only)) = stack.pop() {
+            if dirs_only {
+                // ignored subtree: recreate the (empty) dir, recurse, send no files
+                let rel_dir = rel_to_base(&base, &dir);
+                if !rel_dir.is_empty() {
+                    conn.send_line(&format!("D {rel_dir}"))?;
+                }
+                if let Ok(rd) = fs::read_dir(&dir) {
+                    for e in rd.flatten() {
+                        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                            stack.push((e.path(), true));
+                        }
+                    }
+                }
+                continue;
+            }
+            // Classify entries: push subdirs (ignored => DirsOnly), collect files.
+            let mut files: Vec<PathBuf> = Vec::new();
+            if let Ok(rd) = fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    let ft = match e.file_type() {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    let p = e.path();
+                    if ft.is_dir() {
+                        let ig = ignore.is_ignored(&rel_to_base(&base, &p), true);
+                        stack.push((p, ig));
+                    } else if ft.is_file() {
+                        files.push(p);
+                    }
+                }
+            }
+            for full in files {
+                let rel = rel_to_base(&base, &full);
+                if ignore.is_ignored(&rel, false) {
+                    continue;
+                }
+                let meta = match fs::metadata(&full) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let size = meta.len();
+                let mt = mtime::read_ticks(&meta).unwrap_or(0);
+                if size <= SMALL_FILE {
+                    bundle.push(BundleItem { full: full.clone(), rel, size, mtime: mt });
+                    bundle_bytes += size;
+                    if bundle_bytes >= BUNDLE_BYTES || bundle.len() >= BUNDLE_MAX_COUNT {
+                        if !send_bundle(conn, &bundle, &mut stats)? {
+                            return Ok((false, stats));
+                        }
+                        bundle.clear();
+                        bundle_bytes = 0;
+                    }
+                    continue;
+                }
+                // large file: flush any pending bundle, then offer it on its own
+                if !bundle.is_empty() {
+                    if !send_bundle(conn, &bundle, &mut stats)? {
+                        return Ok((false, stats));
+                    }
+                    bundle.clear();
+                    bundle_bytes = 0;
+                }
+                conn.send_line(&format!("F {size} {mt} {rel}"))?;
+                stats.offered += 1;
+                let resp = match conn.read_line()? {
+                    Some(r) => r,
+                    None => return Ok((false, stats)),
+                };
+                let offset: i64 = resp.trim().parse().unwrap_or(-1);
+                if offset < 0 {
+                    stats.skipped += 1;
+                    continue;
+                }
+                let mut f = match File::open(&full) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("[ft] cannot read (in use?), skipping: {rel} -- {e}");
+                        conn.send_line("-1")?;
+                        stats.skipped += 1;
+                        continue;
+                    }
+                };
+                let ext = full
+                    .extension()
+                    .map(|e| format!(".{}", e.to_string_lossy()))
+                    .unwrap_or_default();
+                send_large_file(conn, &mut f, offset, &ext, &mut stats, use_compress, &mut adaptive)?;
+            }
+        }
+    }
+    if !bundle.is_empty() && !send_bundle(conn, &bundle, &mut stats)? {
+        return Ok((false, stats));
+    }
+    Ok((true, stats))
+}
+
+/// Cutover pause: wait for the operator to signal via an `ft-cutover.go` flag file
+/// next to the binary, sending `PING` keepalives ~every 15 s.
+fn wait_cutover<S: Read + Write>(conn: &mut Conn<S>) -> io::Result<()> {
+    let go = cutover_flag_path();
+    let _ = fs::remove_file(&go);
+    eprintln!("========================================================================");
+    eprintln!(" PHASE 1 complete. Now STOP THE DATABASE so its files are consistent.");
+    eprintln!(" Then create the file to signal phase 2:");
+    eprintln!("   {}", go.display());
+    eprintln!("========================================================================");
+    let mut ticks = 0u64;
+    loop {
+        if go.exists() {
+            let _ = fs::remove_file(&go);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        ticks += 1;
+        if ticks % 60 == 0 {
+            conn.send_line("PING")?;
+        }
+    }
+    eprintln!("[ft] cutover signal received - running final sync pass");
+    Ok(())
+}
+
+fn cutover_flag_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("ft-cutover.go")
+}
+
+/// Configuration for one serve run.
+pub struct ServeConfig {
+    pub folders: Vec<String>,
+    pub port: u16,
+    pub idle_seconds: u64,
+    pub stall_timeout: u64,
+    pub once: bool,
+    pub cutover: bool,
+    pub use_compress: bool,
+    pub ignore_spec: String,
+    /// Serve only this source IP (application-layer gate, independent of the firewall).
+    pub allow_ip: Option<String>,
+}
+
+/// Reject a peer whose IP is not the allowed one (mirrors the PowerShell
+/// `if ($AllowIp -and $ip -ne $AllowIp)` check). Returns true if allowed.
+fn ip_allowed(tcp: &TcpStream, allow_ip: &Option<String>) -> bool {
+    match allow_ip {
+        None => true,
+        Some(want) => match tcp.peer_addr() {
+            Ok(addr) => addr.ip().to_string() == *want,
+            Err(_) => false,
+        },
+    }
+}
+
+/// Validate and canonicalise each shared folder (drops a trailing slash so the
+/// folder's own name resolves correctly, like the PowerShell server).
+fn resolve_folders(folders: &[String]) -> Result<Vec<PathBuf>, BoxError> {
+    let mut out = Vec::new();
+    for f in folders {
+        let f = f.trim().trim_matches('"');
+        if f.is_empty() {
+            continue;
+        }
+        let p = Path::new(f);
+        if !p.exists() {
+            return Err(format!("folder not found: {f}").into());
+        }
+        out.push(crate::paths::canonicalize(p)?);
+    }
+    if out.is_empty() {
+        return Err("at least one folder is required (the folder to share)".into());
+    }
+    Ok(out)
+}
+
+/// Entry point for `ft serve` (single-stream / classic).
+pub fn run_serve_single(cfg: ServeConfig, identity: &ServerIdentity, token: &str) -> Result<(), BoxError> {
+    let roots = resolve_folders(&cfg.folders)?;
+    let ignore = IgnoreSet::parse(&cfg.ignore_spec);
+
+    let listener = TcpListener::bind(("0.0.0.0", cfg.port))?;
+    listener.set_nonblocking(true)?;
+    eprintln!(
+        "[ft] listening 0.0.0.0:{}  folders={}  idle={}s  once={}",
+        cfg.port,
+        roots.len(),
+        cfg.idle_seconds,
+        cfg.once
+    );
+
+    loop {
+        // Wait for a client, enforcing the idle timeout.
+        let mut waited = 0u64;
+        let tcp = loop {
+            match listener.accept() {
+                Ok((s, _)) => break s,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(200));
+                    waited += 200;
+                    if waited >= cfg.idle_seconds * 1000 {
+                        eprintln!("[ft] idle timeout ({}s, no client) - shutting down", cfg.idle_seconds);
+                        return Ok(());
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+
+        match handle_session(tcp, identity, token, &roots, &ignore, &cfg) {
+            Ok(true) => {
+                if cfg.once {
+                    eprintln!("[ft] one-time job done - shutting down");
+                    return Ok(());
+                }
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("[ft] session aborted: {e}"),
+        }
+    }
+}
+
+/// Handle one connection; returns whether the client completed cleanly (`BYE`).
+fn handle_session(
+    tcp: TcpStream,
+    identity: &ServerIdentity,
+    token: &str,
+    roots: &[PathBuf],
+    ignore: &IgnoreSet,
+    cfg: &ServeConfig,
+) -> Result<bool, BoxError> {
+    if !ip_allowed(&tcp, &cfg.allow_ip) {
+        let who = tcp.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+        eprintln!("[ft] session REJECTED from {who} (only {} is allowed)", cfg.allow_ip.as_deref().unwrap_or(""));
+        return Ok(false);
+    }
+    tcp.set_nonblocking(false)?;
+    tcp.set_nodelay(true)?;
+    tcp.set_read_timeout(Some(Duration::from_secs(cfg.stall_timeout)))?;
+    let server_conn = ServerConnection::new(identity.config.clone())?;
+    let tls = StreamOwned::new(server_conn, tcp);
+    let mut c = Conn::new(tls);
+
+    let line = c.read_line()?;
+    let authed = match line.as_deref().and_then(|l| l.strip_prefix("AUTH ")) {
+        Some(t) => token.is_empty() || t == token,
+        None => false,
+    };
+    if !authed {
+        c.send_line("ERR auth")?;
+        eprintln!("[ft] bad auth (rejected)");
+        return Ok(false);
+    }
+    c.send_line("OK")?;
+    eprintln!("[ft] client authenticated");
+
+    let mut completed = false;
+    loop {
+        match c.read_line()? {
+            None => break,
+            Some(cmd) if cmd == "SYNC" => {
+                eprintln!("[ft] sync pass 1");
+                let (ok1, s1) = send_pass(&mut c, roots, ignore, cfg.use_compress)?;
+                if !ok1 {
+                    eprintln!("[ft] client dropped during pass 1");
+                    break;
+                }
+                c.send_line("PASS-END")?;
+                eprintln!("[ft] pass 1: sent={} unchanged={} bytes={} wire={}", s1.sent, s1.skipped, s1.bytes, s1.wire);
+                if cfg.cutover {
+                    wait_cutover(&mut c)?;
+                    c.send_line("GO")?;
+                    eprintln!("[ft] sync pass 2 (final)");
+                    let (ok2, s2) = send_pass(&mut c, roots, ignore, cfg.use_compress)?;
+                    if !ok2 {
+                        eprintln!("[ft] client dropped during pass 2");
+                        break;
+                    }
+                    c.send_line("PASS-END")?;
+                    eprintln!("[ft] pass 2: sent={} unchanged={} bytes={} wire={}", s2.sent, s2.skipped, s2.bytes, s2.wire);
+                }
+                c.send_line("DONE")?;
+            }
+            Some(cmd) if cmd == "BYE" => {
+                completed = true;
+                break;
+            }
+            Some(_) => c.send_line("ERR cmd")?,
+        }
+    }
+    Ok(completed)
+}
+
+// ===========================================================================
+// Parallel mode (QSYNC): a bounded-queue producer + N handler threads. Units
+// are fine-grained (a bundle, one large file, or an empty-dir marker), so even
+// one giant folder spreads across all streams. Mirrors `Invoke-ParallelServe`.
+// ===========================================================================
+
+/// Backpressure cap on the work queue (matches the PowerShell `$cap`).
+const QUEUE_CAP: usize = 256;
+
+/// A unit of work pulled by a handler.
+enum Unit {
+    Dir(String),
+    Bundle(Vec<BundleItem>),
+    Large { full: PathBuf, rel: String, size: u64, mtime: i64 },
+}
+
+/// A simple shared FIFO; handlers poll `try_pop` (like the PowerShell `TryDequeue`).
+struct WorkQueue {
+    q: Mutex<VecDeque<Unit>>,
+}
+
+impl WorkQueue {
+    fn new() -> Self {
+        WorkQueue { q: Mutex::new(VecDeque::new()) }
+    }
+    fn len(&self) -> usize {
+        self.q.lock().unwrap().len()
+    }
+    fn try_pop(&self) -> Option<Unit> {
+        self.q.lock().unwrap().pop_front()
+    }
+    /// Enqueue with backpressure: wait while the queue is at capacity.
+    fn enqueue_blocking(&self, u: Unit) {
+        while self.len() >= QUEUE_CAP {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.q.lock().unwrap().push_back(u);
+    }
+}
+
+/// The producer: lazily walk the roots and assemble units into the queue.
+fn producer_walk(roots: &[PathBuf], ignore: &IgnoreSet, queue: &WorkQueue) {
+    let mut bundle: Vec<BundleItem> = Vec::new();
+    let mut bbytes: u64 = 0;
+    for root in roots {
+        let base: PathBuf = root.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| root.clone());
+        let mut stack: Vec<(PathBuf, bool)> = vec![(root.clone(), false)];
+        while let Some((dir, dirs_only)) = stack.pop() {
+            if dirs_only {
+                let rel_dir = rel_to_base(&base, &dir);
+                if !rel_dir.is_empty() {
+                    queue.enqueue_blocking(Unit::Dir(rel_dir));
+                }
+                if let Ok(rd) = fs::read_dir(&dir) {
+                    for e in rd.flatten() {
+                        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                            stack.push((e.path(), true));
+                        }
+                    }
+                }
+                continue;
+            }
+            let mut files: Vec<PathBuf> = Vec::new();
+            if let Ok(rd) = fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    let ft = match e.file_type() {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    let p = e.path();
+                    if ft.is_dir() {
+                        let ig = ignore.is_ignored(&rel_to_base(&base, &p), true);
+                        stack.push((p, ig));
+                    } else if ft.is_file() {
+                        files.push(p);
+                    }
+                }
+            }
+            for full in files {
+                let rel = rel_to_base(&base, &full);
+                if ignore.is_ignored(&rel, false) {
+                    continue;
+                }
+                let meta = match fs::metadata(&full) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let size = meta.len();
+                let mt = mtime::read_ticks(&meta).unwrap_or(0);
+                if size <= SMALL_FILE {
+                    bundle.push(BundleItem { full: full.clone(), rel, size, mtime: mt });
+                    bbytes += size;
+                    if bbytes >= BUNDLE_BYTES || bundle.len() >= BUNDLE_MAX_COUNT {
+                        queue.enqueue_blocking(Unit::Bundle(std::mem::take(&mut bundle)));
+                        bbytes = 0;
+                    }
+                    continue;
+                }
+                // large file: flush any pending bundle, then offer it on its own
+                if !bundle.is_empty() {
+                    queue.enqueue_blocking(Unit::Bundle(std::mem::take(&mut bundle)));
+                    bbytes = 0;
+                }
+                queue.enqueue_blocking(Unit::Large { full, rel, size, mtime: mt });
+            }
+        }
+    }
+    if !bundle.is_empty() {
+        queue.enqueue_blocking(Unit::Bundle(bundle));
+    }
+}
+
+/// One handler thread: AUTH, expect `QSYNC`, then serve units until `NOUNIT`.
+#[allow(clippy::too_many_arguments)]
+fn parallel_handler(
+    tcp: TcpStream,
+    config: Arc<ServerConfig>,
+    token: String,
+    queue: Arc<WorkQueue>,
+    done: Arc<AtomicBool>,
+    use_compress: bool,
+    stall: u64,
+    allow_ip: Option<String>,
+) {
+    if !ip_allowed(&tcp, &allow_ip) {
+        let who = tcp.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+        eprintln!("[ft] parallel conn REJECTED from {who} (only {} is allowed)", allow_ip.as_deref().unwrap_or(""));
+        return;
+    }
+    if let Err(e) = (|| -> io::Result<()> {
+        tcp.set_nonblocking(false)?;
+        tcp.set_nodelay(true)?;
+        tcp.set_read_timeout(Some(Duration::from_secs(stall)))?;
+        let server_conn = ServerConnection::new(config).map_err(io::Error::other)?;
+        let mut c = Conn::new(StreamOwned::new(server_conn, tcp));
+
+        let line = c.read_line()?;
+        let authed = match line.as_deref().and_then(|l| l.strip_prefix("AUTH ")) {
+            Some(t) => token.is_empty() || t == token,
+            None => false,
+        };
+        if !authed {
+            c.send_line("ERR auth")?;
+            return Ok(());
+        }
+        c.send_line("OK")?;
+        match c.read_line()?.as_deref() {
+            Some("QSYNC") => {}
+            _ => {
+                c.send_line("ERR cmd")?;
+                return Ok(());
+            }
+        }
+
+        let mut stats = SendStats::default();
+        let mut adaptive = AdaptiveState::new();
+        loop {
+            let unit = match queue.try_pop() {
+                Some(u) => u,
+                None => {
+                    if done.load(Ordering::Acquire) {
+                        c.send_line("NOUNIT")?;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(15));
+                    continue;
+                }
+            };
+            match unit {
+                Unit::Dir(rel) => c.send_line(&format!("D {rel}"))?,
+                Unit::Bundle(items) => {
+                    if !send_bundle(&mut c, &items, &mut stats)? {
+                        return Ok(()); // client dropped
+                    }
+                }
+                Unit::Large { full, rel, size, mtime } => {
+                    c.send_line(&format!("F {size} {mtime} {rel}"))?;
+                    stats.offered += 1;
+                    let resp = match c.read_line()? {
+                        Some(r) => r,
+                        None => return Ok(()), // client dropped
+                    };
+                    let offset: i64 = resp.trim().parse().unwrap_or(-1);
+                    if offset < 0 {
+                        stats.skipped += 1;
+                        continue;
+                    }
+                    let mut f = match File::open(&full) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            eprintln!("[ft] cannot read (in use?), skipping: {rel} -- {e}");
+                            c.send_line("-1")?;
+                            stats.skipped += 1;
+                            continue;
+                        }
+                    };
+                    let ext = full
+                        .extension()
+                        .map(|e| format!(".{}", e.to_string_lossy()))
+                        .unwrap_or_default();
+                    send_large_file(&mut c, &mut f, offset, &ext, &mut stats, use_compress, &mut adaptive)?;
+                }
+            }
+        }
+        Ok(())
+    })() {
+        eprintln!("[ft] parallel conn aborted: {e}");
+    }
+}
+
+/// Entry point for `ft serve` with `--streams > 1` (parallel `QSYNC`).
+pub fn run_serve_parallel(cfg: ServeConfig, identity: &ServerIdentity, token: &str, streams: i32) -> Result<(), BoxError> {
+    let roots = resolve_folders(&cfg.folders)?;
+    let ignore = Arc::new(IgnoreSet::parse(&cfg.ignore_spec));
+    let queue = Arc::new(WorkQueue::new());
+    let done = Arc::new(AtomicBool::new(false));
+
+    let listener = TcpListener::bind(("0.0.0.0", cfg.port))?;
+    listener.set_nonblocking(true)?;
+    eprintln!(
+        "[ft] PARALLEL listening 0.0.0.0:{}  folders={}  streams={}  idle={}s",
+        cfg.port,
+        roots.len(),
+        streams,
+        cfg.idle_seconds
+    );
+
+    // Producer thread.
+    let producer = {
+        let queue = queue.clone();
+        let done = done.clone();
+        let ignore = ignore.clone();
+        std::thread::spawn(move || {
+            producer_walk(&roots, &ignore, &queue);
+            done.store(true, Ordering::Release);
+        })
+    };
+
+    // Accept loop with the parallel shutdown rules.
+    let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    let mut idle: u64 = 0;
+    let mut connected_any = false;
+    loop {
+        match listener.accept() {
+            Ok((tcp, _)) => {
+                connected_any = true;
+                idle = 0;
+                let config = identity.config.clone();
+                let token = token.to_string();
+                let queue = queue.clone();
+                let done = done.clone();
+                let use_compress = cfg.use_compress;
+                let stall = cfg.stall_timeout;
+                let allow_ip = cfg.allow_ip.clone();
+                handles.push(std::thread::spawn(move || {
+                    parallel_handler(tcp, config, token, queue, done, use_compress, stall, allow_ip);
+                }));
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(150));
+                idle += 150;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        handles.retain(|h| !h.is_finished());
+
+        if connected_any && handles.is_empty() {
+            if done.load(Ordering::Acquire) && queue.len() == 0 {
+                break; // clean finish
+            }
+            if idle >= 5000 {
+                eprintln!("[ft] all clients gone - stopping");
+                break;
+            }
+        }
+        if !connected_any && idle >= cfg.idle_seconds * 1000 {
+            eprintln!("[ft] idle timeout ({}s, no client) - shutting down", cfg.idle_seconds);
+            break;
+        }
+    }
+
+    let _ = producer.join();
+    for h in handles {
+        let _ = h.join();
+    }
+    eprintln!("[ft] parallel job done");
+    Ok(())
+}

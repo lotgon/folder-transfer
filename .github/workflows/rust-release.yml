@@ -1,0 +1,69 @@
+# Build the Rust `ft` binary for each target and attach the archives to the
+# GitHub release for the pushed tag. This runs ALONGSIDE release.ps1: that script
+# tags, pushes, and creates the release with the PowerShell ZIP; this workflow
+# (triggered by the same tag) adds the Rust archives to the same release. Order
+# does not matter — whichever runs second just adds its assets.
+#
+# Both targets build with pure-Rust crypto/compression (rustls+ring, rcgen+ring,
+# flate2/miniz_oxide), so the Linux musl build is fully static with no C deps.
+name: rust-release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: ft.exe
+            kind: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin: ft
+            kind: targz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --manifest-path rust/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          STAGE="ft-$VER"
+          mkdir -p "$STAGE"
+          cp "rust/target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGE/"
+          cp LICENSE "$STAGE/" 2>/dev/null || true
+          cp README.md "$STAGE/" 2>/dev/null || true
+          if [ "${{ matrix.kind }}" = "zip" ]; then
+            ASSET="ft-$VER-x86_64-windows.zip"
+            7z a "$ASSET" "$STAGE" >/dev/null
+          else
+            ASSET="ft-$VER-x86_64-linux.tar.gz"
+            tar -czf "$ASSET" "$STAGE"
+          fi
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}

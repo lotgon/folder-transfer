@@ -5,6 +5,9 @@ ft-download-*.bat
 # Release build output (release.ps1 stages the ZIP here)
 dist/
 
+# Rust build output
+rust/target/
+
 # Local test / demo artifacts
 _demo/
 _d.ps1

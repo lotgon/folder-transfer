@@ -30,7 +30,8 @@ param(
   [string]$Repo   = 'lotgon/folder-transfer',
   [string]$Branch = 'main',
   [switch]$DryRun,                                          # build the ZIP, skip tag/push/publish
-  [switch]$Force                                            # tolerate a dirty tree / existing tag/release
+  [switch]$Force,                                           # tolerate a dirty tree / existing tag/release
+  [switch]$WithRust                                         # ALSO build+upload the local Rust Windows binary (additive; the CI workflow builds Linux too)
 )
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -132,5 +133,30 @@ if ($relExists) {
 }
 else {
   gh release create $tag $zip --repo $Repo --title $title --notes-file $notesPath; Check "gh release create"
+}
+
+# ---- optional: build + upload the local Rust Windows binary -----------------
+# Additive and opt-in (-WithRust). Does NOT touch the PowerShell ZIP above. The
+# Linux (musl) archive is built by .github/workflows/rust-release.yml on the tag;
+# this just attaches the Windows binary from a local cargo build for convenience.
+if ($WithRust) {
+  if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { Warn 'cargo not found - skipping Rust build (-WithRust)' }
+  else {
+    Info 'building Rust ft.exe (x86_64-pc-windows-msvc, release)'
+    cargo build --release --manifest-path (Join-Path $root 'rust\Cargo.toml') --target x86_64-pc-windows-msvc
+    Check 'cargo build (rust)'
+    $rustBin = Join-Path $root 'rust\target\x86_64-pc-windows-msvc\release\ft.exe'
+    if (-not (Test-Path -LiteralPath $rustBin)) { Die "rust binary not found: $rustBin" }
+    $rstage = Join-Path $dist "ft-$ver"
+    $rzip = Join-Path $dist "ft-$ver-x86_64-windows.zip"
+    if (Test-Path -LiteralPath $rstage) { Remove-Item -Recurse -Force -LiteralPath $rstage }
+    if (Test-Path -LiteralPath $rzip) { Remove-Item -Force -LiteralPath $rzip }
+    New-Item -ItemType Directory -Force -Path $rstage | Out-Null
+    Copy-Item -LiteralPath $rustBin -Destination $rstage
+    foreach ($f in @('LICENSE', 'README.md')) { $p = Join-Path $root $f; if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination $rstage } }
+    Compress-Archive -Path $rstage -DestinationPath $rzip -Force
+    Info ("built {0} ({1:N1} KB)" -f $rzip, ((Get-Item -LiteralPath $rzip).Length / 1KB))
+    if (-not $DryRun) { gh release upload $tag $rzip --repo $Repo --clobber; Check 'gh release upload (rust)' }
+  }
 }
 Info "DONE -> https://github.com/$Repo/releases/tag/$tag"

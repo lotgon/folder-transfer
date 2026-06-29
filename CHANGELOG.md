@@ -12,6 +12,33 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.15.0] — 2026-06-29
+
+### Added
+- **Rust port (`ft`).** A single self‑contained, dependency‑free binary that runs on **Windows
+  and Linux**, wire‑compatible with the PowerShell tool. Two subcommands: `ft serve`
+  (== ft‑server.ps1) and `ft get` (== ft‑client.ps1), with both single‑stream (`SYNC`) and
+  parallel (`QSYNC`, `--streams N`) modes, TLS 1.2/1.3 via rustls with SHA‑256 certificate
+  pinning, adaptive per‑block compression (raw deflate), JSONC config with CLI‑wins merge,
+  ignore‑pattern parity, `--allow-ip` enforcement, and the intrinsic mirror delete. The
+  PowerShell scripts remain the reference implementation.
+- **Cross‑platform release artifacts.** Each release now also ships `ft-<ver>-x86_64-windows.zip`
+  and `ft-<ver>-x86_64-linux.tar.gz` (fully static musl) alongside the PowerShell
+  `folder-transfer-<ver>.zip`. A CI workflow (`.github/workflows/rust-release.yml`) builds both
+  Rust targets on a tag; `release.ps1` gained an opt‑in `-WithRust` step (the PowerShell ZIP step
+  is unchanged).
+- **Generated client (Rust).** `ft serve` writes a `download-scripts/ft-download-<name>.json`
+  connection file and prints a ready‑to‑run `ft get …` command; `ft get --config <that>.json`
+  consumes it.
+- **Benchmarks & cross‑OS validation** for the Rust binary in
+  [BENCHMARKS-rust.md](BENCHMARKS-rust.md): ~1.5× raw LAN goodput on incompressible data vs
+  PowerShell, 94–99% saturation on fast links, and byte‑identical Windows↔Ubuntu transfers with
+  mtime‑ticks preserved.
+
+### Notes
+- The Windows firewall opening stays Windows‑only / best‑effort; on Linux it is a no‑op.
+- No changes to the PowerShell scripts (other than the additive `release.ps1 -WithRust`).
+
 ## [0.14.0] — 2026-06-28
 
 ### Added
