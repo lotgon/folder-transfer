@@ -7,16 +7,17 @@
   //   or just point ft at a folder directly:
   //     ft.exe C:\data
   //
-  // On start, ft prints a FINGERPRINT, writes a client connection file under
-  // .\download-scripts\ft-download-<name>.json, and prints a ready-to-run line.
-  // On the RECEIVER you then run (Windows or Linux):
-  //     ft.exe ft-download-<name>.json  D:\where\to\save
+  // On start, ft prints a FINGERPRINT and a ready-to-run command for the RECEIVER, e.g.:
+  //     ft get --server <ip> --port 8722 --token <token> --fingerprint <hex>
+  // Run that command on the receiver; it then asks where to save (Enter = current folder).
   //
   // Paths: forward slashes "C:/path" OR doubled backslashes "C:\\path".
   // Comments (// and /* */) are allowed. Same keys as the PowerShell ft-server.ps1 config.
 
   "folders": [                 // folders to share; each arrives under its own name on the receiver
-    "C:/Users/Public/Documents"   // <-- EDIT this to the folder(s) you want to send
+    "C:/Users/me/Documents",   // <-- EDIT "me" to your username; add/remove folders as needed
+    "C:/Users/me/Downloads",
+    "C:/Users/me/Pictures"
   ],
 
   "ignore": [                  // skip these.  name (no /) = any depth;  * = within one name;  ** = any depth;  trailing / = folders only

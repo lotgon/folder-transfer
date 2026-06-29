@@ -157,8 +157,12 @@ ft server.example.json
 ```
 ```jsonc
 {
-  "folders": ["C:/data/Bars", "C:/data/Ticks"],   // each arrives under its own name on the receiver
-  "ignore":  ["*.tmp", "**/cache/", "logs/"],      // .gitignore-style, case-insensitive
+  "folders": [                                      // each arrives under its own name on the receiver
+    "C:/Users/me/Documents",
+    "C:/Users/me/Downloads",
+    "C:/Users/me/Pictures"
+  ],
+  "ignore":  ["*.tmp", "~$*", "**/cache/"],         // .gitignore-style, case-insensitive
   "streams": 4,                                     // parallel connections (1 = classic)
   "compress": true,                                 // adaptive; false to disable
   "once": true,                                     // exit after one transfer
