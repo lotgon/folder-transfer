@@ -18,15 +18,18 @@
 run it on the destination.
 
 ```bat
-ft serve D:\data                       ::  source: share a folder over TLS
-ft ft-download-data.json E:\incoming   ::  destination: pull it into an exact mirror
+:: SOURCE — share a folder; ft prints a ready-to-run command to copy:
+ft serve D:\data
+:: DESTINATION — paste that command (it asks where to save, or append a folder):
+ft get --server 10.0.0.1 --port 8722 --token <token> --fingerprint <fp>  E:\incoming
 ```
 
 **Why people use it**
 - 🔒 **Encrypted & safe by default** — TLS with a pinned certificate + a one‑time token; nothing is left behind. [Why it’s safe ↓](#why-its-safe)
 - 📦 **Zero install** — one ~3 MB static binary. No service, no dependencies, no admin (unless you let it open the firewall).
 - 🪞 **Exact mirror, resumable** — only changed files move; re‑run to catch up; a dropped transfer resumes.
-- 🚀 **Fast on bad links** — parallel streams for high‑latency WANs, small files bundled, compression only when it pays.
+- 🚀 **Fast on bad links** — parallel streams for high‑latency WANs; thousands of small files bundled into a few round‑trips.
+- 🧠 **Adaptive compression** — it figures out *by itself* when compressing is faster and when it isn’t (decided per block); never wastes CPU on fast links or already‑compressed data.
 - 🧩 **Embeddable** — call it straight from .NET / C / C++ via `ft.dll` / `libft.so`.
 
 A modern alternative to `scp`/`rsync` when you just need to **push a folder server‑to‑server**,
@@ -100,6 +103,7 @@ Windows ↔ Linux support. It’s *not* a continuous two‑way syncer like Synct
 | Resume after a drop | **yes** | no | yes | yes |
 | Many small files | **bundled** | slow | good | good |
 | High‑latency WAN | **parallel streams** | single stream | single stream | n/a |
+| Adaptive compression | **yes — automatic on/off** | no | `-z` (manual) | yes |
 | Live‑DB cutover | **yes** | no | no | no |
 | Byte‑level delta in one file | no | no | **yes** | yes |
 | Hash‑verified integrity | no (size+mtime) | n/a | optional | yes |
@@ -125,19 +129,19 @@ checksums, and **Syncthing** when you need always‑on two‑way sync.
    ```bat
    ft serve D:\data
    ```
-   It prints a highlighted, copy‑ready command (with the host, token and fingerprint baked in) and
-   writes the same as `download-scripts\ft-download-data.json`.
+   It prints a **highlighted, copy‑ready command** with the host, token and fingerprint baked in —
+   that command *is* what you carry to the other machine (treat the token as a secret).
 
-3. **On the machine that wants the data**, run that command (it asks where to save — Enter = current
-   folder), or pass a destination:
+3. **On the machine that wants the data**, paste that command. It asks where to save (Enter = the
+   current folder), or append a destination:
    ```bat
-   ft ft-download-data.json  E:\incoming
+   ft get --server 10.0.0.1 --port 8722 --token <token> --fingerprint <fp>  E:\incoming
    ```
-   The shared folder is recreated by name: `E:\incoming\data\…`.
+   The shared folder is recreated by name: `E:\incoming\data\…`. If the link drops, run it again — it resumes.
 
-You don’t even need a subcommand: **the first argument decides.** A folder or a server‑config `.json`
-→ serve; a connection file → receive (an optional second argument is the destination). `ft serve` /
-`ft get` still work explicitly, and flags (`--port`, `--once`, `--streams`, …) override anything.
+On the **source** you don’t even need a subcommand — `ft D:\data` or `ft sync.json` serves (the first
+argument decides). The **receiver** just runs the printed `ft get …` command. Flags (`--port`,
+`--once`, `--streams`, …) override anything.
 
 ## Many folders & ignoring — config file
 
@@ -166,8 +170,8 @@ fixed `folders` + ignore rules. You never re‑type the folders; you just run th
 receiver you only choose **where** it lands:
 
 ```bat
-ft nightly.json                          ::  source: serve the predefined folder set
-ft ft-download-nightly.json  E:\backup   ::  destination: pick where it goes
+ft nightly.json                                              ::  source: serve the predefined folder set
+ft get --server 10.0.0.1 --token <token> --fingerprint <fp>  E:\backup   ::  destination: choose where it lands
 ```
 
 **Ignore rules:** `log` = a file/folder named `log` at any depth · `log/` = a *folder* only ·
@@ -199,13 +203,24 @@ carried. Defaults (4 parallel streams + adaptive), over an emulated WAN at 0 ms 
 
 | data type | 20 Mbit | 20 Mbit +150ms | 100 Mbit | 100 Mbit +150ms | 200 Mbit | 200 Mbit +150ms |
 |---|---|---|---|---|---|---|
-| small files (10000 × 4 KB) | 96% | 92% | 55% | 56% | 37% | 31% |
+| small files (10000 × 4 KB) — *disk‑bound* | 96% | 92% | 55% | 56% | 37% | 31% |
 | large, incompressible (4 MB, random) | 96% | 92% | **99%** | **94%** | **99%** | **92%** |
 | large, compressible (4 MB, text 3.73×) | 232% | 212% | 294% | 236% | 296% | 193% |
 
+- **Small files** are limited by **file creation on the receiver’s disk** (filesystem metadata +
+  antivirus), *not* the link. That’s why the % falls on faster links — e.g. **37% at 200 Mbit** isn’t
+  `ft` being slow, it’s the disk: the link simply isn’t the bottleneck. (On Linux/ext4 with no
+  real‑time AV, the same files fly — see [BENCHMARKS-rust.md](BENCHMARKS-rust.md).)
 - **Incompressible** large files saturate fast links (94–99%).
 - **Compressible** data goes far above 100% — fewer bytes on the wire, more original data per second.
-- **Small files** are bound by file creation on the receiver (filesystem + antivirus), not the link.
+- **Adaptive compression** decides all of this for you — automatically (see below).
+
+**Adaptive compression — automatic, no flags.** `ft` measures, per block and per connection,
+whether compressing actually moves data *faster*, and compresses only when it does. On a fast link,
+or with already‑compressed data (`.zip`, `.jpg`, `.mp4`, …), it sends **raw** and wastes no CPU; on a
+slow link with compressible data it **packs** and beats the wire (the 200–290% rows above). You never
+pass `-z` or guess — the system figures out when to compress and when not to, on its own. (Force it
+off with `--no-compress` if you ever need to.)
 
 **Raw LAN throughput** (loopback, no link cap — the implementation’s own ceiling):
 
