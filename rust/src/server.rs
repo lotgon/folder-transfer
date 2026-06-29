@@ -703,6 +703,7 @@ fn parallel_handler(
 
         let mut stats = SendStats::default();
         let mut adaptive = AdaptiveState::new();
+        let mut last_send = Instant::now();
         loop {
             let unit = match queue.try_pop() {
                 Some(u) => u,
@@ -712,9 +713,16 @@ fn parallel_handler(
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(15));
+                    // keepalive while waiting for the producer, so the client's read
+                    // timeout never fires on a slow walk (the client ignores PING).
+                    if last_send.elapsed() >= Duration::from_secs(10) {
+                        c.send_line("PING")?;
+                        last_send = Instant::now();
+                    }
                     continue;
                 }
             };
+            last_send = Instant::now();
             match unit {
                 Unit::Dir(rel) => c.send_line(&format!("D {rel}"))?,
                 Unit::Bundle(items) => {

@@ -12,6 +12,16 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.15.3] — 2026-06-29
+
+### Fixed (Rust `ft`)
+- **No more silent hang on a dropped connection.** The client now sets a read timeout, so if the
+  link stalls or drops it fails fast with a clear message — `connection to the server was lost
+  before the sync finished` + `sync INCOMPLETE … re-run to resume` — and exits non‑zero, instead of
+  sitting forever at the last progress line. The server sends `PING` keepalives while it waits for
+  its file‑walker so the timeout never fires on a slow scan (the client ignores `PING`).
+- The final line is now always printed: `sync DONE …` on success, `sync INCOMPLETE …` on a drop.
+
 ## [0.15.2] — 2026-06-29
 
 > Supersedes 0.15.1 (an incomplete pre‑release): the items below are all built into the 0.15.2

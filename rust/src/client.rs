@@ -9,7 +9,11 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// If no data arrives for this long, treat the connection as lost (the server
+/// sends keepalives while idle, so this only fires on a real drop/stall).
+const CLIENT_READ_TIMEOUT_SECS: u64 = 90;
 
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
@@ -355,6 +359,8 @@ fn connect_auth(
 ) -> Result<(ClientStream, ServerCfg), BoxError> {
     let tcp = TcpStream::connect((server, port))?;
     tcp.set_nodelay(true)?;
+    // Read timeout so a dropped/stalled link fails with an error instead of hanging forever.
+    let _ = tcp.set_read_timeout(Some(Duration::from_secs(CLIENT_READ_TIMEOUT_SECS)));
     let conn = ClientConnection::new(config, tls::sni_server_name())?;
     let mut c = Conn::new(StreamOwned::new(conn, tcp));
     c.send_line(&format!("AUTH {token}"))?;
@@ -397,8 +403,8 @@ fn run_passes<S: Read + Write>(
             if h == "PASS-END" {
                 break;
             }
-            if h.strip_prefix("T ").is_some() {
-                continue;
+            if h == "PING" || h.strip_prefix("T ").is_some() {
+                continue; // keepalive / file-count line
             }
             dispatch_item(conn, to, prefix, mir, stats, prog, &h)?;
         }
@@ -478,12 +484,21 @@ pub fn run(
         let mir = Mirror::new();
         let mut stats = Stats::default();
         let prog = Progress::new("[ft]");
-        run_passes(&mut probe, &to_canon, &prefix, &ignore, &mir, &mut stats, &prog)?;
+        if let Err(e) = run_passes(&mut probe, &to_canon, &prefix, &ignore, &mir, &mut stats, &prog) {
+            let elapsed = crate::progress::fmt_elapsed(start.elapsed().as_secs_f64());
+            eprintln!("[ft] !! connection to the server was lost before the sync finished ({e}).");
+            println!(
+                "[ft] sync INCOMPLETE. fetched={} unchanged={} bytes={} in {elapsed} -- nothing deleted; re-run to resume.",
+                stats.got, stats.skipped, stats.bytes
+            );
+            return Err("sync incomplete (connection lost)".into());
+        }
         let secs = start.elapsed().as_secs_f64();
         let mbps = if secs > 0.0 { (stats.bytes as f64 / 1_048_576.0) / secs } else { 0.0 };
         println!(
-            "[ft] sync done. fetched={} unchanged={} deleted={} bytes={} in {secs:.2}s @ {mbps:.1} MB/s",
-            stats.got, stats.skipped, stats.deleted, stats.bytes
+            "[ft] sync DONE. fetched={} unchanged={} deleted={} bytes={} in {} @ {mbps:.1} MB/s",
+            stats.got, stats.skipped, stats.deleted, stats.bytes,
+            crate::progress::fmt_elapsed(secs)
         );
         Ok(stats)
     } else {
@@ -528,6 +543,9 @@ fn worker(
             if h == "NOUNIT" {
                 ok = true;
                 break;
+            }
+            if h == "PING" {
+                continue; // server keepalive while it waits for the producer
             }
             units += 1;
             dispatch_item(&mut conn, to, prefix, mir, &mut stats, prog, &h)?;
@@ -598,20 +616,25 @@ fn run_parallel_impl(
 
     if clean {
         mirror_delete(prefix, &ignore, &mir, &mut total);
-    } else {
-        eprintln!("[ft] a stream did not finish cleanly - nothing deleted (re-run to complete)");
     }
 
     let secs = start.elapsed().as_secs_f64();
     let mbps = if secs > 0.0 { (total.bytes as f64 / 1_048_576.0) / secs } else { 0.0 };
-    println!(
-        "[ft] sync done. streams={} fetched={} unchanged={} deleted={} bytes={} in {secs:.2}s @ {mbps:.1} MB/s",
-        stats_list.len(),
-        total.got,
-        total.skipped,
-        total.deleted,
-        total.bytes
-    );
+    let elapsed = crate::progress::fmt_elapsed(secs);
+    if clean {
+        println!(
+            "[ft] sync DONE. streams={} fetched={} unchanged={} deleted={} bytes={} in {elapsed} @ {mbps:.1} MB/s",
+            stats_list.len(), total.got, total.skipped, total.deleted, total.bytes
+        );
+    } else {
+        // A stream dropped after receiving data -> connection lost or server stopped.
+        eprintln!("[ft] !! connection to the server was lost before the sync finished.");
+        println!(
+            "[ft] sync INCOMPLETE. fetched={} unchanged={} bytes={} in {elapsed} @ {mbps:.1} MB/s -- nothing deleted; re-run the same command to resume.",
+            total.got, total.skipped, total.bytes
+        );
+        return Err("sync incomplete (connection lost)".into());
+    }
     Ok(total)
 }
 
