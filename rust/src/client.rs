@@ -16,6 +16,7 @@ use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use crate::compress::inflate_raw;
 use crate::mtime;
 use crate::paths::{norm_key, safe_join, top_segment};
+use crate::progress::Progress;
 use crate::wire::Conn;
 use crate::{ignore::IgnoreSet, tls, BoxError};
 
@@ -105,22 +106,24 @@ fn record_root(to: &Path, prefix: &str, rel: &str, mir: &Mirror) {
 }
 
 /// Dispatch one item-stream line (`D`/`B`/`F`); unknown lines are ignored.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_item<S: Read + Write>(
     conn: &mut Conn<S>,
     to: &Path,
     prefix: &str,
     mir: &Mirror,
     stats: &mut Stats,
+    prog: &Progress,
     h: &str,
 ) -> io::Result<()> {
     if let Some(rest) = h.strip_prefix("D ") {
         handle_dir(to, prefix, mir, rest)?;
     } else if let Some(rest) = h.strip_prefix("B ") {
         let count: usize = rest.trim().parse().unwrap_or(0);
-        handle_bundle(conn, to, prefix, mir, stats, count)?;
+        handle_bundle(conn, to, prefix, mir, stats, prog, count)?;
     } else if let Some(rest) = h.strip_prefix("F ") {
         if let Some((size, mt, rel)) = parse_three(rest) {
-            handle_large(conn, to, prefix, mir, stats, size, mt, &rel)?;
+            handle_large(conn, to, prefix, mir, stats, prog, size, mt, &rel)?;
         }
     }
     Ok(())
@@ -136,12 +139,14 @@ fn handle_dir(to: &Path, prefix: &str, mir: &Mirror, drel: &str) -> io::Result<(
 }
 
 /// Handle `B <count>`: read manifest, reply with a want-mask, receive wanted files.
+#[allow(clippy::too_many_arguments)]
 fn handle_bundle<S: Read + Write>(
     conn: &mut Conn<S>,
     to: &Path,
     prefix: &str,
     mir: &Mirror,
     stats: &mut Stats,
+    prog: &Progress,
     count: usize,
 ) -> io::Result<()> {
     let mut items: Vec<Option<(u64, i64, String)>> = Vec::with_capacity(count);
@@ -197,6 +202,7 @@ fn handle_bundle<S: Read + Write>(
         let _ = mtime::set_ticks(bt, mt);
         stats.got += 1;
         stats.bytes += len as u64;
+        prog.add(len as u64, 1);
     }
     Ok(())
 }
@@ -209,6 +215,7 @@ fn handle_large<S: Read + Write>(
     prefix: &str,
     mir: &Mirror,
     stats: &mut Stats,
+    prog: &Progress,
     size: u64,
     mt: i64,
     rel: &str,
@@ -251,6 +258,7 @@ fn handle_large<S: Read + Write>(
                 let rlen: u64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
                 conn.copy_exact_to_writer(rlen, &mut f)?;
                 stats.bytes += rlen;
+                prog.add(rlen, 0);
             } else {
                 let clen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
                 let rlen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
@@ -258,17 +266,27 @@ fn handle_large<S: Read + Write>(
                 let obuf = inflate_raw(&cbuf, rlen)?;
                 f.write_all(&obuf)?;
                 stats.bytes += obuf.len() as u64;
+                prog.add(obuf.len() as u64, 0);
             }
         }
     } else {
-        // raw: "R <remain>"
+        // raw: "R <remain>" - stream in 1 MiB chunks with mid-file progress
         let remain: u64 = hdr.split(' ').nth(1).unwrap_or("0").parse().unwrap_or(0);
-        conn.copy_exact_to_writer(remain, &mut f)?;
-        stats.bytes += remain;
+        let mut left = remain;
+        let mut buf = vec![0u8; 1 << 20];
+        while left > 0 {
+            let want = std::cmp::min(left, buf.len() as u64) as usize;
+            conn.read_exact(&mut buf[..want])?;
+            f.write_all(&buf[..want])?;
+            left -= want as u64;
+            stats.bytes += want as u64;
+            prog.add(want as u64, 0);
+        }
     }
     drop(f);
     let _ = mtime::set_ticks(&target, mt);
     stats.got += 1;
+    prog.add(0, 1);
     Ok(())
 }
 
@@ -309,26 +327,51 @@ fn delete_unseen(dir: &Path, prefix: &str, ignore: &IgnoreSet, mir: &Mirror, sta
     }
 }
 
-/// TLS-connect + AUTH, returning a framed connection on success.
+/// Config the server pushes right after AUTH, so the client need not carry it.
+struct ServerCfg {
+    streams: i32,
+    ignore: String,
+}
+
+/// Parse a `CFG <streams> <ignore-spec>` line (the ignore spec may contain spaces).
+fn parse_cfg(line: &str) -> ServerCfg {
+    let mut it = line.splitn(3, ' ');
+    if it.next() != Some("CFG") {
+        return ServerCfg { streams: 1, ignore: String::new() };
+    }
+    let streams = it.next().unwrap_or("1").parse().unwrap_or(1);
+    let ignore = it.next().unwrap_or("").to_string();
+    ServerCfg { streams, ignore }
+}
+
+type ClientStream = Conn<StreamOwned<ClientConnection, TcpStream>>;
+
+/// TLS-connect + AUTH, then read the server's pushed CFG line.
 fn connect_auth(
     config: Arc<ClientConfig>,
     server: &str,
     port: u16,
     token: &str,
-) -> Result<Conn<StreamOwned<ClientConnection, TcpStream>>, BoxError> {
+) -> Result<(ClientStream, ServerCfg), BoxError> {
     let tcp = TcpStream::connect((server, port))?;
     tcp.set_nodelay(true)?;
     let conn = ClientConnection::new(config, tls::sni_server_name())?;
     let mut c = Conn::new(StreamOwned::new(conn, tcp));
     c.send_line(&format!("AUTH {token}"))?;
     match c.read_line()?.as_deref() {
-        Some("OK") => Ok(c),
-        Some("ERR auth") => Err("auth failed: bad token".into()),
-        other => Err(format!("unexpected auth reply: {other:?}").into()),
+        Some("OK") => {}
+        Some("ERR auth") => return Err("auth failed: bad token".into()),
+        other => return Err(format!("unexpected auth reply: {other:?}").into()),
     }
+    let scfg = match c.read_line()? {
+        Some(line) => parse_cfg(&line),
+        None => return Err("connection closed before server config".into()),
+    };
+    Ok((c, scfg))
 }
 
 /// Single-stream `SYNC`: run the pass(es), then mirror-delete on a clean finish.
+#[allow(clippy::too_many_arguments)]
 fn run_passes<S: Read + Write>(
     conn: &mut Conn<S>,
     to: &Path,
@@ -336,6 +379,7 @@ fn run_passes<S: Read + Write>(
     ignore: &IgnoreSet,
     mir: &Mirror,
     stats: &mut Stats,
+    prog: &Progress,
 ) -> io::Result<bool> {
     conn.send_line("SYNC")?;
     let mut more = true;
@@ -356,7 +400,7 @@ fn run_passes<S: Read + Write>(
             if h.strip_prefix("T ").is_some() {
                 continue;
             }
-            dispatch_item(conn, to, prefix, mir, stats, &h)?;
+            dispatch_item(conn, to, prefix, mir, stats, prog, &h)?;
         }
         if !more {
             break;
@@ -409,33 +453,43 @@ fn prepare_dest(to: &str) -> Result<(PathBuf, String), BoxError> {
     Ok((to_canon, prefix))
 }
 
-/// Entry point for `ft get` (single-stream).
-pub fn run_single(
+/// Entry point for `ft get`. The server tells us how many streams to use and the
+/// ignore patterns after connecting; CLI overrides win if provided.
+pub fn run(
     server: &str,
     port: u16,
     token: &str,
     to: &str,
     fingerprint: &str,
-    ignore_spec: &str,
+    ignore_override: Option<String>,
+    streams_override: Option<i32>,
 ) -> Result<Stats, BoxError> {
     let (to_canon, prefix) = prepare_dest(to)?;
-    let ignore = IgnoreSet::parse(ignore_spec);
     let config = tls::make_client_config(fingerprint)?;
-    let mut c = connect_auth(config, server, port, token)?;
+    let (mut probe, scfg) = connect_auth(config.clone(), server, port, token)?;
+    let streams = streams_override.unwrap_or(scfg.streams).max(1);
+    let ignore_spec = ignore_override.unwrap_or(scfg.ignore);
+    let ignore = IgnoreSet::parse(&ignore_spec);
 
-    eprintln!("[ft] sync -> {}", to_canon.display());
-    let start = Instant::now();
-    let mir = Mirror::new();
-    let mut stats = Stats::default();
-    run_passes(&mut c, &to_canon, &prefix, &ignore, &mir, &mut stats)?;
-
-    let secs = start.elapsed().as_secs_f64();
-    let mbps = if secs > 0.0 { (stats.bytes as f64 / 1_048_576.0) / secs } else { 0.0 };
-    println!(
-        "[ft] sync done. fetched={} unchanged={} deleted={} bytes={} in {secs:.2}s @ {mbps:.1} MB/s",
-        stats.got, stats.skipped, stats.deleted, stats.bytes
-    );
-    Ok(stats)
+    if streams <= 1 {
+        // reuse the probe connection for the single-stream pass
+        eprintln!("[ft] sync -> {}", to_canon.display());
+        let start = Instant::now();
+        let mir = Mirror::new();
+        let mut stats = Stats::default();
+        let prog = Progress::new("[ft]");
+        run_passes(&mut probe, &to_canon, &prefix, &ignore, &mir, &mut stats, &prog)?;
+        let secs = start.elapsed().as_secs_f64();
+        let mbps = if secs > 0.0 { (stats.bytes as f64 / 1_048_576.0) / secs } else { 0.0 };
+        println!(
+            "[ft] sync done. fetched={} unchanged={} deleted={} bytes={} in {secs:.2}s @ {mbps:.1} MB/s",
+            stats.got, stats.skipped, stats.deleted, stats.bytes
+        );
+        Ok(stats)
+    } else {
+        drop(probe); // the probe learned the stream count; workers open fresh connections
+        run_parallel_impl(config, server, port, token, &to_canon, &prefix, ignore, streams)
+    }
 }
 
 /// Per-worker outcome for the parallel run.
@@ -445,6 +499,7 @@ struct WorkerStat {
 }
 
 /// One parallel worker: connect, `QSYNC`, pull units until `NOUNIT`.
+#[allow(clippy::too_many_arguments)]
 fn worker(
     config: Arc<ClientConfig>,
     server: &str,
@@ -453,30 +508,20 @@ fn worker(
     to: &Path,
     prefix: &str,
     mir: &Mirror,
+    prog: &Progress,
 ) -> Option<WorkerStat> {
-    // A connect failure is benign: the server likely already drained the queue
+    // A connect/auth failure is benign: the server likely already drained the queue
     // before this stream connected (common for small/fast jobs). No stat -> the
     // aggregator only errors if NO stream connected at all.
-    let tcp = match TcpStream::connect((server, port)) {
-        Ok(t) => t,
+    let (mut conn, _scfg) = match connect_auth(config, server, port, token) {
+        Ok(x) => x,
         Err(_) => return None,
     };
-    let _ = tcp.set_nodelay(true);
-    let cc = match ClientConnection::new(config, tls::sni_server_name()) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    let mut conn = Conn::new(StreamOwned::new(cc, tcp));
 
     let mut stats = Stats::default();
     let mut units: u64 = 0;
     let mut ok = false;
     let result: io::Result<()> = (|| {
-        conn.send_line(&format!("AUTH {token}"))?;
-        match conn.read_line()?.as_deref() {
-            Some("OK") => {}
-            _ => return Err(io::Error::other("auth failed / rejected by server")),
-        }
         conn.send_line("QSYNC")?;
         loop {
             let h = conn.read_line()?.ok_or_else(eof)?;
@@ -485,7 +530,7 @@ fn worker(
                 break;
             }
             units += 1;
-            dispatch_item(&mut conn, to, prefix, mir, &mut stats, &h)?;
+            dispatch_item(&mut conn, to, prefix, mir, &mut stats, prog, &h)?;
         }
         conn.send_line("BYE")?;
         Ok(())
@@ -503,23 +548,23 @@ fn worker(
     Some(WorkerStat { ok, stats })
 }
 
-/// Entry point for `ft get` with `--streams > 1` (parallel `QSYNC`).
-pub fn run_parallel(
+/// Parallel `QSYNC` run with the stream count and ignore set already resolved.
+#[allow(clippy::too_many_arguments)]
+fn run_parallel_impl(
+    config: Arc<ClientConfig>,
     server: &str,
     port: u16,
     token: &str,
-    to: &str,
-    fingerprint: &str,
-    ignore_spec: &str,
+    to_canon: &Path,
+    prefix: &str,
+    ignore: IgnoreSet,
     streams: i32,
 ) -> Result<Stats, BoxError> {
-    let (to_canon, prefix) = prepare_dest(to)?;
-    let ignore = IgnoreSet::parse(ignore_spec);
-    let config = tls::make_client_config(fingerprint)?;
     let mir = Mirror::new();
-
     eprintln!("[ft] sync -> {} ({streams} parallel streams)", to_canon.display());
     let start = Instant::now();
+    // One shared progress across all workers -> a single aggregate live line.
+    let prog = Progress::new("[ft]");
 
     let mut results: Vec<Option<WorkerStat>> = Vec::new();
     std::thread::scope(|scope| {
@@ -527,9 +572,8 @@ pub fn run_parallel(
         for _ in 0..streams {
             let cfg = config.clone();
             let mir = mir.clone();
-            let to_ref = &to_canon;
-            let prefix_ref = prefix.as_str();
-            handles.push(scope.spawn(move || worker(cfg, server, port, token, to_ref, prefix_ref, &mir)));
+            let prog = prog.clone();
+            handles.push(scope.spawn(move || worker(cfg, server, port, token, to_canon, prefix, &mir, &prog)));
         }
         for h in handles {
             results.push(h.join().unwrap_or(None));
@@ -553,7 +597,7 @@ pub fn run_parallel(
     }
 
     if clean {
-        mirror_delete(&prefix, &ignore, &mir, &mut total);
+        mirror_delete(prefix, &ignore, &mir, &mut total);
     } else {
         eprintln!("[ft] a stream did not finish cleanly - nothing deleted (re-run to complete)");
     }

@@ -18,6 +18,7 @@ use crate::compress::{deflate_raw, AdaptiveState, BLOCK_SIZE};
 use crate::ignore::IgnoreSet;
 use crate::mtime;
 use crate::paths::is_incompressible;
+use crate::progress::Progress;
 use crate::tls::ServerIdentity;
 use crate::wire::Conn;
 use crate::BoxError;
@@ -72,6 +73,7 @@ fn send_bundle<S: Read + Write>(
     conn: &mut Conn<S>,
     bundle: &[BundleItem],
     stats: &mut SendStats,
+    prog: &Progress,
 ) -> io::Result<bool> {
     if bundle.is_empty() {
         return Ok(true);
@@ -112,11 +114,13 @@ fn send_bundle<S: Read + Write>(
         stats.sent += 1;
         stats.bytes += sent;
         stats.wire += len;
+        prog.add(sent, 1);
     }
     Ok(true)
 }
 
 /// Send one already-opened large file: raw (`R <bytes>`) or adaptive (`Z` ... `E`).
+#[allow(clippy::too_many_arguments)]
 fn send_large_file<S: Read + Write>(
     conn: &mut Conn<S>,
     file: &mut File,
@@ -125,6 +129,7 @@ fn send_large_file<S: Read + Write>(
     stats: &mut SendStats,
     use_compress: bool,
     adaptive: &mut AdaptiveState,
+    prog: &Progress,
 ) -> io::Result<()> {
     let file_len = file.metadata()?.len() as i64;
     let mut remain = file_len - offset;
@@ -137,10 +142,22 @@ fn send_large_file<S: Read + Write>(
     let zip = use_compress && remain >= 256 && !is_incompressible(ext);
     if !zip {
         conn.put_line(&format!("R {remain}"));
-        let sent = conn.send_from_reader(file, remain as u64)?;
-        conn.flush()?;
-        stats.bytes += sent;
-        stats.wire += remain as u64;
+        // stream in 1 MiB chunks with mid-file progress (so one big file isn't silent)
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        let mut left = remain as u64;
+        while left > 0 {
+            let want = std::cmp::min(left, buf.len() as u64) as usize;
+            let n = read_block(file, &mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            conn.put_bytes(&buf[..n]);
+            conn.flush()?;
+            left -= n as u64;
+            stats.bytes += n as u64;
+            stats.wire += n as u64;
+            prog.add(n as u64, 0);
+        }
     } else {
         conn.send_line("Z")?;
         let mut buf = vec![0u8; BLOCK_SIZE];
@@ -191,10 +208,12 @@ fn send_large_file<S: Read + Write>(
                 adaptive.cz_since += 1;
             }
             stats.bytes += n as u64;
+            prog.add(n as u64, 0);
         }
         conn.send_line("E")?;
     }
     stats.sent += 1;
+    prog.add(0, 1);
     Ok(())
 }
 
@@ -208,6 +227,7 @@ fn send_pass<S: Read + Write>(
     let mut stats = SendStats::default();
     conn.send_line("T 0")?; // no up-front count
     let mut adaptive = AdaptiveState::new();
+    let prog = Progress::new("[ft serve]");
     let mut bundle: Vec<BundleItem> = Vec::new();
     let mut bundle_bytes: u64 = 0;
 
@@ -262,7 +282,7 @@ fn send_pass<S: Read + Write>(
                     bundle.push(BundleItem { full: full.clone(), rel, size, mtime: mt });
                     bundle_bytes += size;
                     if bundle_bytes >= BUNDLE_BYTES || bundle.len() >= BUNDLE_MAX_COUNT {
-                        if !send_bundle(conn, &bundle, &mut stats)? {
+                        if !send_bundle(conn, &bundle, &mut stats, &prog)? {
                             return Ok((false, stats));
                         }
                         bundle.clear();
@@ -272,7 +292,7 @@ fn send_pass<S: Read + Write>(
                 }
                 // large file: flush any pending bundle, then offer it on its own
                 if !bundle.is_empty() {
-                    if !send_bundle(conn, &bundle, &mut stats)? {
+                    if !send_bundle(conn, &bundle, &mut stats, &prog)? {
                         return Ok((false, stats));
                     }
                     bundle.clear();
@@ -302,11 +322,11 @@ fn send_pass<S: Read + Write>(
                     .extension()
                     .map(|e| format!(".{}", e.to_string_lossy()))
                     .unwrap_or_default();
-                send_large_file(conn, &mut f, offset, &ext, &mut stats, use_compress, &mut adaptive)?;
+                send_large_file(conn, &mut f, offset, &ext, &mut stats, use_compress, &mut adaptive, &prog)?;
             }
         }
     }
-    if !bundle.is_empty() && !send_bundle(conn, &bundle, &mut stats)? {
+    if !bundle.is_empty() && !send_bundle(conn, &bundle, &mut stats, &prog)? {
         return Ok((false, stats));
     }
     Ok((true, stats))
@@ -385,7 +405,7 @@ fn resolve_folders(folders: &[String]) -> Result<Vec<PathBuf>, BoxError> {
         if !p.exists() {
             return Err(format!("folder not found: {f}").into());
         }
-        out.push(crate::paths::canonicalize(p)?);
+        out.push(crate::paths::canonicalize(p).map_err(|e| format!("cannot resolve folder {f}: {e}"))?);
     }
     if out.is_empty() {
         return Err("at least one folder is required (the folder to share)".into());
@@ -471,6 +491,8 @@ fn handle_session(
         return Ok(false);
     }
     c.send_line("OK")?;
+    // Push our config so the client doesn't have to carry ignore/streams: classic = 1 stream.
+    c.send_line(&format!("CFG 1 {}", cfg.ignore_spec))?;
     eprintln!("[ft] client authenticated");
 
     let mut completed = false;
@@ -479,24 +501,34 @@ fn handle_session(
             None => break,
             Some(cmd) if cmd == "SYNC" => {
                 eprintln!("[ft] sync pass 1");
+                let t1 = Instant::now();
                 let (ok1, s1) = send_pass(&mut c, roots, ignore, cfg.use_compress)?;
                 if !ok1 {
                     eprintln!("[ft] client dropped during pass 1");
                     break;
                 }
                 c.send_line("PASS-END")?;
-                eprintln!("[ft] pass 1: sent={} unchanged={} bytes={} wire={}", s1.sent, s1.skipped, s1.bytes, s1.wire);
+                eprintln!(
+                    "[ft] pass 1 done: sent={} unchanged={} bytes={} wire={} in {}",
+                    s1.sent, s1.skipped, s1.bytes, s1.wire,
+                    crate::progress::fmt_elapsed(t1.elapsed().as_secs_f64())
+                );
                 if cfg.cutover {
                     wait_cutover(&mut c)?;
                     c.send_line("GO")?;
                     eprintln!("[ft] sync pass 2 (final)");
+                    let t2 = Instant::now();
                     let (ok2, s2) = send_pass(&mut c, roots, ignore, cfg.use_compress)?;
                     if !ok2 {
                         eprintln!("[ft] client dropped during pass 2");
                         break;
                     }
                     c.send_line("PASS-END")?;
-                    eprintln!("[ft] pass 2: sent={} unchanged={} bytes={} wire={}", s2.sent, s2.skipped, s2.bytes, s2.wire);
+                    eprintln!(
+                        "[ft] pass 2 done: sent={} unchanged={} bytes={} wire={} in {}",
+                        s2.sent, s2.skipped, s2.bytes, s2.wire,
+                        crate::progress::fmt_elapsed(t2.elapsed().as_secs_f64())
+                    );
                 }
                 c.send_line("DONE")?;
             }
@@ -633,6 +665,9 @@ fn parallel_handler(
     use_compress: bool,
     stall: u64,
     allow_ip: Option<String>,
+    streams: i32,
+    ignore_spec: String,
+    prog: Progress,
 ) {
     if !ip_allowed(&tcp, &allow_ip) {
         let who = tcp.peer_addr().map(|a| a.to_string()).unwrap_or_default();
@@ -656,6 +691,8 @@ fn parallel_handler(
             return Ok(());
         }
         c.send_line("OK")?;
+        // Push our config so the client doesn't have to carry ignore/streams.
+        c.send_line(&format!("CFG {streams} {ignore_spec}"))?;
         match c.read_line()?.as_deref() {
             Some("QSYNC") => {}
             _ => {
@@ -681,7 +718,7 @@ fn parallel_handler(
             match unit {
                 Unit::Dir(rel) => c.send_line(&format!("D {rel}"))?,
                 Unit::Bundle(items) => {
-                    if !send_bundle(&mut c, &items, &mut stats)? {
+                    if !send_bundle(&mut c, &items, &mut stats, &prog)? {
                         return Ok(()); // client dropped
                     }
                 }
@@ -710,7 +747,7 @@ fn parallel_handler(
                         .extension()
                         .map(|e| format!(".{}", e.to_string_lossy()))
                         .unwrap_or_default();
-                    send_large_file(&mut c, &mut f, offset, &ext, &mut stats, use_compress, &mut adaptive)?;
+                    send_large_file(&mut c, &mut f, offset, &ext, &mut stats, use_compress, &mut adaptive, &prog)?;
                 }
             }
         }
@@ -748,6 +785,10 @@ pub fn run_serve_parallel(cfg: ServeConfig, identity: &ServerIdentity, token: &s
         })
     };
 
+    // One shared progress across all handler threads, so the live line is the
+    // aggregate of the whole transfer (not per-connection numbers that jump).
+    let prog = Progress::new("[ft serve]");
+
     // Accept loop with the parallel shutdown rules.
     let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut idle: u64 = 0;
@@ -764,8 +805,10 @@ pub fn run_serve_parallel(cfg: ServeConfig, identity: &ServerIdentity, token: &s
                 let use_compress = cfg.use_compress;
                 let stall = cfg.stall_timeout;
                 let allow_ip = cfg.allow_ip.clone();
+                let ignore_spec = cfg.ignore_spec.clone();
+                let prog = prog.clone();
                 handles.push(std::thread::spawn(move || {
-                    parallel_handler(tcp, config, token, queue, done, use_compress, stall, allow_ip);
+                    parallel_handler(tcp, config, token, queue, done, use_compress, stall, allow_ip, streams, ignore_spec, prog);
                 }));
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -795,6 +838,6 @@ pub fn run_serve_parallel(cfg: ServeConfig, identity: &ServerIdentity, token: &s
     for h in handles {
         let _ = h.join();
     }
-    eprintln!("[ft] parallel job done");
+    eprintln!("[ft] parallel job done in {}", crate::progress::fmt_elapsed(prog.elapsed_secs()));
     Ok(())
 }

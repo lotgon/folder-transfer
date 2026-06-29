@@ -47,6 +47,11 @@ impl<S: Read + Write> Conn<S> {
         Ok(v)
     }
 
+    /// Read exactly `buf.len()` bytes into `buf`.
+    pub fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.read_exact(buf)
+    }
+
     /// Queue a control line (`s` + `\n`) without flushing.
     pub fn put_line(&mut self, s: &str) {
         self.wbuf.extend_from_slice(s.as_bytes());

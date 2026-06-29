@@ -8,12 +8,14 @@ mod firewall;
 mod ignore;
 mod mtime;
 mod paths;
+mod progress;
 mod server;
 mod tls;
 mod token;
 mod wire;
 
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -227,12 +229,17 @@ fn cmd_serve(a: ServeArgs) -> Result<(), BoxError> {
     let ignore_spec = ignore_parts.join(";");
 
     // Merge scalars: CLI wins over config, then a built-in default.
+    // An empty string in the config means "not set" (matches the PowerShell stance,
+    // where `"clientOut": ""` / `"allowIp": ""` / `"serverHost": ""` fall back to the
+    // default / no-restriction / auto-detect). Without this, Some("") would be taken
+    // as a literal empty path (clientOut) or a literal "only IP '' may connect" (allowIp).
+    let nonempty = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
     let port = a.port.or(cfg.port).unwrap_or(DEFAULT_PORT);
-    let allow_ip = a.allow_ip.clone().or(cfg.allow_ip.clone());
-    let server_host = a.server_host.clone().or(cfg.server_host.clone());
+    let allow_ip = nonempty(a.allow_ip.clone().or(cfg.allow_ip.clone()));
+    let server_host = nonempty(a.server_host.clone().or(cfg.server_host.clone()));
     let idle_seconds = a.idle_seconds.or(cfg.idle_seconds).unwrap_or(600);
     let stall_timeout = a.stall_timeout.or(cfg.stall_timeout).unwrap_or(300);
-    let client_out = a.client_out.clone().or(cfg.client_out.clone());
+    let client_out = nonempty(a.client_out.clone().or(cfg.client_out.clone()));
     let cutover = a.cutover || cfg.cutover.unwrap_or(false);
     let mut once = a.once || cfg.once.unwrap_or(false);
     let no_firewall = a.no_firewall || cfg.no_firewall.unwrap_or(false);
@@ -256,7 +263,7 @@ fn cmd_serve(a: ServeArgs) -> Result<(), BoxError> {
 
     // Generated client: write the connection JSON and print a ready-to-run command.
     let host = server_host.unwrap_or_else(detect_server_host);
-    generate_client(&host, port, &tok, &identity.fingerprint, &ignore_spec, streams, &folders, &config_path, &client_out)?;
+    generate_client(&host, port, &tok, &identity.fingerprint, &folders, &config_path, &client_out)?;
 
     // Open the firewall (Windows best-effort; no-op elsewhere). Held until return.
     let _fw = if no_firewall {
@@ -288,26 +295,23 @@ fn cmd_get(a: GetArgs) -> Result<(), BoxError> {
         Some(p) => config::ClientConn::load(p)?,
         None => config::ClientConn::default(),
     };
-    let server = a.server.clone().or(cfg.server.clone()).ok_or("--server is required (or via --config)")?;
+    let nonempty = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
+    let server = nonempty(a.server.clone().or(cfg.server.clone()))
+        .ok_or("--server is required (or via --config)")?;
     let port = a.port.or(cfg.port).unwrap_or(DEFAULT_PORT);
     let token = a.token.clone().or(cfg.token.clone()).unwrap_or_default();
-    let to = a.to.clone().ok_or("--to <path> is required")?;
-    let fingerprint = a
-        .fingerprint
-        .clone()
-        .or(cfg.fingerprint.clone())
+    // If no destination was given, ask (Enter = current folder), like the PowerShell client.
+    // Prompt BEFORE connecting so slow human input can't trip the server's stall timeout.
+    let to = match a.to.clone() {
+        Some(t) => t,
+        None => prompt_destination()?,
+    };
+    let fingerprint = nonempty(a.fingerprint.clone().or(cfg.fingerprint.clone()))
         .ok_or("--fingerprint is required (or via --config)")?;
-    let ignore_spec = a.ignore.clone().or(cfg.ignore.clone()).unwrap_or_default();
-    let mut streams = a.streams.or(cfg.streams).unwrap_or(1);
-    if streams < 1 {
-        streams = 1;
-    }
-
-    if streams > 1 {
-        client::run_parallel(&server, port, &token, &to, &fingerprint, &ignore_spec, streams)?;
-    } else {
-        client::run_single(&server, port, &token, &to, &fingerprint, &ignore_spec)?;
-    }
+    // ignore + streams now come from the server after connecting; CLI/old-file values override.
+    let ignore_override = nonempty(a.ignore.clone().or(cfg.ignore.clone()));
+    let streams_override = a.streams.or(cfg.streams);
+    client::run(&server, port, &token, &to, &fingerprint, ignore_override, streams_override)?;
     Ok(())
 }
 
@@ -323,6 +327,72 @@ fn detect_server_host() -> String {
     detect().unwrap_or_else(|| "THIS-SERVER-IP".to_string())
 }
 
+/// Enable ANSI/VT processing on the Windows console so color codes render
+/// (no-op elsewhere; modern terminals already support it).
+#[cfg(windows)]
+fn enable_vt() {
+    use std::os::raw::c_void;
+    const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4; // (DWORD)-12
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    extern "system" {
+        fn GetStdHandle(n: u32) -> *mut c_void;
+        fn GetConsoleMode(h: *mut c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(h: *mut c_void, mode: u32) -> i32;
+    }
+    unsafe {
+        let h = GetStdHandle(STD_ERROR_HANDLE);
+        if h.is_null() {
+            return;
+        }
+        let mut mode: u32 = 0;
+        if GetConsoleMode(h, &mut mode) != 0 {
+            SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+}
+#[cfg(not(windows))]
+fn enable_vt() {}
+
+/// Print the receiver command in a hard-to-miss, cream-coloured block (color only
+/// when stderr is a real terminal; plain text when redirected to a file).
+fn print_receiver_command(cmd: &str, file_hint: &str) {
+    let tty = std::io::stderr().is_terminal();
+    if tty {
+        enable_vt();
+    }
+    // bold + cream (256-colour 230); dim for the secondary note.
+    let (cream, dim, reset) = if tty {
+        ("\x1b[1;38;5;230m", "\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    let bar = "===============================================================";
+    eprintln!();
+    eprintln!("  {bar}");
+    eprintln!("   >> COPY THIS and run it on the RECEIVING machine:");
+    eprintln!("      (it will ask where to save - press Enter for the current folder)");
+    eprintln!();
+    eprintln!("      {cream}{cmd}{reset}");
+    eprintln!();
+    eprintln!("   {dim}(or append a destination folder, or use the saved file: {file_hint}){reset}");
+    eprintln!("  {bar}");
+    eprintln!();
+}
+
+/// Ask the user where to save (Enter = current folder), like the PowerShell client.
+fn prompt_destination() -> Result<String, BoxError> {
+    use std::io::{BufRead, Write};
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    eprint!("Destination folder [{cwd}]: ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    let picked = line.trim().trim_matches('"').trim();
+    Ok(if picked.is_empty() { cwd } else { picked.to_string() })
+}
+
 /// Write the generated-client connection JSON and print a ready-to-run command.
 #[allow(clippy::too_many_arguments)]
 fn generate_client(
@@ -330,8 +400,6 @@ fn generate_client(
     port: u16,
     token: &str,
     fingerprint: &str,
-    ignore_spec: &str,
-    streams: i32,
     folders: &[String],
     config_path: &Option<String>,
     client_out: &Option<String>,
@@ -343,7 +411,8 @@ fn generate_client(
     };
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create client-out folder {}: {e} (check the 'clientOut' path in your config)", parent.display()))?;
         }
     }
     let conn = config::ClientConn {
@@ -351,23 +420,20 @@ fn generate_client(
         port: Some(port),
         token: Some(token.to_string()),
         fingerprint: Some(fingerprint.to_string()),
-        ignore: if ignore_spec.is_empty() { None } else { Some(ignore_spec.to_string()) },
-        streams: Some(streams),
+        // ignore + streams are pushed by the server after connecting, not carried here.
+        ignore: None,
+        streams: None,
     };
-    std::fs::write(&out_path, conn.to_json())?;
+    std::fs::write(&out_path, conn.to_json())
+        .map_err(|e| format!("cannot write client file {}: {e}", out_path.display()))?;
 
     eprintln!("[ft] client connection file -> {}", out_path.display());
-    let mut cmd = format!(
-        "ft get --server {host} --port {port} --token {token} --to <DEST> --fingerprint {fingerprint}"
-    );
-    if !ignore_spec.is_empty() {
-        cmd.push_str(&format!(" --ignore \"{ignore_spec}\""));
-    }
-    if streams != 1 {
-        cmd.push_str(&format!(" --streams {streams}"));
-    }
-    eprintln!("[ft] run on the receiver:\n    {cmd}");
-    eprintln!("[ft] or: ft get --config {} --to <DEST>", out_path.display());
+    let connname = out_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| out_path.display().to_string());
+    let cmd = format!("ft get --server {host} --port {port} --token {token} --fingerprint {fingerprint}");
+    print_receiver_command(&cmd, &format!("ft {connname} <DEST>"));
     Ok(())
 }
 

@@ -8,6 +8,9 @@ dist/
 # Rust build output
 rust/target/
 
+# Local Claude Code / agent settings (personal, not for the repo)
+.claude/
+
 # Local test / demo artifacts
 _demo/
 _d.ps1

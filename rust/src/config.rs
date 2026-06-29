@@ -95,18 +95,23 @@ impl ServeFileConfig {
 }
 
 /// Client connection file written by the server and read by `ft get --config`.
+/// Only the essentials are written (server/port/token/fingerprint); `ignore` and
+/// `streams` are sent by the server after connecting, so they are optional here
+/// (read as overrides if an older file still carries them).
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientConn {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub streams: Option<i32>,
 }
 

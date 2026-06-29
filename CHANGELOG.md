@@ -12,7 +12,10 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
-## [0.15.1] — 2026-06-29
+## [0.15.2] — 2026-06-29
+
+> Supersedes 0.15.1 (an incomplete pre‑release): the items below are all built into the 0.15.2
+> binaries.
 
 ### Added (Rust `ft`)
 - **No subcommand needed — just point `ft` at a folder or a JSON**, PowerShell‑style. The first
@@ -22,6 +25,32 @@ aims to follow [Semantic Versioning](https://semver.org/).
   `ft server.example.json`, `ft C:\data`, `ft ft-download-Name.json D:\incoming`.
 - **`server.example.json`** shipped in the Rust archives: a ready, fully‑commented server config
   (same keys as `ft-server.ps1`) that runs out of the box (`ft server.example.json`).
+- The receiver instructions the server prints now put the **destination as the LAST argument**
+  (`ft ft-download-<name>.json <DEST>`), so you just append the path instead of editing the
+  middle of a long command.
+- **Smaller connection file / command.** The connection file (and the printed one-liner) now carry
+  only `server`, `port`, `token`, `fingerprint`. The server pushes the ignore patterns and the
+  stream count to the client right after connecting, so the client picks the right mode and mirror
+  rules automatically — nothing extra to copy. (`--ignore`/`--streams` still override if given.)
+- **Interactive destination.** If `--to`/`<DEST>` is omitted, the client asks where to save
+  (Enter = current folder, shown as the default) — so you can just copy-and-run the printed
+  command, no file and no path to edit. The server's printed hint now leads with that command.
+- **Live progress on both sides.** During a transfer each side prints one throttled, **aggregated**
+  line (~every 1.5 s) — `N files, X MB in MM:SS @ Y MB/s` — summed across all parallel streams (no
+  more per-stream numbers jumping around), and including **elapsed time**. Mid-file ticks mean even
+  one big file shows movement; the final summary shows the total time. (Fast LAN transfers finish
+  before the first tick, so they stay quiet.)
+- **Highlighted receiver command.** When the server starts it prints the command to copy in a
+  framed, cream-coloured block (ANSI colour when stderr is a terminal — VT is enabled on the
+  Windows console; plain text when redirected) so it's obvious what to copy to the other machine.
+
+### Fixed (Rust `ft`)
+- Empty‑string config values (`"clientOut": ""`, `"serverHost": ""`, `"allowIp": ""`) are now
+  treated as "not set" (matching the PowerShell tool), instead of as a literal empty path / empty
+  IP. Previously an empty `clientOut` aborted startup with `os error 3`, and an empty `allowIp`
+  would have rejected every client.
+- Filesystem errors now name the offending path (e.g. the client‑out folder or an unresolved
+  shared folder) instead of a bare `os error 3`.
 
 ## [0.15.0] — 2026-06-29
 
