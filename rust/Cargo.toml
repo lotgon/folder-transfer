@@ -1,11 +1,17 @@
 [package]
 name = "ft"
-version = "0.15.3"
+version = "0.16.0"
 edition = "2021"
 rust-version = "1.96"
 description = "folder-transfer: wire-compatible Rust port of the PowerShell ft-server/ft-client"
 license = "MIT"
 repository = "https://github.com/lotgon/folder-transfer"
+
+# Library (also a C ABI cdylib: ft.dll / libft.so) + the CLI binary.
+[lib]
+name = "ft"
+crate-type = ["rlib", "cdylib"]
+path = "src/lib.rs"
 
 [[bin]]
 name = "ft"

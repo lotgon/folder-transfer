@@ -1,30 +1,14 @@
 //! folder-transfer (`ft`): a wire-compatible Rust port of the PowerShell
 //! ft-server / ft-client. See RUST-PORT-SPEC.md.
 
-mod client;
-mod compress;
-mod config;
-mod firewall;
-mod ignore;
-mod mtime;
-mod paths;
-mod progress;
-mod server;
-mod tls;
-mod token;
-mod wire;
-
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
-/// Shared error type for fallible operations.
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
-/// Default TCP port (matches `ft-server.ps1`).
-const DEFAULT_PORT: u16 = 8722;
+// All the real logic lives in the library crate (also built as ft.dll / libft.so).
+use ft::{client, config, firewall, server, tls, token, BoxError, DEFAULT_PORT};
 
 #[derive(Parser)]
 #[command(name = "ft", version, about = "folder-transfer: TLS folder sync (Rust port)")]

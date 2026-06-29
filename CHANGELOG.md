@@ -12,6 +12,16 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.16.0] — 2026-06-29
+
+### Added (Rust `ft`)
+- **Embeddable library / C‑ABI shared library** (`ft.dll` / `libft.so`) so file transfer can be
+  driven from your own code (.NET via P/Invoke, C/C++, etc.) without spawning the CLI. Exposes
+  `ft_get` (pull a folder), `ft_serve_start` / `ft_serve_wait` (serve in the background; the token
+  and certificate fingerprint are returned immediately to hand to the receiver), and
+  `ft_last_error`. A C header (`ffi/ft.h`) and a ready .NET binding (`ffi/FolderTransfer.cs`) ship
+  in the Rust archives. The crate is now built as `rlib` + `cdylib`; the CLI binary is unchanged.
+
 ## [0.15.3] — 2026-06-29
 
 ### Fixed (Rust `ft`)
