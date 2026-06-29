@@ -14,14 +14,14 @@
 > binary that serves *and* receives, keeps the far side an exact **one‑way mirror**, and runs on
 > **Windows and Linux** (the two binaries talk to each other).
 
-**The whole tool in one line:** run `ft serve <folder>` on the source, copy the command it prints,
-run it on the destination.
+**The whole tool in one line:** run `ft <folder>` on the source, copy the command it prints, run it
+on the destination.
 
 ```bat
 :: SOURCE — share a folder; ft prints a ready-to-run command to copy:
-ft serve D:\data
-:: DESTINATION — paste that command (it asks where to save, or append a folder):
-ft get --server 10.0.0.1 --port 8722 --token <token> --fingerprint <fp>  E:\incoming
+ft D:\data
+:: DESTINATION — paste that command; it then asks where to save:
+ft get --server 10.0.0.1 --port 8722 --token <token> --fingerprint <fp>
 ```
 
 **Why people use it**
@@ -127,23 +127,25 @@ checksums, and **Syncthing** when you need always‑on two‑way sync.
 1. **Download** the binary for your OS from [Releases](https://github.com/lotgon/folder-transfer/releases):
    `ft-<ver>-x86_64-windows.zip` or `ft-<ver>-x86_64-linux.tar.gz`. Unzip; you get `ft` (or `ft.exe`).
 
-2. **On the machine that has the data**, point `ft` at a folder:
+2. **On the machine that has the data**, point `ft` at a folder (no subcommand — the folder *is* the
+   argument):
    ```bat
-   ft serve D:\data
+   ft D:\data
    ```
    It prints a **highlighted, copy‑ready command** with the host, token and fingerprint baked in —
    that command *is* what you carry to the other machine (treat the token as a secret).
 
-3. **On the machine that wants the data**, paste that command. It asks where to save (Enter = the
-   current folder), or append a destination:
+3. **On the machine that wants the data**, paste that command. It then asks where to save
+   (Enter = the current folder):
    ```bat
-   ft get --server 10.0.0.1 --port 8722 --token <token> --fingerprint <fp>  E:\incoming
+   ft get --server 10.0.0.1 --port 8722 --token <token> --fingerprint <fp>
    ```
-   The shared folder is recreated by name: `E:\incoming\data\…`. If the link drops, run it again — it resumes.
+   The shared folder is recreated by name under the folder you choose (e.g. `data\…`). If the link
+   drops, run it again — it resumes.
 
-On the **source** you don’t even need a subcommand — `ft D:\data` or `ft sync.json` serves (the first
-argument decides). The **receiver** just runs the printed `ft get …` command. Flags (`--port`,
-`--once`, `--streams`, …) override anything.
+On the **source** you don’t even need a subcommand — `ft D:\data` or `ft sync.json` shares it (the
+first argument decides: a folder or a config). The **receiver** just runs the printed `ft get …`
+command. Flags (`--port`, `--once`, `--streams`, …) override anything.
 
 ## Many folders & ignoring — config file
 
@@ -172,8 +174,8 @@ fixed `folders` + ignore rules. You never re‑type the folders; you just run th
 receiver you only choose **where** it lands:
 
 ```bat
-ft nightly.json                                              ::  source: serve the predefined folder set
-ft get --server 10.0.0.1 --token <token> --fingerprint <fp>  E:\backup   ::  destination: choose where it lands
+ft nightly.json                                                          ::  source: share the predefined folder set
+ft get --server 10.0.0.1 --port 8722 --token <token> --fingerprint <fp>  ::  destination: it then asks where to put it
 ```
 
 **Ignore rules:** `log` = a file/folder named `log` at any depth · `log/` = a *folder* only ·
@@ -280,7 +282,7 @@ a holder of the **one‑time token** can pull. The server is read‑only and lea
 ## Install
 
 Download a release archive, unzip, and run `ft` / `ft.exe`. No installer, no runtime. Optional: put
-it on your `PATH`. On Linux: `tar xzf ft-<ver>-x86_64-linux.tar.gz && ./ft-<ver>/ft serve …`.
+it on your `PATH`. On Linux: `tar xzf ft-<ver>-x86_64-linux.tar.gz && ./ft-<ver>/ft /srv/data`.
 
 ## Limitations
 
