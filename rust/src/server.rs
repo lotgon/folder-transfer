@@ -9,6 +9,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -190,6 +191,22 @@ fn send_bundle<S: Read + Write>(
     Ok(true)
 }
 
+/// One framed block produced by the compressor thread, ready for the socket writer.
+struct Chunk {
+    header: String,
+    payload: Vec<u8>,
+    n: usize,      // original bytes
+    tc: f64,       // deflate time (0 for raw)
+    compressed: bool,
+}
+/// Write-time fed back from the writer so the compressor's A/B decision stays live.
+struct Fb {
+    compressed: bool,
+    n: usize,
+    tc: f64,
+    tw: f64,
+}
+
 /// Send one already-opened large file: raw (`R <bytes>`) or adaptive (`Z` ... `E`).
 #[allow(clippy::too_many_arguments)]
 fn send_large_file<S: Read + Write>(
@@ -231,16 +248,69 @@ fn send_large_file<S: Read + Write>(
         }
     } else {
         conn.send_line("Z")?;
-        let mut buf = vec![0u8; BLOCK_SIZE];
-        loop {
-            let n = read_block(file, &mut buf)?;
-            if n == 0 {
-                break;
+        // Pipeline: a worker thread reads + deflates the next block while the main
+        // thread writes the previous block to the socket, so compression (CPU)
+        // overlaps with the network send. The writer feeds write-time back so the
+        // adaptive A/B decision keeps measuring real throughput.
+        std::thread::scope(|scope| -> io::Result<()> {
+            let (ctx, crx) = sync_channel::<Chunk>(3);
+            let (fbtx, fbrx) = channel::<Fb>();
+            let comp = scope.spawn(move || -> io::Result<()> {
+                let mut buf = vec![0u8; BLOCK_SIZE];
+                loop {
+                    // fold any write-time feedback into the per-connection state
+                    while let Ok(fb) = fbrx.try_recv() {
+                        if fb.compressed {
+                            adaptive.cz_cmp_bytes += fb.n as i64;
+                            adaptive.cz_cmp_sec += fb.tc + fb.tw;
+                        } else {
+                            adaptive.cz_raw_bytes += fb.n as i64;
+                            adaptive.cz_raw_sec += fb.tw;
+                        }
+                    }
+                    let n = read_block(file, &mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    let (do_comp, reprobe_now) = adaptive.decide(n);
+                    let chunk = if do_comp {
+                        let t0 = Instant::now();
+                        let cbuf = deflate_raw(&buf[..n]);
+                        let tc = t0.elapsed().as_secs_f64();
+                        adaptive.cz_ratio = n as f64 / cbuf.len().max(1) as f64;
+                        if (cbuf.len() as f64) < (n as f64 * 0.95) {
+                            Chunk { header: format!("Z {} {}", cbuf.len(), n), payload: cbuf, n, tc, compressed: true }
+                        } else {
+                            Chunk { header: format!("R {n}"), payload: buf[..n].to_vec(), n, tc: 0.0, compressed: false }
+                        }
+                    } else {
+                        Chunk { header: format!("R {n}"), payload: buf[..n].to_vec(), n, tc: 0.0, compressed: false }
+                    };
+                    if reprobe_now {
+                        adaptive.cz_since = 0;
+                    } else {
+                        adaptive.cz_since += 1;
+                    }
+                    if ctx.send(chunk).is_err() {
+                        break; // writer gone (error downstream)
+                    }
+                }
+                Ok(())
+            });
+            for chunk in crx {
+                let t1 = Instant::now();
+                conn.put_line(&chunk.header);
+                conn.put_bytes(&chunk.payload);
+                conn.flush()?;
+                let tw = t1.elapsed().as_secs_f64();
+                stats.wire += chunk.payload.len() as u64;
+                stats.bytes += chunk.n as u64;
+                prog.add(chunk.n as u64, 0);
+                let _ = fbtx.send(Fb { compressed: chunk.compressed, n: chunk.n, tc: chunk.tc, tw });
             }
-            send_chunk_adaptive(conn, &buf[..n], adaptive, stats)?;
-            stats.bytes += n as u64;
-            prog.add(n as u64, 0);
-        }
+            comp.join().map_err(|_| io::Error::other("compressor thread panicked"))??;
+            Ok(())
+        })?;
         conn.send_line("E")?;
     }
     stats.sent += 1;
