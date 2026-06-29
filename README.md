@@ -1,275 +1,266 @@
-# folder-transfer
+# ft — secure folder transfer & mirror-sync (Windows ↔ Linux)
 
 ![license](https://img.shields.io/badge/license-MIT-blue)
-![platform](https://img.shields.io/badge/platform-Windows-0078D6)
-![powershell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE)
-![install](https://img.shields.io/badge/install-none-brightgreen)
+![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-444)
+![language](https://img.shields.io/badge/built%20with-Rust-orange)
+![install](https://img.shields.io/badge/install-single%20binary-brightgreen)
 
-**Encrypted, zero‑install folder transfer & mirror‑sync between two Windows machines over TLS
-— no service, no trace, with a two‑phase cutover mode for live databases.**
+> **Move a folder from one server to another — encrypted, with one command. No install, no agent,
+> no network shares.** `ft` is a drop‑and‑run, `scp`/`rsync`‑style tool: a single small static
+> binary that serves *and* receives, keeps the far side an exact **one‑way mirror**, and runs on
+> **Windows and Linux** (the two binaries talk to each other).
 
-Pure PowerShell + the .NET that ships with Windows. You point it at one or more folders; it
-serves them over TLS and shuts itself down, leaving the machine exactly as it was. Transfers are
-**compressed on the fly only when it actually speeds things up** (adaptive — it measures the link
-and stays raw on fast links or incompressible data), **many small files are bundled**, and
-**several connections run in parallel** so transfers fly over high‑latency links. It generates
-**one self‑contained file** to carry to the receiver.
+**The whole tool in one line:** run `ft serve <folder>` on the source, copy the command it prints,
+run it on the destination.
 
-> Status: young but functional; verified end‑to‑end on Windows 11 (loopback) and over a real
-> two‑machine WAN link. Still review and test it in your environment before relying on it — see
-> [Limitations](#limitations).
+```bat
+ft serve D:\data                       ::  source: share a folder over TLS
+ft ft-download-data.json E:\incoming   ::  destination: pull it into an exact mirror
+```
 
-## Contents
+**Why people use it**
+- 🔒 **Encrypted & safe by default** — TLS with a pinned certificate + a one‑time token; nothing is left behind. [Why it’s safe ↓](#why-its-safe)
+- 📦 **Zero install** — one ~3 MB static binary. No service, no dependencies, no admin (unless you let it open the firewall).
+- 🪞 **Exact mirror, resumable** — only changed files move; re‑run to catch up; a dropped transfer resumes.
+- 🚀 **Fast on bad links** — parallel streams for high‑latency WANs, small files bundled, compression only when it pays.
+- 🧩 **Embeddable** — call it straight from .NET / C / C++ via `ft.dll` / `libft.so`.
 
-- [Quick start](#quick-start)
-- [Modes](#modes)
-- [Many folders and ignoring](#many-folders-and-ignoring)
-- [Parallel streams](#parallel-streams)
-- [Performance](#performance)
-- [Parameters](#parameters)
-- [Progress and logs](#progress-and-logs)
-- [Security](#security)
-- [Firewall](#firewall)
-- [Limitations](#limitations)
-- [Troubleshooting](#troubleshooting)
-- [Files](#files)
+A modern alternative to `scp`/`rsync` when you just need to **push a folder server‑to‑server**,
+encrypted, with nothing to install — across Windows and Linux alike.
+
+> Status: young but functional. Verified end‑to‑end Rust↔Rust on Windows and, via Docker, across
+> the Windows ↔ Ubuntu boundary (byte‑for‑byte, mtime preserved). Review and test in your own
+> environment before trusting production data — see [Limitations](#limitations).
+
+---
+
+## What it does
+
+- **Mirror sync, not just copy.** Changed/new files are sent (compared by size + last‑write‑time),
+  files removed on the source are deleted on the receiver, unchanged files are skipped. Re‑run any
+  time to catch up; interrupted runs resume.
+- **Fast where it’s usually slow.** Many small files are **bundled** (one round‑trip for thousands),
+  big files are streamed, several **parallel streams** fill high‑latency links, and data is
+  **compressed only when that’s actually faster** (adaptive — it measures the link and stays raw on
+  fast links or already‑compressed data).
+- **Secure by default.** TLS 1.2/1.3, the server’s certificate is **pinned** by the client
+  (anti‑MITM), a one‑time **token** gates access, optional single‑IP allow‑list. Nothing is left
+  behind: in‑memory cert, temporary firewall rule removed on exit.
+- **Cross‑platform.** Native static binaries for Windows and Linux that interoperate; mtimes survive
+  the NTFS ↔ ext4 round‑trip.
+- **Live‑database cutover.** A two‑phase mode: pass 1 while the DB is up, you stop it, pass 2 copies
+  only the delta — for a consistent copy with minimal downtime.
+- **Embeddable.** Drive it from .NET / C / C++ via a small C‑ABI library — no spawning a process.
+
+## Problems it solves
+
+- “I need to move a big folder (or a whole data directory) to another server **right now**, encrypted,
+  without installing an agent, opening a share, or setting up rsync/SSH keys.”
+- “I want a **repeatable mirror** — run it again and only the changes go.”
+- “The link is fast but far (**high ping**), and a single copy crawls.” → parallel streams.
+- “Thousands of tiny files take forever.” → bundling.
+- “I need a **consistent copy of a live database**.” → cutover.
+- “I want to trigger transfers **from my own application code**.” → the library/DLL.
+
+## Who should use it — and who shouldn’t
+
+**Good fit**
+- One‑off or scripted **server‑to‑server** moves where you control both ends.
+- Migrations (old box → new box), seeding a replica, shipping build artifacts or DB snapshots.
+- Environments where you can’t/won’t install software — you just drop one binary.
+- Apps that need to transfer folders in‑process (via `ft.dll` / `libft.so`).
+
+**Look elsewhere if**
+- You need **continuous, real‑time** sync or conflict resolution → use Syncthing / rsync+inotify / DFSR.
+- You need **two‑way** sync — `ft` is strictly one‑way (source → destination mirror).
+- You need **byte‑level delta within huge files** or **hash‑verified** integrity → use rsync/restic.
+  `ft` compares by size+mtime and re‑sends a changed file whole.
+- You’re exposing this on the **public internet** to untrusted clients — it’s built for trusted
+  machine‑to‑machine use, not a hardened public service.
+
+## How it compares
+
+`ft` is closest to **scp/rsync**, but with nothing to install on either side and first‑class
+Windows ↔ Linux support. It’s *not* a continuous two‑way syncer like Syncthing.
+
+| | **ft** | scp | rsync | Syncthing |
+|---|---|---|---|---|
+| Install | **one binary, both sides** | SSH client/server | rsync (+SSH) | background service |
+| Encryption | **TLS, built‑in** | via SSH | via SSH | TLS |
+| Windows ↔ Linux | **yes, same tool** | ok | awkward on Windows | yes |
+| Direction | one‑way push/pull | one‑way | one‑way | two‑way, continuous |
+| Mirror (delete removed) | **yes** | no | yes (`--delete`) | yes |
+| Resume after a drop | **yes** | no | yes | yes |
+| Many small files | **bundled** | slow | good | good |
+| High‑latency WAN | **parallel streams** | single stream | single stream | n/a |
+| Live‑DB cutover | **yes** | no | no | no |
+| Byte‑level delta in one file | no | no | **yes** | yes |
+| Hash‑verified integrity | no (size+mtime) | n/a | optional | yes |
+| Embeddable library | **yes (`.dll`/`.so`)** | no | no | no |
+
+Rule of thumb: reach for **ft** for a quick, encrypted, drop‑and‑run **one‑way** copy/mirror between
+machines you control; reach for **rsync** when you need byte‑level deltas or checksums, and
+**Syncthing** when you need always‑on two‑way sync.
+
+---
 
 ## Quick start
 
-**Sender** — run with no arguments (or double‑click) and it asks what to share and which mode;
-or pass the folder directly:
+1. **Download** the binary for your OS from [Releases](https://github.com/lotgon/folder-transfer/releases):
+   `ft-<ver>-x86_64-windows.zip` or `ft-<ver>-x86_64-linux.tar.gz`. Unzip; you get `ft` (or `ft.exe`).
+
+2. **On the machine that has the data**, point `ft` at a folder:
+   ```bat
+   ft serve D:\data
+   ```
+   It prints a highlighted, copy‑ready command (with the host, token and fingerprint baked in) and
+   writes the same as `download-scripts\ft-download-data.json`.
+
+3. **On the machine that wants the data**, run that command (it asks where to save — Enter = current
+   folder), or pass a destination:
+   ```bat
+   ft ft-download-data.json  E:\incoming
+   ```
+   The shared folder is recreated by name: `E:\incoming\data\…`.
+
+You don’t even need a subcommand: **the first argument decides.** A folder or a server‑config `.json`
+→ serve; a connection file → receive (an optional second argument is the destination). `ft serve` /
+`ft get` still work explicitly, and flags (`--port`, `--once`, `--streams`, …) override anything.
+
+## Many folders & ignoring — config file
+
+Drop a JSON config (same keys as the legacy PowerShell tool). A ready, fully‑commented
+**`server.example.json`** ships in the archive — it runs out of the box:
 
 ```bat
-folder-transfer.bat D:\ProjectX            REM also: -AllowIp 10.0.0.7  -Once
+ft server.example.json
 ```
-
-It prints a fingerprint and writes a ready client to `download-scripts\ft-download-ProjectX.bat`.
-Copy **that one file** to the receiver (it holds the token — treat it as a secret).
-
-**Receiver** — run the generated file with a destination (or omit it and it asks; Enter = the
-current folder):
-
-```bat
-ft-download-ProjectX.bat D:\incoming
-```
-
-The shared folder is recreated by name (`D:\incoming\ProjectX\…`). If the connection drops,
-re‑run — it resumes. The window stays open at the end so you can read the result.
-
-## Modes
-
-Every transfer is a **mirror sync**: changed/new files are sent (by size + last‑write‑time),
-files removed on the source are deleted on the receiver, unchanged files are skipped.
-
-- **Single‑phase (default)** — one pass. Re‑run any time to catch up.
-- **`-Cutover` (two‑phase, for a live database)** — pass 1 runs while the DB is up (no
-  downtime); the server then **pauses** and prompts you to stop the DB and signal (press a key
-  or create the printed `ft-cutover.go` file); pass 2 transfers only the delta. `-Cutover`
-  implies `-Once`. Consistency depends on stopping the DB cleanly before pass 2.
-
-## Many folders and ignoring
-
-For a bigger job — several source folders and paths you want to skip (big log dirs, temp
-files) — put everything in a **JSON config** and run `folder-transfer.bat sync.json` (a `.json`
-first argument is auto‑detected as the config; `-Config sync.json` also works).
-A ready‑to‑edit **`sync.example.json`** ships alongside the scripts — copy it and adjust:
-
-```json
+```jsonc
 {
-  "folders": ["C:/Users/YourName/Documents", "C:/Users/YourName/Pictures"],
-  "ignore":  ["*.tmp", "~$*", "**/node_modules/", "**/cache/"],
-  "once": true,
-  "compress": true
+  "folders": ["C:/data/Bars", "C:/data/Ticks"],   // each arrives under its own name on the receiver
+  "ignore":  ["*.tmp", "**/cache/", "logs/"],      // .gitignore-style, case-insensitive
+  "streams": 4,                                     // parallel connections (1 = classic)
+  "compress": true,                                 // adaptive; false to disable
+  "once": true,                                     // exit after one transfer
+  "port": 8722
 }
 ```
+Paths: **forward slashes** `C:/path` or **doubled backslashes** `C:\\path`. `//` and `/* */`
+comments allowed. CLI flags override the config.
 
-(A migration example — copying your folders to a new PC. `*` matches within a name (`*.tmp`,
-`~$*`); `**/node_modules/` and `**/cache/` skip those folders at **any** depth.)
+**Ignore rules:** `log` = a file/folder named `log` at any depth · `log/` = a *folder* only ·
+`*.tmp` = wildcard within a name · `Bars/Reports/` = a path anchored at the shared‑folder name ·
+`*/cache/` = one level deep · `**/cache/` = a `cache` folder at **any** depth. Ignored content is
+never transferred and **never deleted** on the receiver; an ignored folder is recreated empty.
 
-- `folders` — each is shared and arrives under its own name (`<dest>\Bars\…`, `<dest>\Ticks\…`).
-  It's standard JSON: in paths use **forward slashes** (`C:/path`) **or doubled backslashes**
-  (`C:\\path`). A single backslash or a trailing comma is invalid and is reported (not auto‑fixed).
-- `ignore` — patterns (see below); the rest of the keys are the same options as the command line
-  (command‑line options override the JSON). `"compress": false` turns off compression.
-- A ready `sync.example.json` with **every** key ships in the release — copy and trim it. The
-  config accepts `//` and `/* */` **comments** (it's fully commented).
-- You can also ignore from the command line: `-Ignore log/,*.tmp,mtlog`.
+## Progress
 
-**Ignore pattern rules** (like `.gitignore`, case‑insensitive):
+During a transfer both sides print one aggregated line (~every 1.5 s) with the running totals and
+**elapsed time**, so a long/slow transfer never looks frozen:
 
-| Pattern | Matches |
-|---------|---------|
-| `log` | a file **or** folder named `log`, at any depth |
-| `log/` | only a **folder** named `log` (a file named `log` is kept) — trailing `/` = directory‑only |
-| `*.tmp` | anything ending in `.tmp` (`*` `?` are wildcards within a name) |
-| `Bars/Reports/` | the `Reports` folder directly under the shared `Bars` (a pattern with `/` is a **path**, anchored at the shared‑folder name) |
-| `*/cache/` | a `cache` folder exactly one level deep; `*` does not cross `/` |
-| `**/cache/` | a `cache` folder at **any** depth (`**` spans `/`) |
+```
+[ft serve] 8120 files, 1604.0 MB in 02:11 @ 215.0 MB/s
+[ft]       8120 files, 1604.0 MB in 02:11 @ 215.0 MB/s
+...
+[ft] sync DONE. fetched=312 unchanged=7808 deleted=0 bytes=… in 02:13 @ 215.0 MB/s
+```
+If the connection drops it says so (`sync INCOMPLETE … re‑run to resume`) and exits non‑zero — no
+silent hang.
 
-A matched folder's **files** are skipped, but the folder (and its subfolders) is still
-**recreated empty** on the receiver — some software won't start without them. Ignored content is
-**never transferred and never deleted** on the receiver.
-
-## Parallel streams
-
-On a fast link with high latency (a long‑distance WAN, VPN, or anything with a big ping), a
-**single** TCP connection can't fill the pipe — throughput is capped at roughly *window ÷
-round‑trip‑time* no matter how much bandwidth you have. Opening several connections multiplies
-that ceiling. folder-transfer uses **4 parallel streams by default** (`-Streams <n>`, or
-`"streams": <n>` in JSON; `1` restores the classic single stream).
-
-How it works: the sender lazily walks the source and assembles fine‑grained **work units** — a
-bundle of small files, one large file, or an empty‑dir marker — into a shared queue; the N
-connections pull units until it's drained. Because units are fine‑grained, even a **single huge
-folder spreads across all streams** automatically — no need to split it in the config. Small files
-are still bundled and data is still compressed (adaptively) within each stream.
-
-Mirror stays exact. Every connection records what it received into one shared set; after **all**
-streams finish cleanly, the receiver makes a single pass and deletes any local file the source no
-longer has — including files under a whole top‑level folder you deleted. (Like single‑stream, it
-deletes files, not directories, so an emptied folder may remain.) If any stream drops, the run is
-considered incomplete and **nothing is deleted** that time — just re‑run.
+---
 
 ## Performance
 
 **Efficiency = goodput / channel capacity** — how much of the link the transfer actually uses.
 Above 100% means adaptive compression delivered *more* original data than the wire physically
-carried. Measured with the defaults (4 parallel streams + adaptive compression) over an emulated
-WAN link, at 0 ms and at 150 ms round‑trip:
+carried. Defaults (4 parallel streams + adaptive), over an emulated WAN at 0 ms and 150 ms RTT:
 
-<!-- BENCH:TABLE START -->
 | data type | 20 Mbit | 20 Mbit +150ms | 100 Mbit | 100 Mbit +150ms | 200 Mbit | 200 Mbit +150ms |
 |---|---|---|---|---|---|---|
-| small files (10000 x 4 KB) | 92% | 88% | 69% | 59% | 40% | 33% |
-| large, incompressible (4 MB files, random) | 96% | 92% | 94% | 84% | 81% | 76% |
-| large, compressible (4 MB files, text 3.73x) | 252% | 216% | 290% | 209% | 270% | 169% |
-<!-- BENCH:TABLE END -->
+| small files (10000 × 4 KB) | 96% | 92% | 55% | 56% | 37% | 31% |
+| large, incompressible (4 MB, random) | 96% | 92% | **99%** | **94%** | **99%** | **92%** |
+| large, compressible (4 MB, text 3.73×) | 232% | 212% | 294% | 236% | 296% | 193% |
 
-- **Compressible** data goes *above 100%* — compression delivers several times the wire's raw rate.
-- **Incompressible** data is link‑bound (~100%) — nothing to compress, so the link is saturated.
-- **Small files** are bound by file creation on the receiver (NTFS metadata + antivirus), not the link.
-- **High ping** (+150 ms) costs little; the gap only grows on the fastest links, where each transfer
-  is so short that the few fixed round‑trips become a visible slice of it.
+- **Incompressible** large files saturate fast links (94–99%).
+- **Compressible** data goes far above 100% — fewer bytes on the wire, more original data per second.
+- **Small files** are bound by file creation on the receiver (filesystem + antivirus), not the link.
 
-Absolute numbers are machine‑specific; efficiency (%) is largely transferable. Full report and the
-test machine are in [BENCHMARKS.md](BENCHMARKS.md). Reproduce on your own hardware with
-`powershell -ExecutionPolicy Bypass -File bench\bench.ps1` — method in [bench/README.md](bench/README.md).
+**Raw LAN throughput** (loopback, no link cap — the implementation’s own ceiling):
 
-## Parameters
+| data type | Windows | Ubuntu |
+|---|---|---|
+| small files (10000 × 4 KB) | 8.4 MB/s | ~100 MB/s |
+| large, incompressible | ~118 MB/s | ~288 MB/s |
+| large, compressible | (adaptive) | ~1.1 GB/s |
 
-Two separate programs: the **sender** (`folder-transfer.bat`) which you configure, and the
-**receiver** (`ft-download-<name>.bat`) which the sender generates with everything baked in.
-The token is auto‑generated and baked in — you never set it. Help: `folder-transfer.bat --help`.
+On Windows that’s ~1.5× the PowerShell edition on incompressible data; small files are NTFS+Defender
+bound (on Linux, with no real‑time AV, they fly). Full method, machine specs and cross‑OS results:
+**[BENCHMARKS-rust.md](BENCHMARKS-rust.md)** (scripts in [`bench/`](bench)).
 
-**Sender** — give a folder (positional, first arg) *or* `-Config` with `folders`; names are
-case‑insensitive:
+---
 
-| Option | Default | Meaning |
-|--------|---------|---------|
-| `<folder>` (positional) | required (or via `-Config`) | Folder to share, read‑only. |
-| `<config.json>` / `-Config <file.json>` | — | JSON config (folders, ignore, options). A `.json` first argument is auto‑detected. |
-| `-Ignore <list>` | none | Ignore name patterns, comma/semicolon separated (`log/,*.tmp`). |
-| `-Streams <n>` | `4` | Parallel connections — big speed‑up on high‑latency links. `1` = classic single stream. See [Parallel streams](#parallel-streams). |
-| `-Cutover` | off | Two‑phase sync for a live DB (implies `-Once`; forces `-Streams 1`). |
-| `-AllowIp <ip>` | any | Serve only this client IP. |
-| `-Once` | off | Close after one successful transfer. |
-| `-IdleSeconds <n>` | `600` | Auto‑close after N s with no client connected. |
-| `-StallTimeout <n>` | `300` | Abort a connected client silent for N s; keep listening. Raise (~1200) for big files over WAN. |
-| `-Port <n>` | `8722` | TCP port. |
-| `-ServerHost <addr>` | auto IPv4 | Address baked into the generated client. |
-| `-ClientOut <path>` | `.\download-scripts\…` | Where to write the generated client. |
-| `-NoFirewall` | off | Don't touch the firewall (opening it otherwise needs admin). |
-| `-NoCompress` | off | Force compression **off**. Default is **adaptive**: the server compresses only when it measures it to be faster (see [Performance](#performance)). |
-| `-Help` | — | Show help. |
+## Cross‑platform
 
-**Receiver** — one optional argument:
+The Windows and Linux binaries speak the same protocol and interoperate — serve on Ubuntu, receive
+on Windows, or vice versa. The Linux CLI is a **fully static musl** binary (no dependencies). mtimes
+survive the NTFS ↔ ext4 round‑trip, so a re‑sync is a clean no‑op.
 
-| Argument | Default | Meaning |
-|----------|---------|---------|
-| `<destination_folder>` | prompted (Enter = current folder) | Where to sync into; the shared folder is recreated by name inside it. |
+## Embed it in your code (library)
 
-## Progress and logs
+Each release also ships a C‑ABI shared library — **`ft.dll`** (Windows) and **`libft.so`** (Linux) —
+so you can transfer folders straight from .NET, C, or C++ without spawning the CLI. A C header
+([`ffi/ft.h`](rust/ffi/ft.h)) and a ready .NET binding ([`ffi/FolderTransfer.cs`](rust/ffi/FolderTransfer.cs))
+are included.
 
-During a pass both sides print a throttled line (~every 2 s) with how many files are done,
-fetched vs unchanged, data moved and speed — updated even mid‑file, so a large file never looks
-frozen:
+```csharp
+// receiver side — pull a folder into E:\incoming
+FolderTransfer.Get("10.0.0.1", 8722, token, fingerprint, @"E:\incoming");
 
-```
-[serve …]   progress: 8120 files - sent 312, unchanged 7808, 1,604.0 MB @ 215.0 MB/s
-[fetch] progress: 8120 files - fetched 312, unchanged 7808, 1,604.0 MB @ 215.0 MB/s
+// source side — serve in the background; token + fingerprint come back to hand to the receiver
+var srv = new FolderTransfer.Server(@"D:\data", 8722);
+Console.WriteLine($"{srv.Token} {srv.Fingerprint}");
+srv.Wait();
 ```
 
-There is **no up‑front file count**, so the transfer starts immediately instead of pausing to
-scan the whole tree first (the progress line therefore shows what's done so far, not "x of N" or
-an ETA). The server also logs the client `IP:port`, each pass's file/byte counts, and how the
-session ended.
+C ABI: `ft_get`, `ft_serve_start` / `ft_serve_wait`, `ft_last_error` (UTF‑8 strings, `0` = success).
 
-## Security
+## Why it's safe
+
+Everything goes over **TLS**, the client only trusts **your** server (pinned certificate), and only
+a holder of the **one‑time token** can pull. The server is read‑only and leaves no trace.
 
 | Layer | What it does |
 |------|--------------|
-| TLS 1.2 (`SslStream`) | Encrypts the whole session — vetted crypto, not hand‑rolled. |
-| Certificate pinning | Client refuses any server whose cert fingerprint doesn't match (anti‑MITM). |
-| Token (auto) | Random secret the client must present, sent inside TLS. |
-| IP allow‑list | `-AllowIp` serves only one client IP. |
-| Read‑only + path‑safe | The client requests files **by offset, never by path** — traversal and device names are impossible by construction. |
-| No trace | Ephemeral cert and temporary firewall rule removed on exit; no service/user/config touched. |
+| TLS 1.2/1.3 (rustls) | Encrypts the whole session — vetted crypto, not hand‑rolled. |
+| Certificate pinning | Client refuses any server whose cert fingerprint doesn’t match (anti‑MITM). The fingerprint is public; share it freely. |
+| Token (auto) | Random one‑time secret the client must present, sent inside TLS — this is the access key; keep it private. |
+| IP allow‑list | `--allow-ip` serves only one client IP. |
+| Read‑only, path‑safe | The client receives files **by name validated under the destination**; the server never executes anything. |
+| No trace | In‑memory self‑signed cert; the Windows firewall rule (best‑effort, needs admin) is removed on exit. |
 
-It is still PowerShell: on a locked‑down host the real gates are PowerShell‑side (GPO
-execution policy, WDAC/AppLocker Constrained Language Mode, EDR, admin for the firewall). The
-sender stays thin (a fixed, readable `.ps1` you can allow‑list/sign). Full protocol and threat
-model in [ARCHITECTURE.md](ARCHITECTURE.md).
+## Install
 
-## Firewall
-
-Two independent gates: the **Windows Firewall** (the OS won't let packets reach the listener
-until the port is open) and **`-AllowIp`** (the app only serves one source IP). folder-transfer
-opens the port on start (needs admin; scoped to `-AllowIp` when set) and removes the rule on
-exit. If the port is already open or managed elsewhere, pass `-NoFirewall`.
+Download a release archive, unzip, and run `ft` / `ft.exe`. No installer, no runtime. Optional: put
+it on your `PATH`. On Linux: `tar xzf ft-<ver>-x86_64-linux.tar.gz && ./ft-<ver>/ft serve …`.
 
 ## Limitations
 
-- Young tool: verified on Windows 11 (loopback) and over a real two‑machine WAN link, but test in
-  your environment before trusting production data.
-- The generated `.bat` holds the token in clear text — treat it as a secret and delete it after.
-- Change detection is **size + mtime, not a hash**; a same‑size corruption isn't detected.
-- A changed file is re‑fetched whole (no byte‑level resume within one huge file) — over a flaky
-  WAN a very large file that drops near the end restarts from zero.
-- A new self‑signed cert each run → fingerprint changes, so an old client bat won't connect to
+- Young tool — verified Rust↔Rust on Windows and Win↔Ubuntu via Docker; test before production use.
+- One‑way mirror only (source → destination); no two‑way sync, no conflict handling.
+- Change detection is **size + mtime, not a hash**; a same‑size corruption isn’t detected.
+- A changed file is re‑fetched whole — no byte‑level resume within a single huge file.
+- A fresh cert each server run → the fingerprint changes, so an old connection file won’t connect to
   a new server instance (by design).
-- **Exclusively‑locked** files are skipped for that pass (logged); files merely open for writing
-  (e.g. DB logs) are read fine. Use `-Cutover` for a consistent live‑DB copy.
-- **Parallel mode (`-Streams > 1`, the default)** deletes files, not directories, so a folder that
-  becomes empty on the source may remain as an empty folder on the receiver (same as single‑stream).
-  See [Parallel streams](#parallel-streams).
-- Symlinks/junctions inside the shared folder are followed — don't share untrusted links.
+- Parallel mode deletes files, not directories, so a folder emptied on the source may remain as an
+  empty folder on the receiver.
+- The connection file / printed command holds the token — treat it as a secret.
 
-## Troubleshooting
+## PowerShell edition
 
-- **"Unknown Publisher" / "publisher could not be verified"** — Windows Mark‑of‑the‑Web on
-  files from a downloaded ZIP. Fix: right‑click the **`.zip`** → Properties → **Unblock** →
-  *then* extract (or `Get-ChildItem -Recurse | Unblock-File`). Only code‑signing removes it fully.
-- **"running scripts is disabled"** — use the `.bat` wrappers; they call PowerShell with
-  `-ExecutionPolicy Bypass`.
-- **Client can't connect** — check the port is reachable and the baked `-ServerHost` is correct.
-- **"remote certificate is invalid"** — the client bat is from a different server run; generate
-  a fresh one.
-- **Transfer interrupted** — just run the client bat again; it resumes.
-
-## Files
-
-Keep the three sender files together. `folder-transfer.bat` is a thin launcher for
-`ft-server.ps1`, which embeds `ft-client.ps1` into the generated client.
-
-| File | Side | Purpose |
-|------|------|---------|
-| `folder-transfer.bat` | sender | Thin launcher you run (asks interactively if given no args). |
-| `ft-server.ps1` | sender | Server engine. |
-| `ft-client.ps1` | sender | Client engine, embedded into the generated client. |
-| `sync.example.json` | sender | Sample `-Config` file — copy, edit, and pass with `-Config`. |
-| `download-scripts/ft-download-<name>.bat` | receiver | Generated single self‑contained file — the only thing you carry over. |
+A pure‑PowerShell, Windows‑only edition (no binary at all) also lives here for people who want a
+script‑only tool: **[POWERSHELL.md](POWERSHELL.md)**.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Andrei Pazniak. Provided as‑is, without
-warranty; review the code and test in your environment before using it on production systems.
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Andrei Pazniak. Provided as‑is, without warranty;
+review the code and test in your environment before using it on production systems.
