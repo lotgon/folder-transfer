@@ -46,9 +46,13 @@ pub struct AdaptiveState {
     /// Raw mode: original bytes sent and seconds taken (write time only).
     pub cz_raw_bytes: i64,
     pub cz_raw_sec: f64,
-    /// Compressed mode: original bytes and seconds (deflate + write).
+    /// Compressed mode: original bytes, with the two stage times kept SEPARATELY.
+    /// `send_large_file` pipelines deflate (CPU, worker thread) concurrently with the
+    /// socket write (main thread), so the effective compressed time is the slower
+    /// stage -- `max(deflate, write)` -- not their sum; hence two accumulators.
     pub cz_cmp_bytes: i64,
-    pub cz_cmp_sec: f64,
+    pub cz_cmp_deflate_sec: f64,
+    pub cz_cmp_write_sec: f64,
     /// Last block's ratio `rlen/clen` (`n / clen`).
     pub cz_ratio: f64,
     /// Blocks since the last re-probe.
@@ -64,9 +68,12 @@ impl AdaptiveState {
     /// `(do_compress, reprobe_now)`. Mirrors the decision in `Send-LargeFile`.
     pub fn decide(&self, n: usize) -> (bool, bool) {
         let have_r = self.cz_raw_sec > 0.0;
-        let have_c = self.cz_cmp_sec > 0.0;
+        let have_c = self.cz_cmp_write_sec > 0.0;
         let tr = if have_r { self.cz_raw_bytes as f64 / self.cz_raw_sec } else { 0.0 };
-        let tc = if have_c { self.cz_cmp_bytes as f64 / self.cz_cmp_sec } else { 0.0 };
+        // Pipeline bottleneck: deflate overlaps the socket write, so the effective
+        // compressed time is the slower stage, not deflate + write.
+        let cmp_sec = self.cz_cmp_deflate_sec.max(self.cz_cmp_write_sec);
+        let tc = if cmp_sec > 0.0 { self.cz_cmp_bytes as f64 / cmp_sec } else { 0.0 };
         let incomp = self.cz_ratio > 0.0 && self.cz_ratio < 1.05;
         if n < 256 {
             return (false, false);
@@ -106,7 +113,8 @@ mod tests {
         assert_eq!(st.decide(BLOCK_SIZE), (true, false));
         // Have a compressed sample, no raw yet -> seed raw.
         st.cz_cmp_bytes = 1000;
-        st.cz_cmp_sec = 0.001;
+        st.cz_cmp_deflate_sec = 0.0005;
+        st.cz_cmp_write_sec = 0.001;
         assert_eq!(st.decide(BLOCK_SIZE), (false, false));
         // Both samples; compressed much faster -> compress.
         st.cz_raw_bytes = 1000;
@@ -120,12 +128,29 @@ mod tests {
     fn decide_reprobe_flips() {
         let mut st = AdaptiveState::new();
         st.cz_cmp_bytes = 1000;
-        st.cz_cmp_sec = 0.001; // compressed fast
+        st.cz_cmp_write_sec = 0.001; // compressed fast
         st.cz_raw_bytes = 1000;
         st.cz_raw_sec = 1.0; // raw slow -> decided = compress
         st.cz_since = REPROBE; // time to re-probe
         let (do_comp, reprobe) = st.decide(BLOCK_SIZE);
         assert!(reprobe);
         assert!(!do_comp, "re-probe flips to the other (raw) mode");
+    }
+
+    #[test]
+    fn decide_uses_pipeline_bottleneck_not_sum() {
+        // deflate and write overlap, so effective compressed time is max(.,.),
+        // not the sum. With these numbers the OLD sum model would NOT compress,
+        // but the pipeline (max) model should.
+        let mut st = AdaptiveState::new();
+        st.cz_cmp_bytes = 1000;
+        st.cz_cmp_deflate_sec = 0.001; // CPU
+        st.cz_cmp_write_sec = 0.001; // network (overlaps the CPU)
+        st.cz_raw_bytes = 1000;
+        st.cz_raw_sec = 0.0015; // raw write throughput
+        // sum model:  Tc = 1000 / 0.002  = 500_000  < 1.25 * (1000/0.0015 = 666_666)
+        // max model:  Tc = 1000 / 0.001  = 1_000_000 >= 1.25 * 666_666 = 833_333
+        let (do_comp, _) = st.decide(BLOCK_SIZE);
+        assert!(do_comp, "pipeline (max) model should choose to compress here");
     }
 }

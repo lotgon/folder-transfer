@@ -94,7 +94,8 @@ fn send_chunk_adaptive<S: Read + Write>(
             let tw = t1.elapsed().as_secs_f64();
             stats.wire += cbuf.len() as u64;
             adaptive.cz_cmp_bytes += n as i64;
-            adaptive.cz_cmp_sec += tc + tw;
+            adaptive.cz_cmp_deflate_sec += tc;
+            adaptive.cz_cmp_write_sec += tw;
         } else {
             // compression did not pay: send raw, record as a raw sample
             let t1 = Instant::now();
@@ -262,7 +263,8 @@ fn send_large_file<S: Read + Write>(
                     while let Ok(fb) = fbrx.try_recv() {
                         if fb.compressed {
                             adaptive.cz_cmp_bytes += fb.n as i64;
-                            adaptive.cz_cmp_sec += fb.tc + fb.tw;
+                            adaptive.cz_cmp_deflate_sec += fb.tc;
+                            adaptive.cz_cmp_write_sec += fb.tw;
                         } else {
                             adaptive.cz_raw_bytes += fb.n as i64;
                             adaptive.cz_raw_sec += fb.tw;
