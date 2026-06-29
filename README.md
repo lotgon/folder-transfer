@@ -90,6 +90,9 @@ Windows ↔ Linux support. It’s *not* a continuous two‑way syncer like Synct
 | | **ft** | scp | rsync | Syncthing |
 |---|---|---|---|---|
 | Install | **one binary, both sides** | SSH client/server | rsync (+SSH) | background service |
+| Time to first copy, from zero¹ | **~1 min** | ~5–15 min | ~10–20 min | ~10–20 min |
+| Setup effort / cost | **none — drop & run** | SSH server + keys/auth | SSH + rsync (Windows: WSL/cygwin) | install + pair devices |
+| Reusable multi‑folder config | **yes — keep N JSON profiles, run one** | DIY script | DIY script / `--files-from` | yes (persistent) |
 | Encryption | **TLS, built‑in** | via SSH | via SSH | TLS |
 | Windows ↔ Linux | **yes, same tool** | ok | awkward on Windows | yes |
 | Direction | one‑way push/pull | one‑way | one‑way | two‑way, continuous |
@@ -102,9 +105,14 @@ Windows ↔ Linux support. It’s *not* a continuous two‑way syncer like Synct
 | Hash‑verified integrity | no (size+mtime) | n/a | optional | yes |
 | Embeddable library | **yes (`.dll`/`.so`)** | no | no | no |
 
+<sub>¹ Cold start with *nothing* pre‑configured. If SSH or the Syncthing service is already set up,
+those tools start a copy quickly too — the point is that `ft` needs nothing set up at all: copy one
+file to each side and run.</sub>
+
 Rule of thumb: reach for **ft** for a quick, encrypted, drop‑and‑run **one‑way** copy/mirror between
-machines you control; reach for **rsync** when you need byte‑level deltas or checksums, and
-**Syncthing** when you need always‑on two‑way sync.
+machines you control — especially when you re‑copy the **same set of folders** repeatedly (save it
+once as a config “profile” and just run it). Reach for **rsync** when you need byte‑level deltas or
+checksums, and **Syncthing** when you need always‑on two‑way sync.
 
 ---
 
@@ -151,6 +159,16 @@ ft server.example.json
 ```
 Paths: **forward slashes** `C:/path` or **doubled backslashes** `C:\\path`. `//` and `/* */`
 comments allowed. CLI flags override the config.
+
+**Reusable profiles.** Define the **set of folders** once and re‑use it. Keep one config per
+recurring job — `nightly.json`, `migrate-to-new-pc.json`, `db-cutover.json` — each with its own
+fixed `folders` + ignore rules. You never re‑type the folders; you just run the profile, and on the
+receiver you only choose **where** it lands:
+
+```bat
+ft nightly.json                          ::  source: serve the predefined folder set
+ft ft-download-nightly.json  E:\backup   ::  destination: pick where it goes
+```
 
 **Ignore rules:** `log` = a file/folder named `log` at any depth · `log/` = a *folder* only ·
 `*.tmp` = wildcard within a name · `Bars/Reports/` = a path anchored at the shared‑folder name ·
