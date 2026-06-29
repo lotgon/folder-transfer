@@ -5,6 +5,10 @@
 ![language](https://img.shields.io/badge/built%20with-Rust-orange)
 ![install](https://img.shields.io/badge/install-single%20binary-brightgreen)
 
+<p align="center">
+  <img src="assets/social-preview.png" alt="ft — secure folder transfer & mirror-sync between Windows and Linux" width="840">
+</p>
+
 > **Move a folder from one server to another — encrypted, with one command. No install, no agent,
 > no network shares.** `ft` is a drop‑and‑run, `scp`/`rsync`‑style tool: a single small static
 > binary that serves *and* receives, keeps the far side an exact **one‑way mirror**, and runs on
