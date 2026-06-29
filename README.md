@@ -25,9 +25,11 @@ ft get --server 10.0.0.1 --port 8722 --token <token> --fingerprint <fp>  E:\inco
 ```
 
 **Why people use it**
+- ⏱️ **Set up in ~1 minute** — drop one binary on each side and run; no SSH, no keys, no service to configure. [How it compares ↓](#how-it-compares)
 - 🔒 **Encrypted & safe by default** — TLS with a pinned certificate + a one‑time token; nothing is left behind. [Why it’s safe ↓](#why-its-safe)
 - 📦 **Zero install** — one ~3 MB static binary. No service, no dependencies, no admin (unless you let it open the firewall).
 - 🪞 **Exact mirror, resumable** — only changed files move; re‑run to catch up; a dropped transfer resumes.
+- 🗂️ **Reusable profiles** — save a fixed set of folders (+ ignore rules) once as a config and just run it; at the receiver you only pick *where*. [Details ↓](#many-folders--ignoring--config-file)
 - 🚀 **Fast on bad links** — parallel streams for high‑latency WANs; thousands of small files bundled into a few round‑trips.
 - 🧠 **Adaptive compression** — it figures out *by itself* when compressing is faster and when it isn’t (decided per block); never wastes CPU on fast links or already‑compressed data.
 - 🧩 **Embeddable** — call it straight from .NET / C / C++ via `ft.dll` / `libft.so`.
