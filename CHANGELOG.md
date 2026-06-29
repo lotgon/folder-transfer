@@ -12,6 +12,31 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.17.0] — 2026-06-30
+
+### Performance (Rust `ft`)
+- **Small-file bundles are now compressed adaptively** (previously always sent raw). Each file in a
+  bundle uses the same per-connection raw/deflate decision as large files, so many compressible
+  small files over a slow link no longer go uncompressed.
+- **Large-file compression is pipelined with the network send**: a worker pool reads and deflates
+  blocks while the socket writer drains the previous ones, so compression overlaps the transfer
+  instead of alternating with it. Output stays in order via a sequence reorder buffer.
+- **Adaptive compression level** (`--compress-level auto|1-9`, JSON `compressLevel`): on a slow link
+  `ft` compresses harder (toward level 9) and on a fast link lighter (toward 1), driven by the
+  measured deflate-vs-link throughput. Level only affects ratio/CPU — the raw-deflate wire format is
+  unchanged, so no client update is needed.
+- **Multi-core compression** (`--compress-threads N`, JSON `compressThreads`, default 1): the
+  large-file path can spread deflate across several cores per stream — most useful for single-stream
+  / cutover transfers, and combined with adaptive level lets it climb higher because aggregate
+  deflate throughput is higher.
+- Fixed the adaptive A/B decision to use the pipeline bottleneck `max(deflate, write)` instead of
+  `deflate + write`, which (after pipelining) had biased the decision against compressing on
+  medium/fast links.
+
+### Notes
+- The bundle wire format changed (small files are now framed `Z`/`R`/`-1` like large-file blocks),
+  so both ends must run 0.17.0+. Rust ↔ Rust only; PowerShell interop is unaffected (separate tool).
+
 ## [0.16.0] — 2026-06-29
 
 ### Added (Rust `ft`)
