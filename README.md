@@ -58,7 +58,7 @@ encrypted, with nothing to install — across Windows and Linux alike.
 - **Cross‑platform.** Native static binaries for Windows and Linux that interoperate; mtimes survive
   the NTFS ↔ ext4 round‑trip.
 - **Live‑database cutover.** A two‑phase mode: pass 1 while the DB is up, you stop it, pass 2 copies
-  only the delta — for a consistent copy with minimal downtime.
+  only the delta — for a consistent copy with minimal downtime. See **[CUTOVER.md](CUTOVER.md)**.
 - **Embeddable.** Drive it from .NET / C / C++ via a small C‑ABI library — no spawning a process.
 
 ## Problems it solves
@@ -68,7 +68,7 @@ encrypted, with nothing to install — across Windows and Linux alike.
 - “I want a **repeatable mirror** — run it again and only the changes go.”
 - “The link is fast but far (**high ping**), and a single copy crawls.” → parallel streams.
 - “Thousands of tiny files take forever.” → bundling.
-- “I need a **consistent copy of a live database**.” → cutover.
+- “I need a **consistent copy of a live database**.” → [cutover mode](CUTOVER.md).
 - “I want to trigger transfers **from my own application code**.” → the library/DLL.
 
 ## Who should use it — and who shouldn’t
@@ -106,7 +106,7 @@ Windows ↔ Linux support. It’s *not* a continuous two‑way syncer like Synct
 | Many small files | **bundled** | slow | good | good |
 | High‑latency WAN | **parallel streams** | single stream | single stream | n/a |
 | Adaptive compression | **yes — automatic on/off** | no | `-z` (manual) | yes |
-| Live‑DB cutover | **yes** | no | no | no |
+| Live‑DB cutover ([details](CUTOVER.md)) | **yes** | no | no | no |
 | Byte‑level delta in one file | no | no | **yes** | yes |
 | Hash‑verified integrity | no (size+mtime) | n/a | optional | yes |
 | Embeddable library | **yes (`.dll`/`.so`)** | no | no | no |
