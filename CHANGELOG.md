@@ -12,6 +12,17 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.15.1] — 2026-06-29
+
+### Added (Rust `ft`)
+- **No subcommand needed — just point `ft` at a folder or a JSON**, PowerShell‑style. The first
+  positional argument is auto‑routed: a folder or a server config (`folders`/`folder`) starts the
+  **server**; a connection file (`fingerprint`/`token`/`server`) starts the **client** (an optional
+  second positional is the destination). `ft serve` / `ft get` still work explicitly. Examples:
+  `ft server.example.json`, `ft C:\data`, `ft ft-download-Name.json D:\incoming`.
+- **`server.example.json`** shipped in the Rust archives: a ready, fully‑commented server config
+  (same keys as `ft-server.ps1`) that runs out of the box (`ft server.example.json`).
+
 ## [0.15.0] — 2026-06-29
 
 ### Added

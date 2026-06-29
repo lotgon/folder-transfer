@@ -1,0 +1,43 @@
+{
+  // folder-transfer (ft) - SERVER config example.
+  //
+  // Run it with NO subcommand (the first argument is a folder OR this .json):
+  //     ft.exe server.example.json          (Windows)
+  //     ./ft server.example.json            (Linux)
+  //   or just point ft at a folder directly:
+  //     ft.exe C:\data
+  //
+  // On start, ft prints a FINGERPRINT, writes a client connection file under
+  // .\download-scripts\ft-download-<name>.json, and prints a ready-to-run line.
+  // On the RECEIVER you then run (Windows or Linux):
+  //     ft.exe ft-download-<name>.json  D:\where\to\save
+  //
+  // Paths: forward slashes "C:/path" OR doubled backslashes "C:\\path".
+  // Comments (// and /* */) are allowed. Same keys as the PowerShell ft-server.ps1 config.
+
+  "folders": [                 // folders to share; each arrives under its own name on the receiver
+    "C:/Users/Public/Documents"   // <-- EDIT this to the folder(s) you want to send
+  ],
+
+  "ignore": [                  // skip these.  name (no /) = any depth;  * = within one name;  ** = any depth;  trailing / = folders only
+    "*.tmp",                   // temp files
+    "~$*",                     // Office lock files
+    "Thumbs.db",               // Explorer thumbnail cache
+    "desktop.ini",             // per-folder Explorer settings
+    "**/node_modules/",        // node_modules at any depth
+    "**/cache/"                // any "cache" folder at any depth
+  ],
+
+  "streams": 4,                // parallel connections - big speed-up on high-latency links (1 = classic single-stream)
+  "compress": true,            // adaptive compression on the fly (already-compressed types are skipped); false to disable
+  "once": true,                // exit after one successful transfer
+  "cutover": false,            // true = two-phase mode for a LIVE database (implies once; forces streams:1)
+
+  "port": 8722,                // TCP port
+  "allowIp": "",               // only this client IP may connect (empty = any)
+  "serverHost": "",            // address baked into the generated client (empty = auto-detect this PC's IPv4)
+  "clientOut": "",             // where to write the client connection file (empty = .\download-scripts\...)
+  "idleSeconds": 600,          // auto-close after N seconds with no client connected
+  "stallTimeout": 300,         // abort a connected client silent for N seconds (raise to ~1200 for big files over WAN)
+  "noFirewall": false          // true = do NOT open the firewall port (opening needs admin)
+}

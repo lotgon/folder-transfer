@@ -1,6 +1,6 @@
 [package]
 name = "ft"
-version = "0.15.0"
+version = "0.15.1"
 edition = "2021"
 rust-version = "1.96"
 description = "folder-transfer: wire-compatible Rust port of the PowerShell ft-server/ft-client"

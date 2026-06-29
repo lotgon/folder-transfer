@@ -13,6 +13,7 @@ mod tls;
 mod token;
 mod wire;
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -116,7 +117,10 @@ fn main() {
     // rustls 0.23 wants a process-default crypto provider for some paths.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cli = Cli::parse();
+    // Allow `ft <folder-or-json> [dest] [flags]` with no subcommand, PowerShell-style:
+    // the first positional decides serve vs get; `serve`/`get` stay available explicitly.
+    let argv = rewrite_argv(std::env::args().collect());
+    let cli = Cli::parse_from(argv);
     let result = match cli.cmd {
         Cmd::Serve(a) => cmd_serve(a),
         Cmd::Get(a) => cmd_get(a),
@@ -125,6 +129,67 @@ fn main() {
         eprintln!("[ft] error: {e}");
         std::process::exit(1);
     }
+}
+
+/// Rewrite argv so a bare first positional works without a subcommand:
+/// - `ft <dir>` or `ft <server-config.json>`  -> `ft serve <arg> [flags]`
+/// - `ft <connection.json> [dest] [flags]`     -> `ft get --config <arg> [--to dest] [flags]`
+/// Explicit `serve`/`get`/`download`/`fetch`/`help` and `-h`/`-V`/no-args pass through unchanged.
+fn rewrite_argv(argv: Vec<String>) -> Vec<String> {
+    let first = argv.get(1).map(|s| s.as_str());
+    let is_subcommand = matches!(first, Some("serve" | "get" | "download" | "fetch" | "help"));
+    let is_help_or_version =
+        first.is_none() || matches!(first, Some("-h" | "--help" | "-V" | "--version"));
+    // A leading flag (e.g. `ft --port 9000 sync.json`) is uncommon; fall back to clap.
+    let leading_flag = first.map(|s| s.starts_with('-')).unwrap_or(false);
+    if is_subcommand || is_help_or_version || leading_flag {
+        return argv;
+    }
+
+    let pos1 = argv[1].clone();
+    let mut out = vec![argv[0].clone()];
+    if detect_is_client(&pos1) {
+        out.push("get".into());
+        out.push("--config".into());
+        out.push(pos1);
+        // an optional second positional is the destination folder
+        let mut rest = 2;
+        if let Some(a2) = argv.get(2) {
+            if !a2.starts_with('-') {
+                out.push("--to".into());
+                out.push(a2.clone());
+                rest = 3;
+            }
+        }
+        out.extend(argv[rest..].iter().cloned());
+    } else {
+        out.push("serve".into());
+        out.push(pos1); // serve's positional auto-detects a .json as its config
+        out.extend(argv[2..].iter().cloned());
+    }
+    out
+}
+
+/// Is this argument a client connection file (has fingerprint/token/server and no
+/// folders)? A directory or a server config (folders/folder) is NOT a client file.
+fn detect_is_client(arg: &str) -> bool {
+    if Path::new(arg).is_dir() {
+        return false;
+    }
+    let raw = match fs::read_to_string(arg) {
+        Ok(s) => s,
+        Err(_) => return false, // not a readable file -> treat as a (maybe missing) folder/config
+    };
+    let stripped = config::strip_jsonc(&raw);
+    let v: serde_json::Value = match serde_json::from_str(&stripped) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let has_server = v.get("folders").is_some() || v.get("folder").is_some();
+    if has_server {
+        return false;
+    }
+    v.get("fingerprint").is_some() || v.get("token").is_some() || v.get("server").is_some()
 }
 
 fn cmd_serve(a: ServeArgs) -> Result<(), BoxError> {
