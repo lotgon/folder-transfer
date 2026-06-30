@@ -82,33 +82,47 @@ fn send_raw_chunk<S: Read + Write>(conn: &mut Conn<S>, data: &[u8], stats: &mut 
 /// compression >= SPEED_MARGIN x the link; if even the floor level loses to raw
 /// (a very fast link), it switches to raw and re-probes periodically. Shared by
 /// the bundle path (one chunk per small file) and the large-file path (per block).
+/// `state` is shared across all parallel streams (one controller per connection),
+/// so the lock is held only for the tiny read/update — never during compress or write.
 fn send_chunk_adaptive<S: Read + Write>(
     conn: &mut Conn<S>,
     data: &[u8],
-    adaptive: &mut AdaptiveState,
+    state: &Mutex<AdaptiveState>,
     stats: &mut SendStats,
 ) -> io::Result<()> {
     let n = data.len();
 
-    // Fast-link raw mode: send raw, but re-probe compression every RAW_REPROBE chunks.
-    if adaptive.prefer_raw {
-        adaptive.raw_since += 1;
-        if adaptive.raw_since >= RAW_REPROBE {
-            adaptive.prefer_raw = false;
+    // Decide under a short lock: raw mode (fast link) or compress at the shared level?
+    let level = {
+        let mut s = state.lock().unwrap();
+        if s.prefer_raw {
+            s.raw_since += 1;
+            if s.raw_since >= RAW_REPROBE {
+                s.prefer_raw = false;
+            }
+            None
+        } else {
+            Some(s.level)
         }
-        return send_raw_chunk(conn, data, stats);
-    }
+    };
+    let level = match level {
+        None => return send_raw_chunk(conn, data, stats),
+        Some(l) => l,
+    };
 
     let t0 = Instant::now();
-    let cbuf = zstd_compress(data, adaptive.level);
+    let cbuf = zstd_compress(data, level);
     let tc = t0.elapsed().as_secs_f64();
-    adaptive.cz_ratio = n as f64 / cbuf.len().max(1) as f64;
+    let ratio = n as f64 / cbuf.len().max(1) as f64;
 
     // Incompressible chunk -> raw; ease the level down so we stop spending CPU.
     if (cbuf.len() as f64) >= (n as f64 * 0.95) {
-        if adaptive.level > LEVEL_MIN {
-            adaptive.level -= 1;
+        let mut s = state.lock().unwrap();
+        s.cz_ratio = ratio;
+        if s.level > LEVEL_MIN {
+            s.level -= 1;
         }
+        drop(s);
         return send_raw_chunk(conn, data, stats);
     }
 
@@ -119,7 +133,9 @@ fn send_chunk_adaptive<S: Read + Write>(
     let tw = t1.elapsed().as_secs_f64();
     stats.wire += cbuf.len() as u64;
     // Re-pick the level from the windowed aggregate (per-block tw is buffer-distorted).
-    adaptive.record(tc, tw, n, cbuf.len());
+    let mut s = state.lock().unwrap();
+    s.cz_ratio = ratio;
+    s.record(tc, tw, n, cbuf.len());
     Ok(())
 }
 
@@ -131,7 +147,7 @@ fn send_bundle<S: Read + Write>(
     bundle: &[BundleItem],
     stats: &mut SendStats,
     use_compress: bool,
-    adaptive: &mut AdaptiveState,
+    state: &Mutex<AdaptiveState>,
     prog: &Progress,
 ) -> io::Result<bool> {
     if bundle.is_empty() {
@@ -175,7 +191,7 @@ fn send_bundle<S: Read + Write>(
             .map(|e| format!(".{}", e.to_string_lossy()))
             .unwrap_or_default();
         if use_compress && rlen >= 256 && !is_incompressible(&ext) {
-            send_chunk_adaptive(conn, &data, adaptive, stats)?;
+            send_chunk_adaptive(conn, &data, state, stats)?;
         } else {
             // too small / already-compressed / compression off: raw, no A/B accounting
             conn.put_line(&format!("R {rlen}"));
@@ -199,7 +215,7 @@ fn send_large_file<S: Read + Write>(
     ext: &str,
     stats: &mut SendStats,
     use_compress: bool,
-    adaptive: &mut AdaptiveState,
+    state: &Mutex<AdaptiveState>,
     prog: &Progress,
 ) -> io::Result<()> {
     let file_len = file.metadata()?.len() as i64;
@@ -237,7 +253,7 @@ fn send_large_file<S: Read + Write>(
             if n == 0 {
                 break;
             }
-            send_chunk_adaptive(conn, &buf[..n], adaptive, stats)?;
+            send_chunk_adaptive(conn, &buf[..n], state, stats)?;
             stats.bytes += n as u64;
             prog.add(n as u64, 0);
         }
@@ -254,10 +270,11 @@ fn send_pass<S: Read + Write>(
     roots: &[PathBuf],
     ignore: &IgnoreSet,
     use_compress: bool,
+    margin: f64,
 ) -> io::Result<(bool, SendStats)> {
     let mut stats = SendStats::default();
     conn.send_line("T 0")?; // no up-front count
-    let mut adaptive = AdaptiveState::new();
+    let state = Mutex::new(AdaptiveState::new(margin));
     let prog = Progress::new("[ft serve]");
     let mut bundle: Vec<BundleItem> = Vec::new();
     let mut bundle_bytes: u64 = 0;
@@ -313,7 +330,7 @@ fn send_pass<S: Read + Write>(
                     bundle.push(BundleItem { full: full.clone(), rel, size, mtime: mt });
                     bundle_bytes += size;
                     if bundle_bytes >= BUNDLE_BYTES || bundle.len() >= BUNDLE_MAX_COUNT {
-                        if !send_bundle(conn, &bundle, &mut stats, use_compress, &mut adaptive, &prog)? {
+                        if !send_bundle(conn, &bundle, &mut stats, use_compress, &state, &prog)? {
                             return Ok((false, stats));
                         }
                         bundle.clear();
@@ -323,7 +340,7 @@ fn send_pass<S: Read + Write>(
                 }
                 // large file: flush any pending bundle, then offer it on its own
                 if !bundle.is_empty() {
-                    if !send_bundle(conn, &bundle, &mut stats, use_compress, &mut adaptive, &prog)? {
+                    if !send_bundle(conn, &bundle, &mut stats, use_compress, &state, &prog)? {
                         return Ok((false, stats));
                     }
                     bundle.clear();
@@ -353,11 +370,11 @@ fn send_pass<S: Read + Write>(
                     .extension()
                     .map(|e| format!(".{}", e.to_string_lossy()))
                     .unwrap_or_default();
-                send_large_file(conn, &mut f, offset, &ext, &mut stats, use_compress, &mut adaptive, &prog)?;
+                send_large_file(conn, &mut f, offset, &ext, &mut stats, use_compress, &state, &prog)?;
             }
         }
     }
-    if !bundle.is_empty() && !send_bundle(conn, &bundle, &mut stats, use_compress, &mut adaptive, &prog)? {
+    if !bundle.is_empty() && !send_bundle(conn, &bundle, &mut stats, use_compress, &state, &prog)? {
         return Ok((false, stats));
     }
     Ok((true, stats))
@@ -406,6 +423,8 @@ pub struct ServeConfig {
     pub once: bool,
     pub cutover: bool,
     pub use_compress: bool,
+    /// Adaptive-level coefficient: keep compression >= this many times the link speed.
+    pub compress_margin: f64,
     pub ignore_spec: String,
     /// Serve only this source IP (application-layer gate, independent of the firewall).
     pub allow_ip: Option<String>,
@@ -533,7 +552,7 @@ fn handle_session(
             Some(cmd) if cmd == "SYNC" => {
                 eprintln!("[ft] sync pass 1");
                 let t1 = Instant::now();
-                let (ok1, s1) = send_pass(&mut c, roots, ignore, cfg.use_compress)?;
+                let (ok1, s1) = send_pass(&mut c, roots, ignore, cfg.use_compress, cfg.compress_margin)?;
                 if !ok1 {
                     eprintln!("[ft] client dropped during pass 1");
                     break;
@@ -549,7 +568,7 @@ fn handle_session(
                     c.send_line("GO")?;
                     eprintln!("[ft] sync pass 2 (final)");
                     let t2 = Instant::now();
-                    let (ok2, s2) = send_pass(&mut c, roots, ignore, cfg.use_compress)?;
+                    let (ok2, s2) = send_pass(&mut c, roots, ignore, cfg.use_compress, cfg.compress_margin)?;
                     if !ok2 {
                         eprintln!("[ft] client dropped during pass 2");
                         break;
@@ -699,6 +718,7 @@ fn parallel_handler(
     streams: i32,
     ignore_spec: String,
     prog: Progress,
+    state: Arc<Mutex<AdaptiveState>>,
 ) {
     if !ip_allowed(&tcp, &allow_ip) {
         let who = tcp.peer_addr().map(|a| a.to_string()).unwrap_or_default();
@@ -733,7 +753,6 @@ fn parallel_handler(
         }
 
         let mut stats = SendStats::default();
-        let mut adaptive = AdaptiveState::new();
         let mut last_send = Instant::now();
         loop {
             let unit = match queue.try_pop() {
@@ -757,7 +776,7 @@ fn parallel_handler(
             match unit {
                 Unit::Dir(rel) => c.send_line(&format!("D {rel}"))?,
                 Unit::Bundle(items) => {
-                    if !send_bundle(&mut c, &items, &mut stats, use_compress, &mut adaptive, &prog)? {
+                    if !send_bundle(&mut c, &items, &mut stats, use_compress, &state, &prog)? {
                         return Ok(()); // client dropped
                     }
                 }
@@ -786,7 +805,7 @@ fn parallel_handler(
                         .extension()
                         .map(|e| format!(".{}", e.to_string_lossy()))
                         .unwrap_or_default();
-                    send_large_file(&mut c, &mut f, offset, &ext, &mut stats, use_compress, &mut adaptive, &prog)?;
+                    send_large_file(&mut c, &mut f, offset, &ext, &mut stats, use_compress, &state, &prog)?;
                 }
             }
         }
@@ -828,6 +847,11 @@ pub fn run_serve_parallel(cfg: ServeConfig, identity: &ServerIdentity, token: &s
     // aggregate of the whole transfer (not per-connection numbers that jump).
     let prog = Progress::new("[ft serve]");
 
+    // One shared adaptive-level controller across ALL streams: pooling every
+    // stream's measurements converges the level fast (a single stream sees too
+    // little data in parallel mode) and keeps all streams at one consistent level.
+    let state = Arc::new(Mutex::new(AdaptiveState::new(cfg.compress_margin)));
+
     // Accept loop with the parallel shutdown rules.
     let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut idle: u64 = 0;
@@ -846,8 +870,9 @@ pub fn run_serve_parallel(cfg: ServeConfig, identity: &ServerIdentity, token: &s
                 let allow_ip = cfg.allow_ip.clone();
                 let ignore_spec = cfg.ignore_spec.clone();
                 let prog = prog.clone();
+                let state = state.clone();
                 handles.push(std::thread::spawn(move || {
-                    parallel_handler(tcp, config, token, queue, done, use_compress, stall, allow_ip, streams, ignore_spec, prog);
+                    parallel_handler(tcp, config, token, queue, done, use_compress, stall, allow_ip, streams, ignore_spec, prog, state);
                 }));
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

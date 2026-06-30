@@ -1,14 +1,5 @@
-//! RAW DEFLATE (RFC 1951) to interoperate with .NET `DeflateStream`, plus the
-//! per-connection adaptive A/B compression state. See spec sections 6.4 and 6.6.
-//!
-//! NOTE: raw deflate, NOT zlib/gzip. flate2's `Deflate*` types are raw deflate;
-//! `Zlib*`/`Gz*` would add a header and break interop.
-
-use std::io::{Read, Write};
-
-use flate2::read::DeflateDecoder;
-use flate2::write::DeflateEncoder;
-use flate2::Compression;
+//! Block compression for the transfer: zstd (vendored libzstd, statically linked)
+//! plus the per-connection adaptive zstd-level controller.
 
 /// Block size for adaptive compression (1 MiB).
 pub const BLOCK_SIZE: usize = 1 << 20;
@@ -17,42 +8,17 @@ pub const BLOCK_SIZE: usize = 1 << 20;
 pub const LEVEL_START: i32 = 3;
 pub const LEVEL_MIN: i32 = -5; // ultra-fast
 pub const LEVEL_MAX: i32 = 19;
-/// Keep compression at least this many times faster than the link (the coefficient).
+/// Default coefficient: compression must stay at least this many times faster than
+/// the link. Overridable via --compress-margin. The raise threshold is derived
+/// (margin + 0.4), so the level settles at ~margin..(margin+0.4) x the link —
+/// at the coefficient, with margin, never "at the edge".
 pub const SPEED_MARGIN: f64 = 1.6;
-/// Raise the level while compression is at least this many times faster than the
-/// link; together with SPEED_MARGIN (the floor) the level settles at ~1.6-2.0x the
-/// link — at the coefficient, with margin, never "at the edge".
-pub const RAISE_HEADROOM: f64 = 2.0;
 /// In raw mode (link faster than even the floor level), re-probe every N chunks.
 pub const RAW_REPROBE: i32 = 64;
 /// Re-evaluate the level once per this many WIRE bytes. Must be well above the
 /// socket/proxy buffer so the aggregate write time reflects the real link rate
 /// (per-block write time is meaningless — writes return into the buffer instantly).
 pub const WINDOW_BYTES: i64 = 4 << 20;
-
-/// Compress with raw deflate at a "fastest"-equivalent level (.NET CompressionLevel.Fastest).
-pub fn deflate_raw(data: &[u8]) -> Vec<u8> {
-    let mut enc = DeflateEncoder::new(Vec::with_capacity(data.len() / 2 + 16), Compression::fast());
-    enc.write_all(data).expect("write to Vec cannot fail");
-    enc.finish().expect("finish to Vec cannot fail")
-}
-
-/// Inflate raw deflate into exactly `expected_len` bytes (best effort: returns
-/// whatever decoded, like the PowerShell client which stops on the first 0-read).
-pub fn inflate_raw(data: &[u8], expected_len: usize) -> std::io::Result<Vec<u8>> {
-    let mut dec = DeflateDecoder::new(data);
-    let mut out = vec![0u8; expected_len];
-    let mut off = 0;
-    while off < expected_len {
-        let n = dec.read(&mut out[off..])?;
-        if n == 0 {
-            break;
-        }
-        off += n;
-    }
-    out.truncate(off);
-    Ok(out)
-}
 
 /// Compress with zstd at the given level (negative = ultra-fast .. ~19 high).
 /// One-shot; the zstd frame is self-describing, so the decoder needs only the bytes.
@@ -81,6 +47,9 @@ pub struct AdaptiveState {
     pub prefer_raw: bool,
     /// Chunks sent raw since the last compression probe.
     pub raw_since: i32,
+    /// Coefficient: keep compression >= `margin` x the link; climb while >= `raise`.
+    margin: f64,
+    raise: f64,
     // Window accumulators (reset every WINDOW_BYTES of wire output).
     win_tc: f64,
     win_tw: f64,
@@ -89,8 +58,10 @@ pub struct AdaptiveState {
 }
 
 impl AdaptiveState {
-    pub fn new() -> Self {
-        Self { level: LEVEL_START, ..Default::default() }
+    /// `margin` is the coefficient (compression must stay >= margin x the link).
+    pub fn new(margin: f64) -> Self {
+        let margin = if margin.is_finite() && margin >= 1.0 { margin } else { SPEED_MARGIN };
+        Self { level: LEVEL_START, margin, raise: margin + 0.4, ..Default::default() }
     }
 
     /// Record one compressed block (compress time `tc`, socket write time `tw`,
@@ -107,11 +78,11 @@ impl AdaptiveState {
             return;
         }
         let headroom = if self.win_tc > 1e-9 { self.win_tw / self.win_tc } else { f64::INFINITY };
-        if headroom >= RAISE_HEADROOM && self.level < LEVEL_MAX {
+        if headroom >= self.raise && self.level < LEVEL_MAX {
             // climb fast (few windows per transfer); it self-corrects down by 1 if it overshoots.
             let step = if headroom >= 12.0 { 4 } else if headroom >= 6.0 { 3 } else { 2 };
             self.level = (self.level + step).min(LEVEL_MAX);
-        } else if headroom < SPEED_MARGIN && self.level > LEVEL_MIN {
+        } else if headroom < self.margin && self.level > LEVEL_MIN {
             let step = if headroom < 0.5 { 3 } else if headroom < 1.0 { 2 } else { 1 };
             self.level = (self.level - step).max(LEVEL_MIN);
         }
@@ -133,15 +104,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deflate_inflate_round_trip() {
-        let data = b"the quick brown fox jumps over the lazy dog".repeat(100);
-        let c = deflate_raw(&data);
-        assert!(c.len() < data.len(), "should compress repetitive data");
-        let d = inflate_raw(&c, data.len()).unwrap();
-        assert_eq!(d, data);
-    }
-
-    #[test]
     fn zstd_round_trip() {
         let data = b"the quick brown fox jumps over the lazy dog ".repeat(500);
         for lvl in [-3, 1, 3, 9, 19] {
@@ -154,7 +116,7 @@ mod tests {
 
     #[test]
     fn level_climbs_on_slow_link() {
-        let mut st = AdaptiveState::new();
+        let mut st = AdaptiveState::new(SPEED_MARGIN);
         let start = st.level;
         // one full window written 10x slower than compress -> headroom 10 -> climb
         st.record(0.001, 0.010, WINDOW_BYTES as usize, WINDOW_BYTES as usize);
@@ -163,7 +125,7 @@ mod tests {
 
     #[test]
     fn level_falls_on_fast_link() {
-        let mut st = AdaptiveState::new();
+        let mut st = AdaptiveState::new(SPEED_MARGIN);
         let start = st.level;
         st.record(0.010, 0.001, WINDOW_BYTES as usize, WINDOW_BYTES as usize); // headroom 0.1
         assert!(st.level < start, "fast link should lower the level");
@@ -171,7 +133,7 @@ mod tests {
 
     #[test]
     fn level_holds_in_band() {
-        let mut st = AdaptiveState::new();
+        let mut st = AdaptiveState::new(SPEED_MARGIN);
         let start = st.level;
         st.record(0.010, 0.018, WINDOW_BYTES as usize, WINDOW_BYTES as usize); // headroom 1.8 in [1.6,2.0)
         assert_eq!(st.level, start, "headroom in the band should hold");
@@ -179,12 +141,12 @@ mod tests {
 
     #[test]
     fn level_clamped_to_range() {
-        let mut st = AdaptiveState::new();
+        let mut st = AdaptiveState::new(SPEED_MARGIN);
         for _ in 0..50 {
             st.record(0.001, 1.0, WINDOW_BYTES as usize, WINDOW_BYTES as usize); // huge headroom
         }
         assert_eq!(st.level, LEVEL_MAX);
-        let mut st = AdaptiveState::new();
+        let mut st = AdaptiveState::new(SPEED_MARGIN);
         for _ in 0..50 {
             st.record(1.0, 0.001, WINDOW_BYTES as usize, WINDOW_BYTES as usize); // no headroom
         }

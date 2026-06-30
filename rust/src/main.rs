@@ -39,6 +39,9 @@ struct ServeArgs {
     /// Disable adaptive compression.
     #[arg(long)]
     no_compress: bool,
+    /// Adaptive-level coefficient: keep compression >= this x the link speed (default 1.6).
+    #[arg(long)]
+    compress_margin: Option<f64>,
     /// Parallel handler streams (1 = classic SYNC; >1 = parallel QSYNC). Default 4.
     #[arg(long)]
     streams: Option<i32>,
@@ -229,6 +232,7 @@ fn cmd_serve(a: ServeArgs) -> Result<(), BoxError> {
     let no_firewall = a.no_firewall || cfg.no_firewall.unwrap_or(false);
     let mut streams = a.streams.or(cfg.streams).unwrap_or(4);
     let use_compress = !a.no_compress && cfg.compress.unwrap_or(true);
+    let compress_margin = a.compress_margin.or(cfg.compress_margin).unwrap_or(1.6).max(1.0);
 
     if cutover {
         once = true;
@@ -264,6 +268,7 @@ fn cmd_serve(a: ServeArgs) -> Result<(), BoxError> {
         once,
         cutover,
         use_compress,
+        compress_margin,
         ignore_spec,
         allow_ip: allow_ip.clone(),
     };
