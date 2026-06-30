@@ -620,8 +620,8 @@ pub fn run(
         );
         Ok(stats)
     } else {
-        drop(probe); // the probe learned the stream count; workers open fresh connections
-        run_parallel_impl(config, server, port, token, &to_canon, &prefix, ignore, streams, fresh)
+        // Reuse the probe as worker 0 instead of dropping it (one fewer handshake).
+        run_parallel_impl(config, server, port, token, &to_canon, &prefix, ignore, streams, fresh, probe)
     }
 }
 
@@ -631,27 +631,16 @@ struct WorkerStat {
     stats: Stats,
 }
 
-/// One parallel worker: connect, `QSYNC`, pull units until `NOUNIT`.
-#[allow(clippy::too_many_arguments)]
-fn worker(
-    config: Arc<ClientConfig>,
-    server: &str,
-    port: u16,
-    token: &str,
+/// Run the `QSYNC` unit loop on an already-connected (handshook) stream until
+/// `NOUNIT`. Shared by the fresh workers and by the reused probe connection.
+fn serve_units<S: Read + Write>(
+    mut conn: Conn<S>,
     to: &Path,
     prefix: &str,
     mir: &Mirror,
     prog: &Progress,
     stream_mode: bool,
 ) -> Option<WorkerStat> {
-    // A connect/auth failure is benign: the server likely already drained the queue
-    // before this stream connected (common for small/fast jobs). No stat -> the
-    // aggregator only errors if NO stream connected at all.
-    let (mut conn, _scfg) = match connect_auth(config, server, port, token) {
-        Ok(x) => x,
-        Err(_) => return None,
-    };
-
     let mut stats = Stats::default();
     let mut units: u64 = 0;
     let mut ok = false;
@@ -686,6 +675,29 @@ fn worker(
     Some(WorkerStat { ok, stats })
 }
 
+/// One parallel worker: open a fresh connection, then serve units.
+#[allow(clippy::too_many_arguments)]
+fn worker(
+    config: Arc<ClientConfig>,
+    server: &str,
+    port: u16,
+    token: &str,
+    to: &Path,
+    prefix: &str,
+    mir: &Mirror,
+    prog: &Progress,
+    stream_mode: bool,
+) -> Option<WorkerStat> {
+    // A connect/auth failure is benign: the server likely already drained the queue
+    // before this stream connected (common for small/fast jobs). No stat -> the
+    // aggregator only errors if NO stream connected at all.
+    let (conn, _scfg) = match connect_auth(config, server, port, token) {
+        Ok(x) => x,
+        Err(_) => return None,
+    };
+    serve_units(conn, to, prefix, mir, prog, stream_mode)
+}
+
 /// Parallel `QSYNC` run with the stream count and ignore set already resolved.
 #[allow(clippy::too_many_arguments)]
 fn run_parallel_impl(
@@ -698,6 +710,7 @@ fn run_parallel_impl(
     ignore: IgnoreSet,
     streams: i32,
     stream_mode: bool,
+    probe: ClientStream,
 ) -> Result<Stats, BoxError> {
     let mir = Mirror::new();
     eprintln!(
@@ -712,7 +725,15 @@ fn run_parallel_impl(
     let mut results: Vec<Option<WorkerStat>> = Vec::new();
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
-        for _ in 0..streams {
+        // Worker 0 REUSES the probe connection (already TCP+TLS+AUTH'd), so a parallel
+        // transfer pays N handshakes, not N+1 — saves a full round-trip of startup,
+        // which matters on high-latency links.
+        {
+            let mir = mir.clone();
+            let prog = prog.clone();
+            handles.push(scope.spawn(move || serve_units(probe, to_canon, prefix, &mir, &prog, stream_mode)));
+        }
+        for _ in 1..streams {
             let cfg = config.clone();
             let mir = mir.clone();
             let prog = prog.clone();
