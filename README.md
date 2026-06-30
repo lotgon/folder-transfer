@@ -211,15 +211,18 @@ carried. Defaults (4 parallel streams + adaptive), over an emulated WAN at 0 ms 
 
 | data type | 20 Mbit | 20 Mbit +150ms | 100 Mbit | 100 Mbit +150ms | 200 Mbit | 200 Mbit +150ms |
 |---|---|---|---|---|---|---|
-| small files (10000 × 4 KB) — *disk‑bound* | 96% | 92% | 55% | 56% | 37% | 31% |
-| large, incompressible (4 MB, random) | 96% | 92% | **99%** | **94%** | **99%** | **92%** |
-| large, compressible (4 MB, text 3.73×) | 232% | 212% | 294% | 236% | 296% | 193% |
+| small files (10000 × 4 KB) — *disk‑bound* | 96% | 96% | 85% | 83% | 55% | 50% |
+| large, incompressible (4 MB, random) | 100% | 96% | **98%** | **96%** | **98%** | **96%** |
+| large, compressible (4 MB, text) | 428% | 384% | 457% | 400% | 444% | 234% |
 
+- **Latency barely matters.** A fresh fetch streams every file without a per‑file round‑trip, so the
+  `+150 ms` columns sit right next to the `0 ms` ones (small files 85→83%, incompressible 98→96%) —
+  exactly what you want on a high‑latency WAN.
 - **Small files** are limited by **file creation on the receiver’s disk** (filesystem metadata +
-  antivirus), *not* the link. That’s why the % falls on faster links — e.g. **37% at 200 Mbit** isn’t
+  antivirus), *not* the link. That’s why the % falls on faster links — e.g. **55% at 200 Mbit** isn’t
   `ft` being slow, it’s the disk: the link simply isn’t the bottleneck. (On Linux/ext4 with no
   real‑time AV, the same files fly — see [BENCHMARKS-rust.md](BENCHMARKS-rust.md).)
-- **Incompressible** large files saturate fast links (94–99%).
+- **Incompressible** large files saturate the link at every speed and ping (96–100%).
 - **Compressible** data goes far above 100% — fewer bytes on the wire, more original data per second.
 - **Adaptive compression** decides all of this for you — automatically (see below).
 
@@ -231,16 +234,16 @@ link** drops to zstd's ultra‑fast levels, or to **raw** when even those can't 
 data (`.zip`, `.jpg`, `.mp4`, …) is detected and sent raw. You never pass `-z` or guess. (Force it off
 entirely with `--no-compress`.)
 
-**Raw LAN throughput** (loopback, no link cap — the implementation’s own ceiling):
+**Raw LAN throughput** (Windows loopback, no link cap — the implementation’s own ceiling):
 
-| data type | Windows | Ubuntu |
+| data type | single‑stream | 4 streams |
 |---|---|---|
-| small files (10000 × 4 KB) | 8.4 MB/s | ~100 MB/s |
-| large, incompressible | ~118 MB/s | ~288 MB/s |
-| large, compressible | (adaptive) | ~1.1 GB/s |
+| small files (10000 × 4 KB) | 6.6 MB/s | 12.9 MB/s |
+| large, incompressible | ~650 MB/s | ~930 MB/s |
+| large, compressible | ~345 MB/s | ~830 MB/s |
 
-On Windows that’s ~1.5× the PowerShell edition on incompressible data; small files are NTFS+Defender
-bound (on Linux, with no real‑time AV, they fly). Full method, machine specs and cross‑OS results:
+Small files are NTFS+Defender bound (on Linux/ext4, with no real‑time AV, they’re ~15× faster).
+Full method, machine specs and cross‑OS (Windows ↔ Ubuntu) results:
 **[BENCHMARKS-rust.md](BENCHMARKS-rust.md)** (scripts in [`bench/`](bench)).
 
 ---

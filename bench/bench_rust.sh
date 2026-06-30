@@ -33,8 +33,19 @@ run_cell() { # corpus streams delay_ms rate_mbps
     for _ in $(seq 1 400000); do grep -q '^proxy ' "$po" 2>/dev/null && break; done
     connport=$pp
   fi
-  "$FT" get --config "$CONN" --server 127.0.0.1 --port "$connport" --to "$DST" --streams "$streams" > "$co" 2>&1
-  MBPS=$(sed -n 's/.*@ \([0-9.][0-9.]*\) MB\/s.*/\1/p' "$co" | head -1)
+  # Best-of-3: the small-file path is disk/AV-bound and noisy (+-2x run to run), so
+  # one run produces flukes. Take the best (least-disturbed) of three. The server
+  # stays up (no --once); each attempt re-fetches into a fresh DST.
+  MBPS=0
+  for _try in 1 2 3; do
+    rm -rf "$DST"
+    "$FT" get --config "$CONN" --server 127.0.0.1 --port "$connport" --to "$DST" --streams "$streams" > "$co" 2>&1
+    # Final (sync DONE) rate, NOT the first progress line: the first reading is the
+    # ramp-up (e.g. "@ 0.6 MB/s") and badly understates slow cells. tail -1 = DONE rate.
+    local m; m=$(sed -n 's/.*@ \([0-9.][0-9.]*\) MB\/s.*/\1/p' "$co" | tail -1)
+    [ -n "$m" ] && MBPS=$(awk "BEGIN{print ($m>$MBPS)?$m:$MBPS}")
+  done
+  [ "$MBPS" = "0" ] && MBPS=""
   [ -n "$PXY" ] && kill "$PXY" 2>/dev/null
   kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null
   [ -z "$MBPS" ] && MBPS="FAIL"

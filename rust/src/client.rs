@@ -119,15 +119,16 @@ fn dispatch_item<S: Read + Write>(
     stats: &mut Stats,
     prog: &Progress,
     h: &str,
+    stream_mode: bool,
 ) -> io::Result<()> {
     if let Some(rest) = h.strip_prefix("D ") {
         handle_dir(to, prefix, mir, rest)?;
     } else if let Some(rest) = h.strip_prefix("B ") {
         let count: usize = rest.trim().parse().unwrap_or(0);
-        handle_bundle(conn, to, prefix, mir, stats, prog, count)?;
+        handle_bundle(conn, to, prefix, mir, stats, prog, count, stream_mode)?;
     } else if let Some(rest) = h.strip_prefix("F ") {
         if let Some((size, mt, rel)) = parse_three(rest) {
-            handle_large(conn, to, prefix, mir, stats, prog, size, mt, &rel)?;
+            handle_large(conn, to, prefix, mir, stats, prog, size, mt, &rel, stream_mode)?;
         }
     }
     Ok(())
@@ -142,7 +143,54 @@ fn handle_dir(to: &Path, prefix: &str, mir: &Mirror, drel: &str) -> io::Result<(
     Ok(())
 }
 
-/// Handle `B <count>`: read manifest, reply with a want-mask, receive wanted files.
+/// Receive one bundled-file payload, given its already-read header line `hdr`
+/// (`Z <clen> <rlen>` zstd / `R <rlen>` raw), into `out`. Returns bytes written.
+/// `out` may be a real file or `io::sink()` (to discard an unwanted file and stay
+/// framed). The caller handles the `-1` (locked) case before calling this.
+fn recv_bundle_file<S: Read + Write, W: Write>(conn: &mut Conn<S>, hdr: &str, out: &mut W) -> io::Result<u64> {
+    let mut parts = hdr.split(' ');
+    let tag = parts.next().unwrap_or("");
+    if tag == "Z" {
+        let clen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        let rlen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        let cbuf = conn.read_exact_vec(clen)?;
+        let obuf = zstd_decompress(&cbuf, rlen)?;
+        out.write_all(&obuf)?;
+        Ok(obuf.len() as u64)
+    } else {
+        // "R <rlen>" (raw)
+        let rlen: u64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        conn.copy_exact_to_writer(rlen, out)?;
+        Ok(rlen)
+    }
+}
+
+/// Write one received bundled file to `bt` (create dirs, set mtime, count it).
+fn write_bundle_file<S: Read + Write>(
+    conn: &mut Conn<S>,
+    hdr: &str,
+    bt: &Path,
+    mt: i64,
+    stats: &mut Stats,
+    prog: &Progress,
+) -> io::Result<()> {
+    if let Some(parent) = bt.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut f = File::create(bt)?;
+    let nbytes = recv_bundle_file(conn, hdr, &mut f)?;
+    drop(f);
+    let _ = mtime::set_ticks(bt, mt);
+    stats.got += 1;
+    stats.bytes += nbytes;
+    prog.add(nbytes, 1);
+    Ok(())
+}
+
+/// Handle `B <count>`: read the manifest, then receive files. In mask mode we
+/// reply a want-mask and the server sends only the files we asked for; in
+/// stream mode (a fresh fetch) no mask is exchanged and the server streams every
+/// file in order, so we read each payload (writing wanted ones, discarding the rest).
 #[allow(clippy::too_many_arguments)]
 fn handle_bundle<S: Read + Write>(
     conn: &mut Conn<S>,
@@ -152,6 +200,7 @@ fn handle_bundle<S: Read + Write>(
     stats: &mut Stats,
     prog: &Progress,
     count: usize,
+    stream_mode: bool,
 ) -> io::Result<()> {
     let mut items: Vec<Option<(u64, i64, String)>> = Vec::with_capacity(count);
     for _ in 0..count {
@@ -175,7 +224,9 @@ fn handle_bundle<S: Read + Write>(
                 Some(bt) => {
                     record_root(to, prefix, rel, mir);
                     mir.insert_seen(norm_key(&bt));
-                    if need_fetch(&bt, *size, *mt) {
+                    // Stream mode = fresh dest, so always want it; mask mode skips
+                    // files we already have (size + mtime match).
+                    if stream_mode || need_fetch(&bt, *size, *mt) {
                         mask.push('1');
                         targets.push(Some(bt));
                     } else {
@@ -187,45 +238,95 @@ fn handle_bundle<S: Read + Write>(
             },
         }
     }
-    conn.send_line(&mask)?;
 
-    for (k, target) in targets.iter().enumerate() {
-        let Some(bt) = target else { continue };
-        // Per file: "Z <clen> <rlen>" (zstd) / "R <rlen>" (raw) / "-1" (locked).
-        let hdr = conn.read_line()?.ok_or_else(eof)?;
-        if hdr == "-1" {
-            continue; // locked on the source -> keep our copy
+    if stream_mode {
+        // No mask: the server streams every file in manifest order. Read each
+        // payload (writing wanted ones, discarding the rest) to stay framed.
+        for k in 0..count {
+            let hdr = conn.read_line()?.ok_or_else(eof)?;
+            if hdr == "-1" {
+                continue; // locked on the source
+            }
+            match &targets[k] {
+                Some(bt) => {
+                    let mt = items[k].as_ref().unwrap().1;
+                    write_bundle_file(conn, &hdr, bt, mt, stats, prog)?;
+                }
+                None => {
+                    recv_bundle_file(conn, &hdr, &mut io::sink())?; // unsafe/garbage: discard
+                }
+            }
         }
-        if let Some(parent) = bt.parent() {
-            fs::create_dir_all(parent)?;
+    } else {
+        conn.send_line(&mask)?;
+        // Mask mode: the server sends only the files we asked for, in order.
+        for (k, target) in targets.iter().enumerate() {
+            let Some(bt) = target else { continue };
+            let hdr = conn.read_line()?.ok_or_else(eof)?;
+            if hdr == "-1" {
+                continue; // locked on the source -> keep our copy
+            }
+            let mt = items[k].as_ref().unwrap().1;
+            write_bundle_file(conn, &hdr, bt, mt, stats, prog)?;
         }
-        let mut f = File::create(bt)?;
-        let mut parts = hdr.split(' ');
-        let tag = parts.next().unwrap_or("");
-        let nbytes: u64 = if tag == "Z" {
-            let clen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
-            let rlen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
-            let cbuf = conn.read_exact_vec(clen)?;
-            let obuf = zstd_decompress(&cbuf, rlen)?;
-            f.write_all(&obuf)?;
-            obuf.len() as u64
-        } else {
-            // "R <rlen>" (raw)
-            let rlen: u64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
-            conn.copy_exact_to_writer(rlen, &mut f)?;
-            rlen
-        };
-        drop(f);
-        let mt = items[k].as_ref().unwrap().1;
-        let _ = mtime::set_ticks(bt, mt);
-        stats.got += 1;
-        stats.bytes += nbytes;
-        prog.add(nbytes, 1);
     }
     Ok(())
 }
 
+/// Receive a large file's body (after its header line `hdr`) into `out`: either
+/// `Z` framing (a sequence of `Z <clen> <rlen>`/`R <rlen>` blocks ended by `E`)
+/// or `R <remain>` raw. `out` may be a file or `io::sink()` (discard). Reports
+/// mid-file byte progress; returns total bytes written.
+fn recv_large_body<S: Read + Write, W: Write>(
+    conn: &mut Conn<S>,
+    hdr: &str,
+    out: &mut W,
+    prog: &Progress,
+) -> io::Result<u64> {
+    let mut total = 0u64;
+    if hdr == "Z" {
+        loop {
+            let ch = conn.read_line()?.ok_or_else(eof)?;
+            if ch == "E" {
+                break;
+            }
+            let mut parts = ch.split(' ');
+            let tag = parts.next().unwrap_or("");
+            if tag == "R" {
+                let rlen: u64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                conn.copy_exact_to_writer(rlen, out)?;
+                total += rlen;
+                prog.add(rlen, 0);
+            } else {
+                let clen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                let rlen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                let cbuf = conn.read_exact_vec(clen)?;
+                let obuf = zstd_decompress(&cbuf, rlen)?;
+                out.write_all(&obuf)?;
+                total += obuf.len() as u64;
+                prog.add(obuf.len() as u64, 0);
+            }
+        }
+    } else {
+        // raw: "R <remain>" - stream in 1 MiB chunks with mid-file progress
+        let remain: u64 = hdr.split(' ').nth(1).unwrap_or("0").parse().unwrap_or(0);
+        let mut left = remain;
+        let mut buf = vec![0u8; 1 << 20];
+        while left > 0 {
+            let want = std::cmp::min(left, buf.len() as u64) as usize;
+            conn.read_exact(&mut buf[..want])?;
+            out.write_all(&buf[..want])?;
+            left -= want as u64;
+            total += want as u64;
+            prog.add(want as u64, 0);
+        }
+    }
+    Ok(total)
+}
+
 /// Handle `F <size> <mtime> <rel>`: a large file, raw or adaptive-compressed.
+/// In stream mode (fresh fetch) the server sends the body immediately (no offset
+/// round-trip); otherwise we reply `0`/`-1` first.
 #[allow(clippy::too_many_arguments)]
 fn handle_large<S: Read + Write>(
     conn: &mut Conn<S>,
@@ -237,8 +338,43 @@ fn handle_large<S: Read + Write>(
     size: u64,
     mt: i64,
     rel: &str,
+    stream_mode: bool,
 ) -> io::Result<()> {
-    let target = match safe_join(to, prefix, rel) {
+    let target = safe_join(to, prefix, rel);
+    if let Some(t) = &target {
+        record_root(to, prefix, rel, mir);
+        mir.insert_seen(norm_key(t));
+    }
+
+    if stream_mode {
+        // Fresh fetch: the server streams the body now without waiting for an offset.
+        let hdr = conn.read_line()?.ok_or_else(eof)?;
+        if hdr == "-1" {
+            return Ok(()); // locked on the source
+        }
+        match &target {
+            Some(t) => {
+                if let Some(parent) = t.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut f = File::create(t)?;
+                let n = recv_large_body(conn, &hdr, &mut f, prog)?;
+                drop(f);
+                let _ = mtime::set_ticks(t, mt);
+                stats.got += 1;
+                stats.bytes += n;
+                prog.add(0, 1);
+            }
+            None => {
+                eprintln!("[ft]   skip unsafe path from server: {rel}");
+                recv_large_body(conn, &hdr, &mut io::sink(), prog)?; // discard to stay framed
+            }
+        }
+        return Ok(());
+    }
+
+    // Mask mode: decline (already have / unsafe) or request the body from offset 0.
+    let target = match &target {
         Some(t) => t,
         None => {
             eprintln!("[ft]   skip unsafe path from server: {rel}");
@@ -246,10 +382,7 @@ fn handle_large<S: Read + Write>(
             return Ok(());
         }
     };
-    record_root(to, prefix, rel, mir);
-    mir.insert_seen(norm_key(&target));
-
-    if !need_fetch(&target, size, mt) {
+    if !need_fetch(target, size, mt) {
         conn.send_line("-1")?;
         stats.skipped += 1;
         return Ok(());
@@ -262,48 +395,12 @@ fn handle_large<S: Read + Write>(
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut f = File::create(&target)?;
-    if hdr == "Z" {
-        // adaptive: "Z <clen> <rlen>" (zstd) or "R <rlen>" (raw), ended by "E"
-        loop {
-            let ch = conn.read_line()?.ok_or_else(eof)?;
-            if ch == "E" {
-                break;
-            }
-            let mut parts = ch.split(' ');
-            let tag = parts.next().unwrap_or("");
-            if tag == "R" {
-                let rlen: u64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                conn.copy_exact_to_writer(rlen, &mut f)?;
-                stats.bytes += rlen;
-                prog.add(rlen, 0);
-            } else {
-                let clen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                let rlen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                let cbuf = conn.read_exact_vec(clen)?;
-                let obuf = zstd_decompress(&cbuf, rlen)?;
-                f.write_all(&obuf)?;
-                stats.bytes += obuf.len() as u64;
-                prog.add(obuf.len() as u64, 0);
-            }
-        }
-    } else {
-        // raw: "R <remain>" - stream in 1 MiB chunks with mid-file progress
-        let remain: u64 = hdr.split(' ').nth(1).unwrap_or("0").parse().unwrap_or(0);
-        let mut left = remain;
-        let mut buf = vec![0u8; 1 << 20];
-        while left > 0 {
-            let want = std::cmp::min(left, buf.len() as u64) as usize;
-            conn.read_exact(&mut buf[..want])?;
-            f.write_all(&buf[..want])?;
-            left -= want as u64;
-            stats.bytes += want as u64;
-            prog.add(want as u64, 0);
-        }
-    }
+    let mut f = File::create(target)?;
+    let n = recv_large_body(conn, &hdr, &mut f, prog)?;
     drop(f);
-    let _ = mtime::set_ticks(&target, mt);
+    let _ = mtime::set_ticks(target, mt);
     stats.got += 1;
+    stats.bytes += n;
     prog.add(0, 1);
     Ok(())
 }
@@ -420,7 +517,7 @@ fn run_passes<S: Read + Write>(
             if h == "PING" || h.strip_prefix("T ").is_some() {
                 continue; // keepalive / file-count line
             }
-            dispatch_item(conn, to, prefix, mir, stats, prog, &h)?;
+            dispatch_item(conn, to, prefix, mir, stats, prog, &h, false)?;
         }
         if !more {
             break;
@@ -485,6 +582,13 @@ pub fn run(
     streams_override: Option<i32>,
 ) -> Result<Stats, BoxError> {
     let (to_canon, prefix) = prepare_dest(to)?;
+    // A fresh fetch (the destination has no files yet) wants every file at offset 0,
+    // so the parallel path can stream without the per-unit want-mask / offset
+    // round-trips. A re-sync / mirror (non-empty dest) keeps those round-trips.
+    let fresh = match fs::read_dir(&to_canon) {
+        Ok(mut rd) => rd.next().is_none(),
+        Err(_) => true,
+    };
     let config = tls::make_client_config(fingerprint)?;
     let (mut probe, scfg) = connect_auth(config.clone(), server, port, token)?;
     let streams = streams_override.unwrap_or(scfg.streams).max(1);
@@ -517,7 +621,7 @@ pub fn run(
         Ok(stats)
     } else {
         drop(probe); // the probe learned the stream count; workers open fresh connections
-        run_parallel_impl(config, server, port, token, &to_canon, &prefix, ignore, streams)
+        run_parallel_impl(config, server, port, token, &to_canon, &prefix, ignore, streams, fresh)
     }
 }
 
@@ -538,6 +642,7 @@ fn worker(
     prefix: &str,
     mir: &Mirror,
     prog: &Progress,
+    stream_mode: bool,
 ) -> Option<WorkerStat> {
     // A connect/auth failure is benign: the server likely already drained the queue
     // before this stream connected (common for small/fast jobs). No stat -> the
@@ -551,7 +656,8 @@ fn worker(
     let mut units: u64 = 0;
     let mut ok = false;
     let result: io::Result<()> = (|| {
-        conn.send_line("QSYNC")?;
+        // STREAM = a fresh fetch: ask the server to skip the per-unit round-trips.
+        conn.send_line(if stream_mode { "QSYNC STREAM" } else { "QSYNC" })?;
         loop {
             let h = conn.read_line()?.ok_or_else(eof)?;
             if h == "NOUNIT" {
@@ -562,7 +668,7 @@ fn worker(
                 continue; // server keepalive while it waits for the producer
             }
             units += 1;
-            dispatch_item(&mut conn, to, prefix, mir, &mut stats, prog, &h)?;
+            dispatch_item(&mut conn, to, prefix, mir, &mut stats, prog, &h, stream_mode)?;
         }
         conn.send_line("BYE")?;
         Ok(())
@@ -591,9 +697,14 @@ fn run_parallel_impl(
     prefix: &str,
     ignore: IgnoreSet,
     streams: i32,
+    stream_mode: bool,
 ) -> Result<Stats, BoxError> {
     let mir = Mirror::new();
-    eprintln!("[ft] sync -> {} ({streams} parallel streams)", to_canon.display());
+    eprintln!(
+        "[ft] sync -> {} ({streams} parallel streams{})",
+        to_canon.display(),
+        if stream_mode { ", fresh fetch" } else { "" }
+    );
     let start = Instant::now();
     // One shared progress across all workers -> a single aggregate live line.
     let prog = Progress::new("[ft]");
@@ -605,7 +716,7 @@ fn run_parallel_impl(
             let cfg = config.clone();
             let mir = mir.clone();
             let prog = prog.clone();
-            handles.push(scope.spawn(move || worker(cfg, server, port, token, to_canon, prefix, &mir, &prog)));
+            handles.push(scope.spawn(move || worker(cfg, server, port, token, to_canon, prefix, &mir, &prog, stream_mode)));
         }
         for h in handles {
             results.push(h.join().unwrap_or(None));

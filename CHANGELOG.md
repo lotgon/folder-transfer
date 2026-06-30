@@ -29,10 +29,23 @@ aims to follow [Semantic Versioning](https://semver.org/).
   little data to adapt. Measured: streams=4 over a 30 Mbit link climbs to ~level 10 (~9× on logs).
 - Configurable via `--compress-margin <x>` (JSON `compressMargin`). Removed the deflate code and the
   `flate2` dependency.
+- **Fixed the adaptive level on fast links.** The level decision compared compress time to write time
+  but dropped the compression-ratio factor, so a fast-but-compressible link mis-read its headroom and
+  collapsed to the ultra-fast floor (~1.5×). The ratio is now included; a 200 Mbit link with
+  compressible text climbs to a real level — measured efficiency went from ~150% to ~430%.
+- **Latency: a fresh fetch no longer pays a round-trip per bundle / per large file.** When the
+  destination is empty, the parallel client requests *stream mode* (`QSYNC STREAM`): the server sends
+  every file at offset 0 without waiting for a per-bundle want-mask or a per-file offset reply (both
+  are pure latency on a fresh pull). A re-sync / mirror (non-empty destination) keeps the round-trips,
+  so resume and mirror-delete are unchanged.
+- **Coalesced small-file writes.** A bundle's file bodies now flush in ~512 KiB batches instead of one
+  flush per file, so thousands of tiny files ride full-size TLS records/TCP segments instead of runt
+  segments — higher small-file throughput at every latency.
 
 ### Notes
-- Compressed blocks are now zstd, so the wire format changed again — both ends must run 0.18.0+
-  (Rust ↔ Rust only; the PowerShell edition is a separate tool and unaffected).
+- Compressed blocks are now zstd **and** the parallel handshake gained `QSYNC STREAM`, so the wire
+  format changed — both ends must run 0.18.0+ (Rust ↔ Rust only; the PowerShell edition is a separate
+  tool and unaffected).
 
 ## [0.17.0] — 2026-06-30
 

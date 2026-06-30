@@ -104,7 +104,16 @@ impl AdaptiveState {
     }
 
     /// A block that actually compressed: feed the level window. Once a window of
-    /// WINDOW_BYTES (wire) is full, re-pick the level from headroom = Σtw/Σtc.
+    /// WINDOW_BYTES (wire) is full, re-pick the level.
+    ///
+    /// `headroom` is compression-throughput / link-throughput (both in ORIGINAL
+    /// bytes): >= margin means compression comfortably out-paces the link, so we
+    /// can afford a higher level. Expanding the invariant:
+    ///   compress_thru / link_thru
+    ///     = (win_orig/win_tc) / (win_wire/win_tw)      // link delivers win_orig as win_wire
+    ///     = (win_tw/win_tc) * (win_orig/win_wire)      // second factor = realized ratio
+    /// The ratio factor is essential: on a FAST link win_tw is small, and only the
+    /// ratio keeps a highly-compressible stream from free-falling to the floor.
     pub fn note_compressed(&mut self, tc: f64, tw: f64, orig: usize, wire: usize) {
         self.incompressible_run = 0;
         self.win_tc += tc;
@@ -114,7 +123,8 @@ impl AdaptiveState {
         if self.win_wire < WINDOW_BYTES {
             return;
         }
-        let headroom = if self.win_tc > 1e-9 { self.win_tw / self.win_tc } else { f64::INFINITY };
+        let ratio = if self.win_wire > 0 { self.win_orig as f64 / self.win_wire as f64 } else { 1.0 };
+        let headroom = if self.win_tc > 1e-9 { (self.win_tw / self.win_tc) * ratio } else { f64::INFINITY };
         if headroom >= self.raise && self.level < LEVEL_MAX {
             let step = if headroom >= 12.0 { 4 } else if headroom >= 6.0 { 3 } else { 2 };
             self.level = nonzero_level((self.level + step).min(LEVEL_MAX));
@@ -182,6 +192,20 @@ mod tests {
         let start = st.level;
         st.note_compressed(0.010, 0.001, W, W); // headroom 0.1 -> drop
         assert!(st.level < start, "fast link should lower the level");
+    }
+
+    #[test]
+    fn level_climbs_on_fast_but_compressible_link() {
+        // FAST link (small write time) but highly compressible (8x): compression
+        // easily out-paces the link, so the level must HOLD/CLIMB, not free-fall.
+        // Regression for the dropped ratio factor — with the old `win_tw/win_tc`
+        // metric this drove the level to LEVEL_MIN (~1.5x); the ratio term fixes it.
+        let mut st = AdaptiveState::new(SPEED_MARGIN);
+        let start = st.level;
+        // tc=0.13s compress, tw=0.16s write, orig = 8 * wire (8x ratio).
+        st.note_compressed(0.13, 0.16, 8 * W, W); // headroom = (0.16/0.13)*8 ≈ 9.8 -> climb
+        assert!(st.level > start, "fast but compressible link must raise, not lower, the level");
+        assert_ne!(st.level, LEVEL_MIN, "must not free-fall to the floor on compressible data");
     }
 
     #[test]

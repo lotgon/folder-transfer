@@ -29,6 +29,10 @@ const SMALL_FILE: u64 = 1_048_576;
 const BUNDLE_BYTES: u64 = 10_485_760;
 /// ...or this many files.
 const BUNDLE_MAX_COUNT: usize = 4096;
+/// Coalesce a bundle's file bodies: flush once this many buffered bytes accumulate
+/// (instead of one flush per file), so thousands of small files become a handful of
+/// full-size TLS records/TCP segments rather than runt segments that stall the cwnd.
+const BUNDLE_FLUSH: usize = 512 * 1024;
 
 #[derive(Default)]
 struct SendStats {
@@ -75,6 +79,29 @@ fn send_raw_chunk<S: Read + Write>(conn: &mut Conn<S>, data: &[u8], stats: &mut 
     conn.flush()?;
     stats.wire += data.len() as u64;
     Ok(())
+}
+
+/// Buffer one bundled small file WITHOUT flushing (the bundle flushes in batches).
+/// `Some(l)` tries zstd at level `l` and keeps it only if it shrank below 95%;
+/// `None` (or no shrink) sends raw. Deliberately does NOT touch the adaptive
+/// controller: the bodies are coalesced, so a per-file write time is meaningless —
+/// the large-file path (real per-block flushes) drives the level.
+fn put_chunk_bundled<S: Read + Write>(conn: &mut Conn<S>, data: &[u8], level: Option<i32>, stats: &mut SendStats) {
+    let n = data.len();
+    if let Some(l) = level {
+        if n >= MIN_COMPRESS {
+            let cbuf = zstd_compress(data, l);
+            if (cbuf.len() as f64) < (n as f64 * 0.95) {
+                conn.put_line(&format!("Z {} {}", cbuf.len(), n));
+                conn.put_bytes(&cbuf);
+                stats.wire += cbuf.len() as u64;
+                return;
+            }
+        }
+    }
+    conn.put_line(&format!("R {n}"));
+    conn.put_bytes(data);
+    stats.wire += n as u64;
 }
 
 /// Send one chunk of `data`, framed as `Z <clen> <rlen>` (zstd at the adaptive
@@ -139,6 +166,7 @@ fn send_chunk_adaptive<S: Read + Write>(
 /// Send a bundle of small files. Returns `false` if the client dropped.
 /// Each wanted file is framed like a large-file block: `Z <clen> <rlen>` / `R <rlen>`
 /// (adaptive) or `-1` (locked on the source).
+#[allow(clippy::too_many_arguments)]
 fn send_bundle<S: Read + Write>(
     conn: &mut Conn<S>,
     bundle: &[BundleItem],
@@ -146,6 +174,7 @@ fn send_bundle<S: Read + Write>(
     use_compress: bool,
     state: &Mutex<AdaptiveState>,
     prog: &Progress,
+    stream_mode: bool,
 ) -> io::Result<bool> {
     if bundle.is_empty() {
         return Ok(true);
@@ -158,14 +187,25 @@ fn send_bundle<S: Read + Write>(
     conn.put_bytes(header.as_bytes());
     conn.flush()?;
 
-    let mask = match conn.read_line()? {
-        Some(m) => m,
-        None => return Ok(false),
+    // Want-mask. On a fresh fetch (stream_mode) the client wants everything, so we
+    // skip the per-bundle round-trip — that mask RTT was pure latency on a fresh
+    // pull. Otherwise read the client's mask (resume / mirror / incremental).
+    let mask: Vec<u8> = if stream_mode {
+        vec![b'1'; bundle.len()]
+    } else {
+        match conn.read_line()? {
+            Some(m) => m.into_bytes(),
+            None => return Ok(false),
+        }
     };
-    let mask_bytes = mask.as_bytes();
+
+    // Compress bundled files at the controller's CURRENT level (read once); the
+    // controller itself is driven by the large-file path (see put_chunk_bundled).
+    let level: Option<i32> = if use_compress { Some(state.lock().unwrap().level()) } else { None };
+
     for (i, b) in bundle.iter().enumerate() {
         stats.offered += 1;
-        let wanted = i < mask_bytes.len() && mask_bytes[i] == b'1';
+        let wanted = i < mask.len() && mask[i] == b'1';
         if !wanted {
             stats.skipped += 1;
             continue;
@@ -174,7 +214,7 @@ fn send_bundle<S: Read + Write>(
             Ok(f) => f,
             Err(e) => {
                 eprintln!("[ft] cannot read (in use?), skipping: {} -- {e}", b.rel);
-                conn.send_line("-1")?;
+                conn.put_line("-1"); // buffered; flushed with the batch
                 stats.skipped += 1;
                 continue;
             }
@@ -187,16 +227,18 @@ fn send_bundle<S: Read + Write>(
             .extension()
             .map(|e| format!(".{}", e.to_string_lossy()))
             .unwrap_or_default();
-        if use_compress && rlen >= MIN_COMPRESS && !is_incompressible(&ext) {
-            send_chunk_adaptive(conn, &data, state, stats)?;
-        } else {
-            // too small / already-compressed / compression off: send raw
-            send_raw_chunk(conn, &data, stats)?;
+        let lvl = if use_compress && rlen >= MIN_COMPRESS && !is_incompressible(&ext) { level } else { None };
+        put_chunk_bundled(conn, &data, lvl, stats);
+        // Coalesce: flush in BUNDLE_FLUSH-sized batches (not per file) so memory is
+        // bounded and small files ride full-size records instead of runt segments.
+        if conn.buffered_len() >= BUNDLE_FLUSH {
+            conn.flush()?;
         }
         stats.sent += 1;
         stats.bytes += rlen as u64;
         prog.add(rlen as u64, 1);
     }
+    conn.flush()?; // flush the bundle's tail
     Ok(true)
 }
 
@@ -324,7 +366,7 @@ fn send_pass<S: Read + Write>(
                     bundle.push(BundleItem { full: full.clone(), rel, size, mtime: mt });
                     bundle_bytes += size;
                     if bundle_bytes >= BUNDLE_BYTES || bundle.len() >= BUNDLE_MAX_COUNT {
-                        if !send_bundle(conn, &bundle, &mut stats, use_compress, &state, &prog)? {
+                        if !send_bundle(conn, &bundle, &mut stats, use_compress, &state, &prog, false)? {
                             return Ok((false, stats));
                         }
                         bundle.clear();
@@ -334,7 +376,7 @@ fn send_pass<S: Read + Write>(
                 }
                 // large file: flush any pending bundle, then offer it on its own
                 if !bundle.is_empty() {
-                    if !send_bundle(conn, &bundle, &mut stats, use_compress, &state, &prog)? {
+                    if !send_bundle(conn, &bundle, &mut stats, use_compress, &state, &prog, false)? {
                         return Ok((false, stats));
                     }
                     bundle.clear();
@@ -368,7 +410,7 @@ fn send_pass<S: Read + Write>(
             }
         }
     }
-    if !bundle.is_empty() && !send_bundle(conn, &bundle, &mut stats, use_compress, &state, &prog)? {
+    if !bundle.is_empty() && !send_bundle(conn, &bundle, &mut stats, use_compress, &state, &prog, false)? {
         return Ok((false, stats));
     }
     Ok((true, stats))
@@ -738,13 +780,18 @@ fn parallel_handler(
         c.send_line("OK")?;
         // Push our config so the client doesn't have to carry ignore/streams.
         c.send_line(&format!("CFG {streams} {ignore_spec}"))?;
-        match c.read_line()?.as_deref() {
-            Some("QSYNC") => {}
+        // `QSYNC STREAM` = the client's destination is empty (a fresh pull), so it
+        // wants every file at offset 0 — we can stream without the per-unit want-mask
+        // / offset round-trips (pure latency on a fresh fetch). Plain `QSYNC` keeps
+        // the round-trips (resume / mirror / incremental).
+        let stream_mode = match c.read_line()?.as_deref() {
+            Some("QSYNC") => false,
+            Some("QSYNC STREAM") => true,
             _ => {
                 c.send_line("ERR cmd")?;
                 return Ok(());
             }
-        }
+        };
 
         let mut stats = SendStats::default();
         let mut last_send = Instant::now();
@@ -770,18 +817,22 @@ fn parallel_handler(
             match unit {
                 Unit::Dir(rel) => c.send_line(&format!("D {rel}"))?,
                 Unit::Bundle(items) => {
-                    if !send_bundle(&mut c, &items, &mut stats, use_compress, &state, &prog)? {
+                    if !send_bundle(&mut c, &items, &mut stats, use_compress, &state, &prog, stream_mode)? {
                         return Ok(()); // client dropped
                     }
                 }
                 Unit::Large { full, rel, size, mtime } => {
                     c.send_line(&format!("F {size} {mtime} {rel}"))?;
                     stats.offered += 1;
-                    let resp = match c.read_line()? {
-                        Some(r) => r,
-                        None => return Ok(()), // client dropped
+                    // Fresh fetch: skip the offset round-trip and send from the start.
+                    let offset: i64 = if stream_mode {
+                        0
+                    } else {
+                        match c.read_line()? {
+                            Some(r) => r.trim().parse().unwrap_or(-1),
+                            None => return Ok(()), // client dropped
+                        }
                     };
-                    let offset: i64 = resp.trim().parse().unwrap_or(-1);
                     if offset < 0 {
                         stats.skipped += 1;
                         continue;
