@@ -173,7 +173,7 @@ mod tests {
     fn level_holds_in_band() {
         let mut st = AdaptiveState::new();
         let start = st.level;
-        st.record(0.010, 0.020, WINDOW_BYTES as usize, WINDOW_BYTES as usize); // headroom 2.0
+        st.record(0.010, 0.018, WINDOW_BYTES as usize, WINDOW_BYTES as usize); // headroom 1.8 in [1.6,2.0)
         assert_eq!(st.level, start, "headroom in the band should hold");
     }
 
