@@ -191,22 +191,36 @@ fn handle_bundle<S: Read + Write>(
 
     for (k, target) in targets.iter().enumerate() {
         let Some(bt) = target else { continue };
-        let len_line = conn.read_line()?.ok_or_else(eof)?;
-        let len: i64 = len_line.trim().parse().unwrap_or(-1);
-        if len < 0 {
+        // Per file: "Z <clen> <rlen>" (deflate) / "R <rlen>" (raw) / "-1" (locked).
+        let hdr = conn.read_line()?.ok_or_else(eof)?;
+        if hdr == "-1" {
             continue; // locked on the source -> keep our copy
         }
         if let Some(parent) = bt.parent() {
             fs::create_dir_all(parent)?;
         }
         let mut f = File::create(bt)?;
-        conn.copy_exact_to_writer(len as u64, &mut f)?;
+        let mut parts = hdr.split(' ');
+        let tag = parts.next().unwrap_or("");
+        let nbytes: u64 = if tag == "Z" {
+            let clen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
+            let rlen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
+            let cbuf = conn.read_exact_vec(clen)?;
+            let obuf = inflate_raw(&cbuf, rlen)?;
+            f.write_all(&obuf)?;
+            obuf.len() as u64
+        } else {
+            // "R <rlen>" (raw)
+            let rlen: u64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+            conn.copy_exact_to_writer(rlen, &mut f)?;
+            rlen
+        };
         drop(f);
         let mt = items[k].as_ref().unwrap().1;
         let _ = mtime::set_ticks(bt, mt);
         stats.got += 1;
-        stats.bytes += len as u64;
-        prog.add(len as u64, 1);
+        stats.bytes += nbytes;
+        prog.add(nbytes, 1);
     }
     Ok(())
 }

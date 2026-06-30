@@ -68,11 +68,70 @@ fn read_block(f: &mut File, buf: &mut [u8]) -> io::Result<usize> {
     Ok(off)
 }
 
+/// Send one chunk of `data` with an adaptive raw/compressed decision, framed as
+/// `Z <clen> <rlen>` (deflate) or `R <rlen>` (raw) followed by the bytes. Updates
+/// `adaptive` (per-connection A/B throughput) and `stats.wire`. Shared by the
+/// bundle path (one chunk per small file) and the large-file path (one per block).
+fn send_chunk_adaptive<S: Read + Write>(
+    conn: &mut Conn<S>,
+    data: &[u8],
+    adaptive: &mut AdaptiveState,
+    stats: &mut SendStats,
+) -> io::Result<()> {
+    let n = data.len();
+    let (do_comp, reprobe_now) = adaptive.decide(n);
+    if do_comp {
+        let t0 = Instant::now();
+        let cbuf = deflate_raw(data);
+        let tc = t0.elapsed().as_secs_f64();
+        adaptive.cz_ratio = n as f64 / cbuf.len().max(1) as f64;
+        if (cbuf.len() as f64) < (n as f64 * 0.95) {
+            let t1 = Instant::now();
+            conn.put_line(&format!("Z {} {}", cbuf.len(), n));
+            conn.put_bytes(&cbuf);
+            conn.flush()?;
+            let tw = t1.elapsed().as_secs_f64();
+            stats.wire += cbuf.len() as u64;
+            adaptive.cz_cmp_bytes += n as i64;
+            adaptive.cz_cmp_sec += tc + tw;
+        } else {
+            // compression did not pay: send raw, record as a raw sample
+            let t1 = Instant::now();
+            conn.put_line(&format!("R {n}"));
+            conn.put_bytes(data);
+            conn.flush()?;
+            let tw = t1.elapsed().as_secs_f64();
+            stats.wire += n as u64;
+            adaptive.cz_raw_bytes += n as i64;
+            adaptive.cz_raw_sec += tw;
+        }
+    } else {
+        let t1 = Instant::now();
+        conn.put_line(&format!("R {n}"));
+        conn.put_bytes(data);
+        conn.flush()?;
+        let tw = t1.elapsed().as_secs_f64();
+        stats.wire += n as u64;
+        adaptive.cz_raw_bytes += n as i64;
+        adaptive.cz_raw_sec += tw;
+    }
+    if reprobe_now {
+        adaptive.cz_since = 0;
+    } else {
+        adaptive.cz_since += 1;
+    }
+    Ok(())
+}
+
 /// Send a bundle of small files. Returns `false` if the client dropped.
+/// Each wanted file is framed like a large-file block: `Z <clen> <rlen>` / `R <rlen>`
+/// (adaptive) or `-1` (locked on the source).
 fn send_bundle<S: Read + Write>(
     conn: &mut Conn<S>,
     bundle: &[BundleItem],
     stats: &mut SendStats,
+    use_compress: bool,
+    adaptive: &mut AdaptiveState,
     prog: &Progress,
 ) -> io::Result<bool> {
     if bundle.is_empty() {
@@ -107,14 +166,26 @@ fn send_bundle<S: Read + Write>(
                 continue;
             }
         };
-        let len = f.metadata()?.len();
-        conn.put_line(&len.to_string());
-        let sent = conn.send_from_reader(&mut f, len)?;
-        conn.flush()?; // ensure the len line is flushed even for empty files
+        let mut data = Vec::new();
+        f.read_to_end(&mut data)?;
+        let rlen = data.len();
+        let ext = b
+            .full
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default();
+        if use_compress && rlen >= 256 && !is_incompressible(&ext) {
+            send_chunk_adaptive(conn, &data, adaptive, stats)?;
+        } else {
+            // too small / already-compressed / compression off: raw, no A/B accounting
+            conn.put_line(&format!("R {rlen}"));
+            conn.put_bytes(&data);
+            conn.flush()?; // ensure the header line is flushed even for empty files
+            stats.wire += rlen as u64;
+        }
         stats.sent += 1;
-        stats.bytes += sent;
-        stats.wire += len;
-        prog.add(sent, 1);
+        stats.bytes += rlen as u64;
+        prog.add(rlen as u64, 1);
     }
     Ok(true)
 }
@@ -166,47 +237,7 @@ fn send_large_file<S: Read + Write>(
             if n == 0 {
                 break;
             }
-            let (do_comp, reprobe_now) = adaptive.decide(n);
-            if do_comp {
-                let t0 = Instant::now();
-                let cbuf = deflate_raw(&buf[..n]);
-                let tc = t0.elapsed().as_secs_f64();
-                adaptive.cz_ratio = n as f64 / cbuf.len() as f64;
-                if (cbuf.len() as f64) < (n as f64 * 0.95) {
-                    let t1 = Instant::now();
-                    conn.put_line(&format!("Z {} {}", cbuf.len(), n));
-                    conn.put_bytes(&cbuf);
-                    conn.flush()?;
-                    let tw = t1.elapsed().as_secs_f64();
-                    stats.wire += cbuf.len() as u64;
-                    adaptive.cz_cmp_bytes += n as i64;
-                    adaptive.cz_cmp_sec += tc + tw;
-                } else {
-                    // does not compress: send raw, record as a raw sample (write time only)
-                    let t1 = Instant::now();
-                    conn.put_line(&format!("R {n}"));
-                    conn.put_bytes(&buf[..n]);
-                    conn.flush()?;
-                    let tw = t1.elapsed().as_secs_f64();
-                    stats.wire += n as u64;
-                    adaptive.cz_raw_bytes += n as i64;
-                    adaptive.cz_raw_sec += tw;
-                }
-            } else {
-                let t1 = Instant::now();
-                conn.put_line(&format!("R {n}"));
-                conn.put_bytes(&buf[..n]);
-                conn.flush()?;
-                let tw = t1.elapsed().as_secs_f64();
-                stats.wire += n as u64;
-                adaptive.cz_raw_bytes += n as i64;
-                adaptive.cz_raw_sec += tw;
-            }
-            if reprobe_now {
-                adaptive.cz_since = 0;
-            } else {
-                adaptive.cz_since += 1;
-            }
+            send_chunk_adaptive(conn, &buf[..n], adaptive, stats)?;
             stats.bytes += n as u64;
             prog.add(n as u64, 0);
         }
@@ -282,7 +313,7 @@ fn send_pass<S: Read + Write>(
                     bundle.push(BundleItem { full: full.clone(), rel, size, mtime: mt });
                     bundle_bytes += size;
                     if bundle_bytes >= BUNDLE_BYTES || bundle.len() >= BUNDLE_MAX_COUNT {
-                        if !send_bundle(conn, &bundle, &mut stats, &prog)? {
+                        if !send_bundle(conn, &bundle, &mut stats, use_compress, &mut adaptive, &prog)? {
                             return Ok((false, stats));
                         }
                         bundle.clear();
@@ -292,7 +323,7 @@ fn send_pass<S: Read + Write>(
                 }
                 // large file: flush any pending bundle, then offer it on its own
                 if !bundle.is_empty() {
-                    if !send_bundle(conn, &bundle, &mut stats, &prog)? {
+                    if !send_bundle(conn, &bundle, &mut stats, use_compress, &mut adaptive, &prog)? {
                         return Ok((false, stats));
                     }
                     bundle.clear();
@@ -326,7 +357,7 @@ fn send_pass<S: Read + Write>(
             }
         }
     }
-    if !bundle.is_empty() && !send_bundle(conn, &bundle, &mut stats, &prog)? {
+    if !bundle.is_empty() && !send_bundle(conn, &bundle, &mut stats, use_compress, &mut adaptive, &prog)? {
         return Ok((false, stats));
     }
     Ok((true, stats))
@@ -726,7 +757,7 @@ fn parallel_handler(
             match unit {
                 Unit::Dir(rel) => c.send_line(&format!("D {rel}"))?,
                 Unit::Bundle(items) => {
-                    if !send_bundle(&mut c, &items, &mut stats, &prog)? {
+                    if !send_bundle(&mut c, &items, &mut stats, use_compress, &mut adaptive, &prog)? {
                         return Ok(()); // client dropped
                     }
                 }

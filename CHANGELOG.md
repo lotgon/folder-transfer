@@ -12,6 +12,22 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.17.0] — 2026-06-30
+
+### Performance (Rust `ft`)
+- **Small-file bundles are now compressed adaptively** (previously always sent raw). Each file in a
+  bundle uses the same per-connection raw/deflate decision as large files, so many compressible
+  small files no longer go uncompressed — measured ~2.6–2.8× fewer bytes on the wire for compressible
+  small/medium files, which is a similar speed-up on a link-bound link.
+
+### Notes
+- The bundle wire format changed (small files are now framed `Z`/`R`/`-1` like large-file blocks),
+  so both ends must run 0.17.0+. Rust ↔ Rust only; PowerShell interop is unaffected (separate tool).
+- A pipelined / multi-core / adaptive-level compression experiment was prototyped and then dropped:
+  benchmarking (deterministic on-the-wire bytes) showed it gave no link-bound gain and the
+  adaptive-level heuristic was counterproductive (raising the level slowed deflate, which made the
+  A/B decision fall back to raw and send *more* bytes). Only the bundle-compression win was kept.
+
 ## [0.16.0] — 2026-06-29
 
 ### Added (Rust `ft`)

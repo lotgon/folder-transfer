@@ -32,7 +32,7 @@ ft get --server 10.0.0.1 --port 8722 --token <token> --fingerprint <fp>
 - 🗂️ **Reusable profiles** — save a fixed set of folders (+ ignore rules) once as a config and just run it; at the receiver you only pick *where*. [Details ↓](#many-folders--ignoring--config-file)
 - 🚀 **Fast on bad links** — parallel streams for high‑latency WANs; thousands of small files bundled into a few round‑trips.
 - 🧠 **Adaptive compression** — it figures out *by itself* when compressing is faster and when it isn’t (decided per block); never wastes CPU on fast links or already‑compressed data.
-- 🧩 **Embeddable** — call it straight from .NET / C / C++ via `ft.dll` / `libft.so`.
+- 🧩 **Embeddable** — call it straight from .NET / C / C++ via `ft.dll` / `libft.so`. → [LIBRARY.md](LIBRARY.md)
 
 A modern alternative to `scp`/`rsync` when you just need to **push a folder server‑to‑server**,
 encrypted, with nothing to install — across Windows and Linux alike.
@@ -58,8 +58,8 @@ encrypted, with nothing to install — across Windows and Linux alike.
 - **Cross‑platform.** Native static binaries for Windows and Linux that interoperate; mtimes survive
   the NTFS ↔ ext4 round‑trip.
 - **Live‑database cutover.** A two‑phase mode: pass 1 while the DB is up, you stop it, pass 2 copies
-  only the delta — for a consistent copy with minimal downtime.
-- **Embeddable.** Drive it from .NET / C / C++ via a small C‑ABI library — no spawning a process.
+  only the delta — for a consistent copy with minimal downtime. See **[CUTOVER.md](CUTOVER.md)**.
+- **Embeddable.** Drive it from .NET / C / C++ via a small C‑ABI library — no spawning a process. See **[LIBRARY.md](LIBRARY.md)**.
 
 ## Problems it solves
 
@@ -68,7 +68,7 @@ encrypted, with nothing to install — across Windows and Linux alike.
 - “I want a **repeatable mirror** — run it again and only the changes go.”
 - “The link is fast but far (**high ping**), and a single copy crawls.” → parallel streams.
 - “Thousands of tiny files take forever.” → bundling.
-- “I need a **consistent copy of a live database**.” → cutover.
+- “I need a **consistent copy of a live database**.” → [cutover mode](CUTOVER.md).
 - “I want to trigger transfers **from my own application code**.” → the library/DLL.
 
 ## Who should use it — and who shouldn’t
@@ -106,7 +106,7 @@ Windows ↔ Linux support. It’s *not* a continuous two‑way syncer like Synct
 | Many small files | **bundled** | slow | good | good |
 | High‑latency WAN | **parallel streams** | single stream | single stream | n/a |
 | Adaptive compression | **yes — automatic on/off** | no | `-z` (manual) | yes |
-| Live‑DB cutover | **yes** | no | no | no |
+| Live‑DB cutover ([details](CUTOVER.md)) | **yes** | no | no | no |
 | Byte‑level delta in one file | no | no | **yes** | yes |
 | Hash‑verified integrity | no (size+mtime) | n/a | optional | yes |
 | Embeddable library | **yes (`.dll`/`.so`)** | no | no | no |
@@ -119,6 +119,20 @@ Rule of thumb: reach for **ft** for a quick, encrypted, drop‑and‑run **one�
 machines you control — especially when you re‑copy the **same set of folders** repeatedly (save it
 once as a config “profile” and just run it). Reach for **rsync** when you need byte‑level deltas or
 checksums, and **Syncthing** when you need always‑on two‑way sync.
+
+## Why it's safe
+
+Everything goes over **TLS**, the client only trusts **your** server (pinned certificate), and only
+a holder of the **one‑time token** can pull. The server is read‑only and leaves no trace.
+
+| Layer | What it does |
+|------|--------------|
+| TLS 1.2/1.3 (rustls) | Encrypts the whole session — vetted crypto, not hand‑rolled. |
+| Certificate pinning | Client refuses any server whose cert fingerprint doesn’t match (anti‑MITM). The fingerprint is public; share it freely. |
+| Token (auto) | Random one‑time secret the client must present, sent inside TLS — this is the access key; keep it private. |
+| IP allow‑list | `--allow-ip` serves only one client IP. |
+| Read‑only, path‑safe | The client receives files **by name validated under the destination**; the server never executes anything. |
+| No trace | In‑memory self‑signed cert; the Windows firewall rule (best‑effort, needs admin) is removed on exit. |
 
 ---
 
@@ -187,20 +201,6 @@ ft get --server 10.0.0.1 --port 8722 --token <token> --fingerprint <fp>  ::  des
 `*/cache/` = one level deep · `**/cache/` = a `cache` folder at **any** depth. Ignored content is
 never transferred and **never deleted** on the receiver; an ignored folder is recreated empty.
 
-## Progress
-
-During a transfer both sides print one aggregated line (~every 1.5 s) with the running totals and
-**elapsed time**, so a long/slow transfer never looks frozen:
-
-```
-[ft serve] 8120 files, 1604.0 MB in 02:11 @ 215.0 MB/s
-[ft]       8120 files, 1604.0 MB in 02:11 @ 215.0 MB/s
-...
-[ft] sync DONE. fetched=312 unchanged=7808 deleted=0 bytes=… in 02:13 @ 215.0 MB/s
-```
-If the connection drops it says so (`sync INCOMPLETE … re‑run to resume`) and exits non‑zero — no
-silent hang.
-
 ---
 
 ## Performance
@@ -250,38 +250,13 @@ The Windows and Linux binaries speak the same protocol and interoperate — serv
 on Windows, or vice versa. The Linux CLI is a **fully static musl** binary (no dependencies). mtimes
 survive the NTFS ↔ ext4 round‑trip, so a re‑sync is a clean no‑op.
 
-## Embed it in your code (library)
+## Additional features
 
-Each release also ships a C‑ABI shared library — **`ft.dll`** (Windows) and **`libft.so`** (Linux) —
-so you can transfer folders straight from .NET, C, or C++ without spawning the CLI. A C header
-([`ffi/ft.h`](rust/ffi/ft.h)) and a ready .NET binding ([`ffi/FolderTransfer.cs`](rust/ffi/FolderTransfer.cs))
-are included.
+Beyond the core CLI, every release also includes:
 
-```csharp
-// receiver side — pull a folder into E:\incoming
-FolderTransfer.Get("10.0.0.1", 8722, token, fingerprint, @"E:\incoming");
-
-// source side — serve in the background; token + fingerprint come back to hand to the receiver
-var srv = new FolderTransfer.Server(@"D:\data", 8722);
-Console.WriteLine($"{srv.Token} {srv.Fingerprint}");
-srv.Wait();
-```
-
-C ABI: `ft_get`, `ft_serve_start` / `ft_serve_wait`, `ft_last_error` (UTF‑8 strings, `0` = success).
-
-## Why it's safe
-
-Everything goes over **TLS**, the client only trusts **your** server (pinned certificate), and only
-a holder of the **one‑time token** can pull. The server is read‑only and leaves no trace.
-
-| Layer | What it does |
-|------|--------------|
-| TLS 1.2/1.3 (rustls) | Encrypts the whole session — vetted crypto, not hand‑rolled. |
-| Certificate pinning | Client refuses any server whose cert fingerprint doesn’t match (anti‑MITM). The fingerprint is public; share it freely. |
-| Token (auto) | Random one‑time secret the client must present, sent inside TLS — this is the access key; keep it private. |
-| IP allow‑list | `--allow-ip` serves only one client IP. |
-| Read‑only, path‑safe | The client receives files **by name validated under the destination**; the server never executes anything. |
-| No trace | In‑memory self‑signed cert; the Windows firewall rule (best‑effort, needs admin) is removed on exit. |
+- **🧩 Embeddable library** — drive transfers from your own .NET / C / C++ code via `ft.dll` / `libft.so`, no CLI spawning (almost no code to write). → **[LIBRARY.md](LIBRARY.md)**
+- **🗄️ Live‑database cutover** — two‑phase copy of a *running* database: consistent, with only seconds of downtime. → **[CUTOVER.md](CUTOVER.md)**
+- **🪟 PowerShell edition** — the original script‑only tool for Windows (no binary at all). → **[POWERSHELL.md](POWERSHELL.md)**
 
 ## Install
 
@@ -299,11 +274,6 @@ it on your `PATH`. On Linux: `tar xzf ft-<ver>-x86_64-linux.tar.gz && ./ft-<ver>
 - Parallel mode deletes files, not directories, so a folder emptied on the source may remain as an
   empty folder on the receiver.
 - The connection file / printed command holds the token — treat it as a secret.
-
-## PowerShell edition
-
-A pure‑PowerShell, Windows‑only edition (no binary at all) also lives here for people who want a
-script‑only tool: **[POWERSHELL.md](POWERSHELL.md)**.
 
 ## License
 
