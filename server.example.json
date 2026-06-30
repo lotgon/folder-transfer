@@ -30,7 +30,8 @@
   ],
 
   "streams": 4,                // parallel connections - big speed-up on high-latency links (1 = classic single-stream)
-  "compress": true,            // adaptive compression on the fly (already-compressed types are skipped); false to disable
+  "compress": true,            // adaptive zstd compression on the fly (already-compressed types are skipped); false to disable
+  "compressMargin": 1.6,       // adaptive level: keep compression >= this x the link speed (slow link -> compress harder)
   "once": true,                // exit after one successful transfer
   "cutover": false,            // true = two-phase mode for a LIVE database (implies once; forces streams:1)
 
