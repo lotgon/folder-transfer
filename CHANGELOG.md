@@ -41,6 +41,10 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - **Coalesced small-file writes.** A bundle's file bodies now flush in ~512 KiB batches instead of one
   flush per file, so thousands of tiny files ride full-size TLS records/TCP segments instead of runt
   segments — higher small-file throughput at every latency.
+- **One fewer handshake on a parallel transfer.** The client used to open a throwaway probe connection
+  just to learn the stream count, then drop it and reconnect N workers; it now reuses that connection
+  as the first worker, so a parallel run does N handshakes, not N+1 (≈ one RTT less startup — ~10% on
+  a small transfer over a 150 ms link).
 
 ### Notes
 - Compressed blocks are now zstd **and** the parallel handshake gained `QSYNC STREAM`, so the wire
