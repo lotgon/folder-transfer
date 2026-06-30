@@ -72,6 +72,13 @@ struct ServeArgs {
     /// Two-phase cutover (implies --once, forces --streams 1).
     #[arg(long)]
     cutover: bool,
+    /// Log important decisions (adaptive compression level, etc.) to stderr and a
+    /// debug log file, so you can watch what happens and share the log.
+    #[arg(long)]
+    debug: bool,
+    /// Path for the debug log (default ft-debug.log in the current directory).
+    #[arg(long)]
+    debug_log: Option<String>,
 }
 
 #[derive(Parser)]
@@ -100,6 +107,12 @@ struct GetArgs {
     /// JSONC connection/config file (as written by the server).
     #[arg(long)]
     config: Option<String>,
+    /// Log important decisions to stderr and a debug log file.
+    #[arg(long)]
+    debug: bool,
+    /// Path for the debug log (default ft-debug.log in the current directory).
+    #[arg(long)]
+    debug_log: Option<String>,
 }
 
 fn main() {
@@ -182,6 +195,9 @@ fn detect_is_client(arg: &str) -> bool {
 }
 
 fn cmd_serve(a: ServeArgs) -> Result<(), BoxError> {
+    if a.debug {
+        ft::debug::init(a.debug_log.as_deref().unwrap_or("ft-debug.log"));
+    }
     // A positional .json (or any existing file) is taken as the config.
     let mut config_path = a.config.clone();
     let mut folder_pos = a.folder.clone();
@@ -281,6 +297,9 @@ fn cmd_serve(a: ServeArgs) -> Result<(), BoxError> {
 }
 
 fn cmd_get(a: GetArgs) -> Result<(), BoxError> {
+    if a.debug {
+        ft::debug::init(a.debug_log.as_deref().unwrap_or("ft-debug.log"));
+    }
     let cfg = match &a.config {
         Some(p) => config::ClientConn::load(p)?,
         None => config::ClientConn::default(),

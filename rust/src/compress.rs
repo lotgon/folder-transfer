@@ -1,6 +1,8 @@
 //! Block compression for the transfer: zstd (vendored libzstd, statically linked)
 //! plus the adaptive zstd-level controller (shared across a connection's streams).
 
+use std::time::Instant;
+
 /// Block size for adaptive compression (1 MiB).
 pub const BLOCK_SIZE: usize = 1 << 20;
 
@@ -51,9 +53,10 @@ fn nonzero_level(l: i32) -> i32 {
 ///   * compress-vs-raw: a short run of blocks that don't shrink flips to raw mode
 ///     (with periodic re-probe), so incompressible data isn't recompressed forever;
 ///   * how-hard: among compressed blocks, pick the highest zstd level whose
-///     aggregate speed stays >= `margin` x the link (measured over a WINDOW of wire
-///     bytes — per-block write time is meaningless, it's absorbed by the socket
-///     buffer). Slow link -> climbs (more ratio); fast link -> ultra-fast floor.
+///     compression still out-paces the link by `margin`, judged over a WINDOW of
+///     wire bytes by the window's WALL-CLOCK (buffer-immune; per-block write time is
+///     not — a flush returns into the socket buffer). Slow link -> climbs (more
+///     ratio); fast link -> ultra-fast floor.
 #[derive(Default)]
 pub struct AdaptiveState {
     /// Current zstd level (kept != 0, see `nonzero_level`).
@@ -67,19 +70,32 @@ pub struct AdaptiveState {
     /// Coefficient: keep compression >= `margin` x the link; climb while >= `raise`.
     margin: f64,
     raise: f64,
+    /// Stream count, used only to estimate a buffer-immune link rate for the debug
+    /// log (N threads compress concurrently, so wall-clock compress ≈ win_tc / N).
+    streams: i32,
     // Window accumulators for the level decision (compressed blocks only).
     win_tc: f64,
-    win_tw: f64,
     win_orig: i64,
     win_wire: i64,
+    /// Wall-clock start of the current window (a buffer-immune link-time reference,
+    /// unlike per-block write time which returns into the socket buffer instantly).
+    win_start: Option<Instant>,
 }
 
 impl AdaptiveState {
     /// `margin` is the coefficient (compression must stay >= margin x the link).
     /// Clamped to a sane range so a typo can't silently disable compression.
-    pub fn new(margin: f64) -> Self {
+    /// `streams` is the connection's stream count (for the debug link-rate estimate).
+    pub fn new(margin: f64, streams: i32) -> Self {
         let margin = if margin.is_finite() { margin.clamp(1.0, 16.0) } else { SPEED_MARGIN };
-        Self { level: LEVEL_START, margin, raise: margin + 0.4, ..Default::default() }
+        Self {
+            level: LEVEL_START,
+            margin,
+            raise: margin + 0.4,
+            streams: streams.max(1),
+            win_start: Some(Instant::now()),
+            ..Default::default()
+        }
     }
 
     /// The zstd level to compress the next block at (never 0).
@@ -96,6 +112,9 @@ impl AdaptiveState {
                 self.prefer_raw = false; // probe compression on the next chunk
                 self.raw_since = 0;
                 self.reset_window();
+                if crate::debug::enabled() {
+                    crate::debug::log("raw mode: re-probing compression");
+                }
             }
             true
         } else {
@@ -104,40 +123,63 @@ impl AdaptiveState {
     }
 
     /// A block that actually compressed: feed the level window. Once a window of
-    /// WINDOW_BYTES (wire) is full, re-pick the level.
+    /// WINDOW_BYTES (wire) is full, re-pick the level from `spare` — how many times
+    /// faster compression ran than the link, measured over the window's REAL
+    /// wall-clock.
     ///
-    /// `headroom` is compression-throughput / link-throughput (both in ORIGINAL
-    /// bytes): >= margin means compression comfortably out-paces the link, so we
-    /// can afford a higher level. Expanding the invariant:
-    ///   compress_thru / link_thru
-    ///     = (win_orig/win_tc) / (win_wire/win_tw)      // link delivers win_orig as win_wire
-    ///     = (win_tw/win_tc) * (win_orig/win_wire)      // second factor = realized ratio
-    /// The ratio factor is essential: on a FAST link win_tw is small, and only the
-    /// ratio keeps a highly-compressible stream from free-falling to the floor.
-    pub fn note_compressed(&mut self, tc: f64, tw: f64, orig: usize, wire: usize) {
+    /// Why wall-clock and not per-block write time: a `flush()` returns once bytes
+    /// are in the socket send buffer, not when they reach the wire, so per-block
+    /// write time badly under-reads a slow link and makes the level oscillate (the
+    /// `--debug` log showed it swinging level 3..14). The window's wall-clock is
+    /// buffer-immune once the buffer fills, which it does over a 4 MiB window.
+    pub fn note_compressed(&mut self, tc: f64, orig: usize, wire: usize) {
         self.incompressible_run = 0;
         self.win_tc += tc;
-        self.win_tw += tw;
         self.win_orig += orig as i64;
         self.win_wire += wire as i64;
         if self.win_wire < WINDOW_BYTES {
             return;
         }
-        let ratio = if self.win_wire > 0 { self.win_orig as f64 / self.win_wire as f64 } else { 1.0 };
-        let headroom = if self.win_tc > 1e-9 { (self.win_tw / self.win_tc) * ratio } else { f64::INFINITY };
-        if headroom >= self.raise && self.level < LEVEL_MAX {
-            let step = if headroom >= 12.0 { 4 } else if headroom >= 6.0 { 3 } else { 2 };
-            self.level = nonzero_level((self.level + step).min(LEVEL_MAX));
-        } else if headroom < self.margin && self.level > LEVEL_MIN {
-            let step = if headroom < 0.5 { 3 } else if headroom < 1.0 { 2 } else { 1 };
-            self.level = nonzero_level((self.level - step).max(LEVEL_MIN));
-        }
-        // Genuinely fast link: at the floor and compression still can't keep up -> raw.
-        if self.level <= LEVEL_MIN && headroom < 1.0 {
-            self.prefer_raw = true;
-            self.raw_since = 0;
+        // spare = compress throughput / link throughput (both in original bytes):
+        // N threads compress concurrently (wall-clock compress ≈ win_tc / N) and the
+        // link carried the window's wire in `elapsed`. >= raise: room to compress harder.
+        let elapsed = self.win_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(tc).max(1e-9);
+        let spare = if self.win_tc > 1e-9 { (self.streams as f64) * elapsed / self.win_tc } else { f64::INFINITY };
+        let old = self.level;
+        let to_raw = self.apply_spare(spare);
+        if crate::debug::enabled() {
+            let ratio = if self.win_wire > 0 { self.win_orig as f64 / self.win_wire as f64 } else { 1.0 };
+            let link_mbps = (self.win_wire as f64 / 1_048_576.0) / elapsed;
+            crate::debug::log(&format!(
+                "zstd level {}{}{} | ratio {:.2}x | spare {:.2} | link {:.2} MB/s | win {:.1} MiB orig / {:.1} MiB wire in {:.3}s | streams {}",
+                self.level,
+                if self.level != old { format!(" (was {old})") } else { String::new() },
+                if to_raw { " -> RAW (fast link)" } else { "" },
+                ratio, spare, link_mbps,
+                self.win_orig as f64 / 1_048_576.0, self.win_wire as f64 / 1_048_576.0, elapsed, self.streams,
+            ));
         }
         self.reset_window();
+    }
+
+    /// Re-pick the level from `spare` (compress-throughput / link-throughput): climb
+    /// while there's headroom (>= raise), drop when it can't keep the margin, and go
+    /// raw if even the floor can't keep up. Pure (no I/O or clock) so it's unit-tested
+    /// directly. Returns whether it switched to raw mode.
+    fn apply_spare(&mut self, spare: f64) -> bool {
+        if spare >= self.raise && self.level < LEVEL_MAX {
+            let step = if spare >= 12.0 { 4 } else if spare >= 6.0 { 3 } else { 2 };
+            self.level = nonzero_level((self.level + step).min(LEVEL_MAX));
+        } else if spare < self.margin && self.level > LEVEL_MIN {
+            let step = if spare < 0.5 { 3 } else if spare < 1.0 { 2 } else { 1 };
+            self.level = nonzero_level((self.level - step).max(LEVEL_MIN));
+        }
+        if self.level <= LEVEL_MIN && spare < 1.0 {
+            self.prefer_raw = true;
+            self.raw_since = 0;
+            return true;
+        }
+        false
     }
 
     /// A block that did not shrink (`clen >= 0.95 * n`). After a short run we stop
@@ -150,14 +192,17 @@ impl AdaptiveState {
             self.raw_since = 0;
             self.incompressible_run = 0;
             self.reset_window();
+            if crate::debug::enabled() {
+                crate::debug::log("switched to RAW (incompressible streak)");
+            }
         }
     }
 
     fn reset_window(&mut self) {
         self.win_tc = 0.0;
-        self.win_tw = 0.0;
         self.win_orig = 0;
         self.win_wire = 0;
+        self.win_start = Some(Instant::now());
     }
 }
 
@@ -176,65 +221,65 @@ mod tests {
         }
     }
 
-    const W: usize = WINDOW_BYTES as usize;
+    // The level decision is driven by `spare` (compress-throughput / link-throughput),
+    // which note_compressed derives from the window's real wall-clock. The tests exercise
+    // the pure decision (apply_spare) directly with synthetic `spare` values.
 
     #[test]
     fn level_climbs_on_slow_link() {
-        let mut st = AdaptiveState::new(SPEED_MARGIN);
+        let mut st = AdaptiveState::new(SPEED_MARGIN, 1);
         let start = st.level;
-        st.note_compressed(0.001, 0.010, W, W); // headroom 10 -> climb
-        assert!(st.level > start, "slow link should raise the level");
+        st.apply_spare(10.0); // compression 10x faster than the link -> climb
+        assert!(st.level > start, "slow link (lots of spare) should raise the level");
     }
 
     #[test]
     fn level_falls_on_fast_link() {
-        let mut st = AdaptiveState::new(SPEED_MARGIN);
+        let mut st = AdaptiveState::new(SPEED_MARGIN, 1);
         let start = st.level;
-        st.note_compressed(0.010, 0.001, W, W); // headroom 0.1 -> drop
-        assert!(st.level < start, "fast link should lower the level");
-    }
-
-    #[test]
-    fn level_climbs_on_fast_but_compressible_link() {
-        // FAST link (small write time) but highly compressible (8x): compression
-        // easily out-paces the link, so the level must HOLD/CLIMB, not free-fall.
-        // Regression for the dropped ratio factor — with the old `win_tw/win_tc`
-        // metric this drove the level to LEVEL_MIN (~1.5x); the ratio term fixes it.
-        let mut st = AdaptiveState::new(SPEED_MARGIN);
-        let start = st.level;
-        // tc=0.13s compress, tw=0.16s write, orig = 8 * wire (8x ratio).
-        st.note_compressed(0.13, 0.16, 8 * W, W); // headroom = (0.16/0.13)*8 ≈ 9.8 -> climb
-        assert!(st.level > start, "fast but compressible link must raise, not lower, the level");
-        assert_ne!(st.level, LEVEL_MIN, "must not free-fall to the floor on compressible data");
+        st.apply_spare(0.5); // compression barely keeps up -> drop
+        assert!(st.level < start, "fast link (no spare) should lower the level");
     }
 
     #[test]
     fn level_holds_in_band() {
-        let mut st = AdaptiveState::new(SPEED_MARGIN);
+        let mut st = AdaptiveState::new(SPEED_MARGIN, 1);
         let start = st.level;
-        st.note_compressed(0.010, 0.018, W, W); // headroom 1.8 in [1.6, 2.0) -> hold
-        assert_eq!(st.level, start, "headroom in the band should hold");
+        st.apply_spare(1.8); // in [margin 1.6, raise 2.0) -> hold
+        assert_eq!(st.level, start, "spare in the band should hold");
     }
 
     #[test]
     fn level_clamped_and_never_zero() {
-        let mut st = AdaptiveState::new(SPEED_MARGIN);
+        let mut st = AdaptiveState::new(SPEED_MARGIN, 1);
         for _ in 0..50 {
-            st.note_compressed(0.001, 1.0, W, W); // huge headroom -> climb
+            st.apply_spare(100.0); // huge spare -> climb
             assert_ne!(st.level, 0, "level must never settle on 0 (zstd default)");
         }
         assert_eq!(st.level, LEVEL_MAX);
-        let mut st = AdaptiveState::new(SPEED_MARGIN);
+        let mut st = AdaptiveState::new(SPEED_MARGIN, 1);
         for _ in 0..50 {
-            st.note_compressed(1.0, 0.001, W, W); // no headroom -> drop (crosses 0)
+            st.apply_spare(0.1); // no spare -> drop (crosses 0)
             assert_ne!(st.level, 0, "level must never settle on 0 (zstd default)");
         }
         assert_eq!(st.level, LEVEL_MIN);
     }
 
     #[test]
+    fn floor_with_no_spare_switches_to_raw() {
+        // A genuinely fast link: even the floor level can't keep up -> raw mode.
+        let mut st = AdaptiveState::new(SPEED_MARGIN, 1);
+        for _ in 0..50 {
+            st.apply_spare(0.1);
+        }
+        assert_eq!(st.level, LEVEL_MIN);
+        assert!(st.apply_spare(0.5), "at the floor with spare < 1.0 should switch to raw");
+        assert!(st.prefer_raw);
+    }
+
+    #[test]
     fn incompressible_run_enters_raw() {
-        let mut st = AdaptiveState::new(SPEED_MARGIN);
+        let mut st = AdaptiveState::new(SPEED_MARGIN, 1);
         for _ in 0..(INCOMPRESSIBLE_STREAK - 1) {
             st.note_incompressible();
             assert!(!st.prefer_raw, "should not flip before the streak completes");
@@ -245,7 +290,7 @@ mod tests {
 
     #[test]
     fn raw_mode_reprobes() {
-        let mut st = AdaptiveState::new(SPEED_MARGIN);
+        let mut st = AdaptiveState::new(SPEED_MARGIN, 1);
         st.prefer_raw = true;
         for _ in 0..(RAW_REPROBE - 1) {
             assert!(st.want_raw(), "still in raw mode before the re-probe");
@@ -258,8 +303,8 @@ mod tests {
 
     #[test]
     fn margin_is_clamped() {
-        assert_eq!(AdaptiveState::new(0.5).margin, 1.0, "below-1 margin clamps to 1.0");
-        assert_eq!(AdaptiveState::new(1000.0).margin, 16.0, "huge margin clamps so it can't disable compression");
-        assert_eq!(AdaptiveState::new(f64::NAN).margin, SPEED_MARGIN, "NaN falls back to default");
+        assert_eq!(AdaptiveState::new(0.5, 1).margin, 1.0, "below-1 margin clamps to 1.0");
+        assert_eq!(AdaptiveState::new(1000.0, 1).margin, 16.0, "huge margin clamps so it can't disable compression");
+        assert_eq!(AdaptiveState::new(f64::NAN, 1).margin, SPEED_MARGIN, "NaN falls back to default");
     }
 }

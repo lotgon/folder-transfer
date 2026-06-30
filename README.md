@@ -213,10 +213,10 @@ carried. Defaults (4 parallel streams + adaptive), over an emulated WAN at 0 ms 
 |---|---|---|---|---|---|---|
 | small files (10000 × 4 KB) — *disk‑bound* | 100% | 96% | 64% | 65% | 57% | 48% |
 | large, incompressible (4 MB, random) | 100% | 100% | **99%** | **98%** | **100%** | **98%** |
-| large, compressible (4 MB, text) | 452% | 428% | 430% | 441% | 460% | 406% |
+| large, compressible (4 MB, text) | 452% | 424% | 480% | 442% | 464% | 427% |
 
 - **Latency barely matters.** A fresh fetch streams every file without a per‑file round‑trip, so the
-  `+150 ms` columns sit right next to the `0 ms` ones (compressible 460→406%, incompressible 100→98%) —
+  `+150 ms` columns sit right next to the `0 ms` ones (compressible 464→427%, incompressible 100→98%) —
   exactly what you want on a high‑latency WAN.
 - **Small files** are limited by **file creation on the receiver’s disk** (filesystem metadata +
   antivirus), *not* the link. That’s why the % falls on faster links — e.g. **57% at 200 Mbit** isn’t
@@ -239,10 +239,14 @@ entirely with `--no-compress`.)
 | data type | single‑stream | 4 streams |
 |---|---|---|
 | small files (10000 × 4 KB) | ~3.5 MB/s | ~10 MB/s |
-| large, incompressible | ~475 MB/s | ~885 MB/s |
-| large, compressible | ~440 MB/s | ~950 MB/s |
+| large, incompressible | ~475 MB/s | ~1100 MB/s |
+| large, compressible | ~300 MB/s | ~425 MB/s |
 
 Small files are NTFS+Defender bound (on Linux/ext4, with no real‑time AV, they’re ~15× faster).
+The *compressible* loopback figure is **compression‑bound, not link‑bound**: with no link cap the
+adaptive controller still compresses (it pegs to the receiver’s rate, which on a >1 GB/s loopback is
+the CPU), so raw memcpy would be faster *here* — but on any real link compression is a large net win
+(see the efficiency table). On a genuinely fast LAN you can `--no-compress` to skip it.
 Full method, machine specs and cross‑OS (Windows ↔ Ubuntu) results:
 **[BENCHMARKS-rust.md](BENCHMARKS-rust.md)** (scripts in [`bench/`](bench)).
 
