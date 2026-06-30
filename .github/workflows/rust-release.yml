@@ -4,8 +4,10 @@
 # (triggered by the same tag) adds the Rust archives to the same release. Order
 # does not matter — whichever runs second just adds its assets.
 #
-# Both targets build with pure-Rust crypto/compression (rustls+ring, rcgen+ring,
-# flate2/miniz_oxide), so the Linux musl build is fully static with no C deps.
+# Crypto is pure-Rust (rustls+ring, rcgen+ring); compression is zstd (vendored
+# libzstd, compiled from C by zstd-sys and STATICALLY linked). The Linux musl
+# target therefore needs a C toolchain at build time (musl-tools, installed below);
+# the resulting binary is still fully static with no runtime deps.
 name: rust-release
 
 on:

@@ -223,12 +223,13 @@ carried. Defaults (4 parallel streams + adaptive), over an emulated WAN at 0 ms 
 - **Compressible** data goes far above 100% — fewer bytes on the wire, more original data per second.
 - **Adaptive compression** decides all of this for you — automatically (see below).
 
-**Adaptive compression — automatic, no flags.** `ft` measures, per block and per connection,
-whether compressing actually moves data *faster*, and compresses only when it does. On a fast link,
-or with already‑compressed data (`.zip`, `.jpg`, `.mp4`, …), it sends **raw** and wastes no CPU; on a
-slow link with compressible data it **packs** and beats the wire (the 200–290% rows above). You never
-pass `-z` or guess — the system figures out when to compress and when not to, on its own. (Force it
-off with `--no-compress` if you ever need to.)
+**Adaptive compression — automatic.** Compression is **zstd**, and `ft` adapts both *whether* and
+*how hard* to compress to the link: it measures the link speed and picks the highest zstd level whose
+compression still stays comfortably faster than the link (the coefficient, `--compress-margin`,
+default `1.6×`). A **slow link** compresses harder (more ratio → fewer bytes → faster); a **fast
+link** drops to zstd's ultra‑fast levels, or to **raw** when even those can't keep up; already‑compressed
+data (`.zip`, `.jpg`, `.mp4`, …) is detected and sent raw. You never pass `-z` or guess. (Force it off
+entirely with `--no-compress`.)
 
 **Raw LAN throughput** (loopback, no link cap — the implementation’s own ceiling):
 
