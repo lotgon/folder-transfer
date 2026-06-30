@@ -232,7 +232,8 @@ fn cmd_serve(a: ServeArgs) -> Result<(), BoxError> {
     let no_firewall = a.no_firewall || cfg.no_firewall.unwrap_or(false);
     let mut streams = a.streams.or(cfg.streams).unwrap_or(4);
     let use_compress = !a.no_compress && cfg.compress.unwrap_or(true);
-    let compress_margin = a.compress_margin.or(cfg.compress_margin).unwrap_or(1.6).max(1.0);
+    // Clamping lives in AdaptiveState::new (single source of truth, range [1.0, 16.0]).
+    let compress_margin = a.compress_margin.or(cfg.compress_margin).unwrap_or(1.6);
 
     if cutover {
         once = true;

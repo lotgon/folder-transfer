@@ -191,7 +191,7 @@ fn handle_bundle<S: Read + Write>(
 
     for (k, target) in targets.iter().enumerate() {
         let Some(bt) = target else { continue };
-        // Per file: "Z <clen> <rlen>" (deflate) / "R <rlen>" (raw) / "-1" (locked).
+        // Per file: "Z <clen> <rlen>" (zstd) / "R <rlen>" (raw) / "-1" (locked).
         let hdr = conn.read_line()?.ok_or_else(eof)?;
         if hdr == "-1" {
             continue; // locked on the source -> keep our copy
@@ -264,7 +264,7 @@ fn handle_large<S: Read + Write>(
     }
     let mut f = File::create(&target)?;
     if hdr == "Z" {
-        // adaptive: "Z <clen> <rlen>" (deflate) or "R <rlen>" (raw), ended by "E"
+        // adaptive: "Z <clen> <rlen>" (zstd) or "R <rlen>" (raw), ended by "E"
         loop {
             let ch = conn.read_line()?.ok_or_else(eof)?;
             if ch == "E" {

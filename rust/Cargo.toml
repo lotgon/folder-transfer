@@ -24,8 +24,6 @@ clap = { version = "4", features = ["derive"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # ring backend (not the default aws_lc_rs) to avoid a C toolchain / cmake at build time.
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
-# flate2 defaults to the pure-Rust miniz_oxide backend (no zlib C dependency).
-# We use it in RAW deflate mode (RFC 1951) to match .NET DeflateStream.
 # zstd: vendored libzstd compiled from C and STATICALLY linked into the binary
 # (build-time C only; no runtime .dll/.so -> the release stays a single file).
 zstd = "0.13"

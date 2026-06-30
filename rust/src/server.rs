@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
-use crate::compress::{zstd_compress, AdaptiveState, BLOCK_SIZE, LEVEL_MIN, RAW_REPROBE};
+use crate::compress::{zstd_compress, AdaptiveState, BLOCK_SIZE, MIN_COMPRESS};
 use crate::ignore::IgnoreSet;
 use crate::mtime;
 use crate::paths::is_incompressible;
@@ -92,17 +92,20 @@ fn send_chunk_adaptive<S: Read + Write>(
 ) -> io::Result<()> {
     let n = data.len();
 
-    // Decide under a short lock: raw mode (fast link) or compress at the shared level?
+    // Tiny blocks (e.g. a large file's final tail) never beat a zstd frame -> raw,
+    // and must not disturb the shared controller.
+    if n < MIN_COMPRESS {
+        return send_raw_chunk(conn, data, stats);
+    }
+
+    // Decide under a short lock: raw mode (incompressible run / link faster than the
+    // floor) or compress at the shared level? The lock never spans compress or write.
     let level = {
         let mut s = state.lock().unwrap();
-        if s.prefer_raw {
-            s.raw_since += 1;
-            if s.raw_since >= RAW_REPROBE {
-                s.prefer_raw = false;
-            }
+        if s.want_raw() {
             None
         } else {
-            Some(s.level)
+            Some(s.level())
         }
     };
     let level = match level {
@@ -113,17 +116,13 @@ fn send_chunk_adaptive<S: Read + Write>(
     let t0 = Instant::now();
     let cbuf = zstd_compress(data, level);
     let tc = t0.elapsed().as_secs_f64();
-    let ratio = n as f64 / cbuf.len().max(1) as f64;
 
-    // Incompressible chunk -> raw; ease the level down so we stop spending CPU.
+    // Didn't shrink -> raw; a short run of these flips the controller to raw mode
+    // (the level is NOT touched here — incompressibility is not a link-speed signal).
     if (cbuf.len() as f64) >= (n as f64 * 0.95) {
-        let mut s = state.lock().unwrap();
-        s.cz_ratio = ratio;
-        if s.level > LEVEL_MIN {
-            s.level -= 1;
-        }
-        drop(s);
-        return send_raw_chunk(conn, data, stats);
+        send_raw_chunk(conn, data, stats)?;
+        state.lock().unwrap().note_incompressible();
+        return Ok(());
     }
 
     let t1 = Instant::now();
@@ -133,9 +132,7 @@ fn send_chunk_adaptive<S: Read + Write>(
     let tw = t1.elapsed().as_secs_f64();
     stats.wire += cbuf.len() as u64;
     // Re-pick the level from the windowed aggregate (per-block tw is buffer-distorted).
-    let mut s = state.lock().unwrap();
-    s.cz_ratio = ratio;
-    s.record(tc, tw, n, cbuf.len());
+    state.lock().unwrap().note_compressed(tc, tw, n, cbuf.len());
     Ok(())
 }
 
@@ -190,14 +187,11 @@ fn send_bundle<S: Read + Write>(
             .extension()
             .map(|e| format!(".{}", e.to_string_lossy()))
             .unwrap_or_default();
-        if use_compress && rlen >= 256 && !is_incompressible(&ext) {
+        if use_compress && rlen >= MIN_COMPRESS && !is_incompressible(&ext) {
             send_chunk_adaptive(conn, &data, state, stats)?;
         } else {
-            // too small / already-compressed / compression off: raw, no A/B accounting
-            conn.put_line(&format!("R {rlen}"));
-            conn.put_bytes(&data);
-            conn.flush()?; // ensure the header line is flushed even for empty files
-            stats.wire += rlen as u64;
+            // too small / already-compressed / compression off: send raw
+            send_raw_chunk(conn, &data, stats)?;
         }
         stats.sent += 1;
         stats.bytes += rlen as u64;
@@ -226,7 +220,7 @@ fn send_large_file<S: Read + Write>(
     if offset > 0 {
         file.seek(SeekFrom::Start(offset as u64))?;
     }
-    let zip = use_compress && remain >= 256 && !is_incompressible(ext);
+    let zip = use_compress && remain >= MIN_COMPRESS as i64 && !is_incompressible(ext);
     if !zip {
         conn.put_line(&format!("R {remain}"));
         // stream in 1 MiB chunks with mid-file progress (so one big file isn't silent)
