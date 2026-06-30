@@ -39,12 +39,6 @@ struct ServeArgs {
     /// Disable adaptive compression.
     #[arg(long)]
     no_compress: bool,
-    /// Deflate level: `auto` (default, adapts to the link) or a fixed `1`..`9`.
-    #[arg(long)]
-    compress_level: Option<String>,
-    /// Worker threads per stream for large-file compression (default 1).
-    #[arg(long)]
-    compress_threads: Option<usize>,
     /// Parallel handler streams (1 = classic SYNC; >1 = parallel QSYNC). Default 4.
     #[arg(long)]
     streams: Option<i32>,
@@ -235,21 +229,6 @@ fn cmd_serve(a: ServeArgs) -> Result<(), BoxError> {
     let no_firewall = a.no_firewall || cfg.no_firewall.unwrap_or(false);
     let mut streams = a.streams.or(cfg.streams).unwrap_or(4);
     let use_compress = !a.no_compress && cfg.compress.unwrap_or(true);
-    // Compression level: CLI ("auto" | 1..9) overrides config; absent -> config; None = auto.
-    let compress_level: Option<u32> = match a.compress_level.as_deref() {
-        None => cfg.compress_level,
-        Some(s) if s.eq_ignore_ascii_case("auto") => None,
-        Some(s) => {
-            let n: u32 = s
-                .parse()
-                .map_err(|_| format!("--compress-level must be 'auto' or 1-9, got '{s}'"))?;
-            if !(1..=9).contains(&n) {
-                return Err(format!("--compress-level must be 'auto' or 1-9, got '{s}'").into());
-            }
-            Some(n)
-        }
-    };
-    let compress_threads = a.compress_threads.or(cfg.compress_threads).unwrap_or(1).max(1);
 
     if cutover {
         once = true;
@@ -285,8 +264,6 @@ fn cmd_serve(a: ServeArgs) -> Result<(), BoxError> {
         once,
         cutover,
         use_compress,
-        compress_level,
-        compress_threads,
         ignore_spec,
         allow_ip: allow_ip.clone(),
     };

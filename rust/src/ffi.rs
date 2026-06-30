@@ -140,8 +140,6 @@ pub unsafe extern "C" fn ft_serve_start(
         once: once != 0,
         cutover: false,
         use_compress: no_compress == 0,
-        compress_level: None, // auto
-        compress_threads: 1,
         ignore_spec,
         allow_ip: None,
     };

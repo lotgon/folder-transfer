@@ -14,22 +14,12 @@ use flate2::Compression;
 pub const BLOCK_SIZE: usize = 1 << 20;
 /// Re-probe the other mode every this many blocks.
 pub const REPROBE: i32 = 64;
-/// Default starting deflate level when the level is "auto" (climbs/falls from here).
-pub const START_LEVEL: u32 = 1;
-
-/// Compress with raw deflate at the given level (1 = fastest .. 9 = best); the
-/// level only affects ratio/CPU, the output is valid raw deflate at any level so
-/// the decoder needs no change.
-pub fn deflate_raw_level(data: &[u8], level: u32) -> Vec<u8> {
-    let lvl = Compression::new(level.clamp(1, 9));
-    let mut enc = DeflateEncoder::new(Vec::with_capacity(data.len() / 2 + 16), lvl);
-    enc.write_all(data).expect("write to Vec cannot fail");
-    enc.finish().expect("finish to Vec cannot fail")
-}
 
 /// Compress with raw deflate at a "fastest"-equivalent level (.NET CompressionLevel.Fastest).
 pub fn deflate_raw(data: &[u8]) -> Vec<u8> {
-    deflate_raw_level(data, 1)
+    let mut enc = DeflateEncoder::new(Vec::with_capacity(data.len() / 2 + 16), Compression::fast());
+    enc.write_all(data).expect("write to Vec cannot fail");
+    enc.finish().expect("finish to Vec cannot fail")
 }
 
 /// Inflate raw deflate into exactly `expected_len` bytes (best effort: returns
@@ -56,17 +46,9 @@ pub struct AdaptiveState {
     /// Raw mode: original bytes sent and seconds taken (write time only).
     pub cz_raw_bytes: i64,
     pub cz_raw_sec: f64,
-    /// Compressed mode: original bytes, with the two stage times kept SEPARATELY.
-    /// `send_large_file` pipelines deflate (CPU, worker thread) concurrently with the
-    /// socket write (main thread), so the effective compressed time is the slower
-    /// stage -- `max(deflate, write)` -- not their sum; hence two accumulators.
+    /// Compressed mode: original bytes and seconds (deflate + write).
     pub cz_cmp_bytes: i64,
-    pub cz_cmp_deflate_sec: f64,
-    pub cz_cmp_write_sec: f64,
-    /// Wire (compressed) bytes written, for the link-rate estimate.
-    pub cz_cmp_wire_bytes: i64,
-    /// Current adaptive deflate level (0 = not started -> use START_LEVEL).
-    pub cz_level: u32,
+    pub cz_cmp_sec: f64,
     /// Last block's ratio `rlen/clen` (`n / clen`).
     pub cz_ratio: f64,
     /// Blocks since the last re-probe.
@@ -82,12 +64,9 @@ impl AdaptiveState {
     /// `(do_compress, reprobe_now)`. Mirrors the decision in `Send-LargeFile`.
     pub fn decide(&self, n: usize) -> (bool, bool) {
         let have_r = self.cz_raw_sec > 0.0;
-        let have_c = self.cz_cmp_write_sec > 0.0;
+        let have_c = self.cz_cmp_sec > 0.0;
         let tr = if have_r { self.cz_raw_bytes as f64 / self.cz_raw_sec } else { 0.0 };
-        // Pipeline bottleneck: deflate overlaps the socket write, so the effective
-        // compressed time is the slower stage, not deflate + write.
-        let cmp_sec = self.cz_cmp_deflate_sec.max(self.cz_cmp_write_sec);
-        let tc = if cmp_sec > 0.0 { self.cz_cmp_bytes as f64 / cmp_sec } else { 0.0 };
+        let tc = if have_c { self.cz_cmp_bytes as f64 / self.cz_cmp_sec } else { 0.0 };
         let incomp = self.cz_ratio > 0.0 && self.cz_ratio < 1.05;
         if n < 256 {
             return (false, false);
@@ -104,34 +83,6 @@ impl AdaptiveState {
                 (decided, false)
             }
         }
-    }
-
-    /// The deflate level for the next block: the fixed override if set, else the
-    /// current auto level (clamped 1..=9).
-    pub fn level(&self, fixed: Option<u32>) -> u32 {
-        match fixed {
-            Some(l) => l.clamp(1, 9),
-            None if self.cz_level == 0 => START_LEVEL,
-            None => self.cz_level.clamp(1, 9),
-        }
-    }
-
-    /// Nudge the auto level after a compressed block: if deflate (spread over
-    /// `threads` workers) comfortably outpaces the socket write, compress harder;
-    /// if it can't keep up, compress lighter. Slow link -> climbs toward 9; fast
-    /// link -> falls toward 1. No-op semantics for the caller when a fixed level
-    /// is configured (the caller simply doesn't call this).
-    pub fn nudge_level(&mut self, tc: f64, tw: f64, threads: usize) {
-        let cur = if self.cz_level == 0 { START_LEVEL } else { self.cz_level };
-        let eff = tc / threads.max(1) as f64; // effective per-block deflate time with the pool
-        let next = if eff < tw * 0.5 && cur < 9 {
-            cur + 1
-        } else if eff > tw && cur > 1 {
-            cur - 1
-        } else {
-            cur
-        };
-        self.cz_level = next.clamp(1, 9);
     }
 }
 
@@ -155,8 +106,7 @@ mod tests {
         assert_eq!(st.decide(BLOCK_SIZE), (true, false));
         // Have a compressed sample, no raw yet -> seed raw.
         st.cz_cmp_bytes = 1000;
-        st.cz_cmp_deflate_sec = 0.0005;
-        st.cz_cmp_write_sec = 0.001;
+        st.cz_cmp_sec = 0.001;
         assert_eq!(st.decide(BLOCK_SIZE), (false, false));
         // Both samples; compressed much faster -> compress.
         st.cz_raw_bytes = 1000;
@@ -170,29 +120,12 @@ mod tests {
     fn decide_reprobe_flips() {
         let mut st = AdaptiveState::new();
         st.cz_cmp_bytes = 1000;
-        st.cz_cmp_write_sec = 0.001; // compressed fast
+        st.cz_cmp_sec = 0.001; // compressed fast
         st.cz_raw_bytes = 1000;
         st.cz_raw_sec = 1.0; // raw slow -> decided = compress
         st.cz_since = REPROBE; // time to re-probe
         let (do_comp, reprobe) = st.decide(BLOCK_SIZE);
         assert!(reprobe);
         assert!(!do_comp, "re-probe flips to the other (raw) mode");
-    }
-
-    #[test]
-    fn decide_uses_pipeline_bottleneck_not_sum() {
-        // deflate and write overlap, so effective compressed time is max(.,.),
-        // not the sum. With these numbers the OLD sum model would NOT compress,
-        // but the pipeline (max) model should.
-        let mut st = AdaptiveState::new();
-        st.cz_cmp_bytes = 1000;
-        st.cz_cmp_deflate_sec = 0.001; // CPU
-        st.cz_cmp_write_sec = 0.001; // network (overlaps the CPU)
-        st.cz_raw_bytes = 1000;
-        st.cz_raw_sec = 0.0015; // raw write throughput
-        // sum model:  Tc = 1000 / 0.002  = 500_000  < 1.25 * (1000/0.0015 = 666_666)
-        // max model:  Tc = 1000 / 0.001  = 1_000_000 >= 1.25 * 666_666 = 833_333
-        let (do_comp, _) = st.decide(BLOCK_SIZE);
-        assert!(do_comp, "pipeline (max) model should choose to compress here");
     }
 }

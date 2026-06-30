@@ -3,19 +3,18 @@
 //! per-block compression, honours ignore patterns, and supports two-phase cutover.
 //! The classic accept loop enforces idle and stall timeouts and `--once`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
-use crate::compress::{deflate_raw_level, AdaptiveState, BLOCK_SIZE};
+use crate::compress::{deflate_raw, AdaptiveState, BLOCK_SIZE};
 use crate::ignore::IgnoreSet;
 use crate::mtime;
 use crate::paths::is_incompressible;
@@ -76,16 +75,14 @@ fn read_block(f: &mut File, buf: &mut [u8]) -> io::Result<usize> {
 fn send_chunk_adaptive<S: Read + Write>(
     conn: &mut Conn<S>,
     data: &[u8],
-    compress_level: Option<u32>,
     adaptive: &mut AdaptiveState,
     stats: &mut SendStats,
 ) -> io::Result<()> {
     let n = data.len();
     let (do_comp, reprobe_now) = adaptive.decide(n);
     if do_comp {
-        let level = adaptive.level(compress_level);
         let t0 = Instant::now();
-        let cbuf = deflate_raw_level(data, level);
+        let cbuf = deflate_raw(data);
         let tc = t0.elapsed().as_secs_f64();
         adaptive.cz_ratio = n as f64 / cbuf.len().max(1) as f64;
         if (cbuf.len() as f64) < (n as f64 * 0.95) {
@@ -96,12 +93,7 @@ fn send_chunk_adaptive<S: Read + Write>(
             let tw = t1.elapsed().as_secs_f64();
             stats.wire += cbuf.len() as u64;
             adaptive.cz_cmp_bytes += n as i64;
-            adaptive.cz_cmp_deflate_sec += tc;
-            adaptive.cz_cmp_write_sec += tw;
-            adaptive.cz_cmp_wire_bytes += cbuf.len() as i64;
-            if compress_level.is_none() {
-                adaptive.nudge_level(tc, tw, 1); // bundle path is sequential -> 1 thread
-            }
+            adaptive.cz_cmp_sec += tc + tw;
         } else {
             // compression did not pay: send raw, record as a raw sample
             let t1 = Instant::now();
@@ -139,7 +131,6 @@ fn send_bundle<S: Read + Write>(
     bundle: &[BundleItem],
     stats: &mut SendStats,
     use_compress: bool,
-    compress_level: Option<u32>,
     adaptive: &mut AdaptiveState,
     prog: &Progress,
 ) -> io::Result<bool> {
@@ -184,7 +175,7 @@ fn send_bundle<S: Read + Write>(
             .map(|e| format!(".{}", e.to_string_lossy()))
             .unwrap_or_default();
         if use_compress && rlen >= 256 && !is_incompressible(&ext) {
-            send_chunk_adaptive(conn, &data, compress_level, adaptive, stats)?;
+            send_chunk_adaptive(conn, &data, adaptive, stats)?;
         } else {
             // too small / already-compressed / compression off: raw, no A/B accounting
             conn.put_line(&format!("R {rlen}"));
@@ -199,39 +190,7 @@ fn send_bundle<S: Read + Write>(
     Ok(true)
 }
 
-/// A block handed to a compressor worker.
-struct Job {
-    seq: u64,
-    data: Vec<u8>,
-    n: usize,
-    do_comp: bool,
-    level: u32,
-}
-/// A framed block produced by a worker, written to the socket in `seq` order.
-struct Out {
-    seq: u64,
-    header: String,
-    payload: Vec<u8>,
-    n: usize,
-    tc: f64,        // deflate time (0 for raw)
-    compressed: bool,
-    ratio: f64,     // n/clen when compression was attempted, else 0
-}
-/// Write-time + result fed back to the reader so the A/B decision and the auto
-/// level keep measuring real throughput.
-struct Fb {
-    compressed: bool,
-    n: usize,
-    tc: f64,
-    tw: f64,
-    clen: usize,
-    ratio: f64,
-}
-
 /// Send one already-opened large file: raw (`R <bytes>`) or adaptive (`Z` ... `E`).
-/// The adaptive path runs a reader (owns the A/B + level decision) -> a pool of
-/// `compress_threads` deflate workers -> an in-order socket writer, so compression
-/// overlaps the network send and can use several cores.
 #[allow(clippy::too_many_arguments)]
 fn send_large_file<S: Read + Write>(
     conn: &mut Conn<S>,
@@ -240,8 +199,6 @@ fn send_large_file<S: Read + Write>(
     ext: &str,
     stats: &mut SendStats,
     use_compress: bool,
-    compress_level: Option<u32>,
-    compress_threads: usize,
     adaptive: &mut AdaptiveState,
     prog: &Progress,
 ) -> io::Result<()> {
@@ -274,128 +231,16 @@ fn send_large_file<S: Read + Write>(
         }
     } else {
         conn.send_line("Z")?;
-        let nthreads = compress_threads.max(1);
-        // reader (A/B + level decision) -> pool of `nthreads` deflate workers -> in-order writer.
-        std::thread::scope(|scope| -> io::Result<()> {
-            let (jobtx, jobrx) = sync_channel::<Job>(nthreads * 2);
-            let jobrx = Arc::new(Mutex::new(jobrx));
-            let (restx, resrx) = channel::<Out>();
-            let (fbtx, fbrx) = channel::<Fb>();
-
-            // Reader: owns the per-connection state, reads the file in order, decides.
-            let reader = scope.spawn(move || -> io::Result<()> {
-                let mut buf = vec![0u8; BLOCK_SIZE];
-                let mut seq = 0u64;
-                loop {
-                    while let Ok(fb) = fbrx.try_recv() {
-                        if fb.compressed {
-                            adaptive.cz_cmp_bytes += fb.n as i64;
-                            adaptive.cz_cmp_deflate_sec += fb.tc;
-                            adaptive.cz_cmp_write_sec += fb.tw;
-                            adaptive.cz_cmp_wire_bytes += fb.clen as i64;
-                            if compress_level.is_none() {
-                                adaptive.nudge_level(fb.tc, fb.tw, nthreads);
-                            }
-                        } else {
-                            adaptive.cz_raw_bytes += fb.n as i64;
-                            adaptive.cz_raw_sec += fb.tw;
-                        }
-                        if fb.ratio > 0.0 {
-                            adaptive.cz_ratio = fb.ratio;
-                        }
-                    }
-                    let n = read_block(file, &mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    let (do_comp, reprobe_now) = adaptive.decide(n);
-                    let level = adaptive.level(compress_level);
-                    if reprobe_now {
-                        adaptive.cz_since = 0;
-                    } else {
-                        adaptive.cz_since += 1;
-                    }
-                    if jobtx.send(Job { seq, data: buf[..n].to_vec(), n, do_comp, level }).is_err() {
-                        break; // workers gone
-                    }
-                    seq += 1;
-                }
-                Ok(())
-            });
-
-            // Compressor pool: pull jobs, deflate (or pass raw), emit framed blocks.
-            let mut workers = Vec::with_capacity(nthreads);
-            for _ in 0..nthreads {
-                let jobrx = Arc::clone(&jobrx);
-                let restx = restx.clone();
-                workers.push(scope.spawn(move || {
-                    loop {
-                        let job = {
-                            let g = jobrx.lock().unwrap();
-                            g.recv()
-                        };
-                        let job = match job {
-                            Ok(j) => j,
-                            Err(_) => break,
-                        };
-                        let out = if job.do_comp {
-                            let t0 = Instant::now();
-                            let cbuf = deflate_raw_level(&job.data, job.level);
-                            let tc = t0.elapsed().as_secs_f64();
-                            let ratio = job.n as f64 / cbuf.len().max(1) as f64;
-                            if (cbuf.len() as f64) < (job.n as f64 * 0.95) {
-                                Out { seq: job.seq, header: format!("Z {} {}", cbuf.len(), job.n), payload: cbuf, n: job.n, tc, compressed: true, ratio }
-                            } else {
-                                Out { seq: job.seq, header: format!("R {}", job.n), payload: job.data, n: job.n, tc: 0.0, compressed: false, ratio }
-                            }
-                        } else {
-                            Out { seq: job.seq, header: format!("R {}", job.n), payload: job.data, n: job.n, tc: 0.0, compressed: false, ratio: 0.0 }
-                        };
-                        if restx.send(out).is_err() {
-                            break; // writer gone
-                        }
-                    }
-                }));
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        loop {
+            let n = read_block(file, &mut buf)?;
+            if n == 0 {
+                break;
             }
-            drop(jobrx); // only the workers keep the job receiver alive
-            drop(restx); // only the workers keep result senders alive
-
-            // Writer (this thread): flush blocks strictly in `seq` order.
-            let mut next = 0u64;
-            let mut pending: HashMap<u64, Out> = HashMap::new();
-            let mut werr: io::Result<()> = Ok(());
-            'recv: for out in resrx {
-                pending.insert(out.seq, out);
-                while let Some(o) = pending.remove(&next) {
-                    let t1 = Instant::now();
-                    conn.put_line(&o.header);
-                    conn.put_bytes(&o.payload);
-                    if let Err(e) = conn.flush() {
-                        werr = Err(e);
-                        break 'recv;
-                    }
-                    let tw = t1.elapsed().as_secs_f64();
-                    stats.wire += o.payload.len() as u64;
-                    stats.bytes += o.n as u64;
-                    prog.add(o.n as u64, 0);
-                    let _ = fbtx.send(Fb {
-                        compressed: o.compressed,
-                        n: o.n,
-                        tc: o.tc,
-                        tw,
-                        clen: o.payload.len(),
-                        ratio: o.ratio,
-                    });
-                    next += 1;
-                }
-            }
-            drop(fbtx);
-            for w in workers {
-                let _ = w.join();
-            }
-            reader.join().map_err(|_| io::Error::other("reader thread panicked"))??;
-            werr
-        })?;
+            send_chunk_adaptive(conn, &buf[..n], adaptive, stats)?;
+            stats.bytes += n as u64;
+            prog.add(n as u64, 0);
+        }
         conn.send_line("E")?;
     }
     stats.sent += 1;
@@ -404,14 +249,11 @@ fn send_large_file<S: Read + Write>(
 }
 
 /// One lazy walk of each shared folder. Returns `false` if the client dropped.
-#[allow(clippy::too_many_arguments)]
 fn send_pass<S: Read + Write>(
     conn: &mut Conn<S>,
     roots: &[PathBuf],
     ignore: &IgnoreSet,
     use_compress: bool,
-    compress_level: Option<u32>,
-    compress_threads: usize,
 ) -> io::Result<(bool, SendStats)> {
     let mut stats = SendStats::default();
     conn.send_line("T 0")?; // no up-front count
@@ -471,7 +313,7 @@ fn send_pass<S: Read + Write>(
                     bundle.push(BundleItem { full: full.clone(), rel, size, mtime: mt });
                     bundle_bytes += size;
                     if bundle_bytes >= BUNDLE_BYTES || bundle.len() >= BUNDLE_MAX_COUNT {
-                        if !send_bundle(conn, &bundle, &mut stats, use_compress, compress_level, &mut adaptive, &prog)? {
+                        if !send_bundle(conn, &bundle, &mut stats, use_compress, &mut adaptive, &prog)? {
                             return Ok((false, stats));
                         }
                         bundle.clear();
@@ -481,7 +323,7 @@ fn send_pass<S: Read + Write>(
                 }
                 // large file: flush any pending bundle, then offer it on its own
                 if !bundle.is_empty() {
-                    if !send_bundle(conn, &bundle, &mut stats, use_compress, compress_level, &mut adaptive, &prog)? {
+                    if !send_bundle(conn, &bundle, &mut stats, use_compress, &mut adaptive, &prog)? {
                         return Ok((false, stats));
                     }
                     bundle.clear();
@@ -511,11 +353,11 @@ fn send_pass<S: Read + Write>(
                     .extension()
                     .map(|e| format!(".{}", e.to_string_lossy()))
                     .unwrap_or_default();
-                send_large_file(conn, &mut f, offset, &ext, &mut stats, use_compress, compress_level, compress_threads, &mut adaptive, &prog)?;
+                send_large_file(conn, &mut f, offset, &ext, &mut stats, use_compress, &mut adaptive, &prog)?;
             }
         }
     }
-    if !bundle.is_empty() && !send_bundle(conn, &bundle, &mut stats, use_compress, compress_level, &mut adaptive, &prog)? {
+    if !bundle.is_empty() && !send_bundle(conn, &bundle, &mut stats, use_compress, &mut adaptive, &prog)? {
         return Ok((false, stats));
     }
     Ok((true, stats))
@@ -564,10 +406,6 @@ pub struct ServeConfig {
     pub once: bool,
     pub cutover: bool,
     pub use_compress: bool,
-    /// Deflate level for compressed blocks: `None` = auto (adapt to the link), `Some(1..=9)` = fixed.
-    pub compress_level: Option<u32>,
-    /// Worker threads per stream for the large-file compression pipeline.
-    pub compress_threads: usize,
     pub ignore_spec: String,
     /// Serve only this source IP (application-layer gate, independent of the firewall).
     pub allow_ip: Option<String>,
@@ -695,7 +533,7 @@ fn handle_session(
             Some(cmd) if cmd == "SYNC" => {
                 eprintln!("[ft] sync pass 1");
                 let t1 = Instant::now();
-                let (ok1, s1) = send_pass(&mut c, roots, ignore, cfg.use_compress, cfg.compress_level, cfg.compress_threads)?;
+                let (ok1, s1) = send_pass(&mut c, roots, ignore, cfg.use_compress)?;
                 if !ok1 {
                     eprintln!("[ft] client dropped during pass 1");
                     break;
@@ -711,7 +549,7 @@ fn handle_session(
                     c.send_line("GO")?;
                     eprintln!("[ft] sync pass 2 (final)");
                     let t2 = Instant::now();
-                    let (ok2, s2) = send_pass(&mut c, roots, ignore, cfg.use_compress, cfg.compress_level, cfg.compress_threads)?;
+                    let (ok2, s2) = send_pass(&mut c, roots, ignore, cfg.use_compress)?;
                     if !ok2 {
                         eprintln!("[ft] client dropped during pass 2");
                         break;
@@ -856,8 +694,6 @@ fn parallel_handler(
     queue: Arc<WorkQueue>,
     done: Arc<AtomicBool>,
     use_compress: bool,
-    compress_level: Option<u32>,
-    compress_threads: usize,
     stall: u64,
     allow_ip: Option<String>,
     streams: i32,
@@ -921,7 +757,7 @@ fn parallel_handler(
             match unit {
                 Unit::Dir(rel) => c.send_line(&format!("D {rel}"))?,
                 Unit::Bundle(items) => {
-                    if !send_bundle(&mut c, &items, &mut stats, use_compress, compress_level, &mut adaptive, &prog)? {
+                    if !send_bundle(&mut c, &items, &mut stats, use_compress, &mut adaptive, &prog)? {
                         return Ok(()); // client dropped
                     }
                 }
@@ -950,7 +786,7 @@ fn parallel_handler(
                         .extension()
                         .map(|e| format!(".{}", e.to_string_lossy()))
                         .unwrap_or_default();
-                    send_large_file(&mut c, &mut f, offset, &ext, &mut stats, use_compress, compress_level, compress_threads, &mut adaptive, &prog)?;
+                    send_large_file(&mut c, &mut f, offset, &ext, &mut stats, use_compress, &mut adaptive, &prog)?;
                 }
             }
         }
@@ -1006,14 +842,12 @@ pub fn run_serve_parallel(cfg: ServeConfig, identity: &ServerIdentity, token: &s
                 let queue = queue.clone();
                 let done = done.clone();
                 let use_compress = cfg.use_compress;
-                let compress_level = cfg.compress_level;
-                let compress_threads = cfg.compress_threads;
                 let stall = cfg.stall_timeout;
                 let allow_ip = cfg.allow_ip.clone();
                 let ignore_spec = cfg.ignore_spec.clone();
                 let prog = prog.clone();
                 handles.push(std::thread::spawn(move || {
-                    parallel_handler(tcp, config, token, queue, done, use_compress, compress_level, compress_threads, stall, allow_ip, streams, ignore_spec, prog);
+                    parallel_handler(tcp, config, token, queue, done, use_compress, stall, allow_ip, streams, ignore_spec, prog);
                 }));
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

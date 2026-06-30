@@ -77,10 +77,6 @@ pub struct ServeFileConfig {
     pub no_firewall: Option<bool>,
     pub streams: Option<i32>,
     pub compress: Option<bool>,
-    /// Deflate level 1..=9; omit for "auto" (adapt to the link).
-    pub compress_level: Option<u32>,
-    /// Worker threads per stream for large-file compression.
-    pub compress_threads: Option<usize>,
 }
 
 impl ServeFileConfig {

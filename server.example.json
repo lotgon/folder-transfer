@@ -31,8 +31,6 @@
 
   "streams": 4,                // parallel connections - big speed-up on high-latency links (1 = classic single-stream)
   "compress": true,            // adaptive compression on the fly (already-compressed types are skipped); false to disable
-  // "compressLevel": 6,       // fixed deflate level 1..9; OMIT for "auto" (slow link -> compress harder, fast link -> lighter)
-  "compressThreads": 1,        // worker threads per stream for large-file compression (raise to use more cores; helps streams:1 / cutover)
   "once": true,                // exit after one successful transfer
   "cutover": false,            // true = two-phase mode for a LIVE database (implies once; forces streams:1)
 
