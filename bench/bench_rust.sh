@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # Rust benchmark: reproduces bench.ps1's matrix for the Rust `ft` binary.
-# Same corpora, same channels (20/100/200 Mbit at 0/150ms via a Python WAN proxy),
+# Same corpora, same channels (20/100/200 Mbit at 0/150ms via a Rust WAN proxy),
 # same metric (efficiency = goodput / channel capacity). Run on an idle machine.
+#
+# The WAN proxy is the Rust `wanproxy` example (NOT the old Python proxy.py): the
+# Python proxy is GIL-bound and under-delivers at high rate x many streams, skewing
+# the fast-link cells; the Rust one stays accurate. proxy.py is kept only for the
+# PowerShell bench (bench.ps1).
 set -u
 REPO="C:/project/github/folder-transfer"
 FT="$REPO/rust/target/release/ft.exe"
-PROXY="$REPO/bench/proxy.py"
+WANPROXY="$REPO/rust/target/release/examples/wanproxy.exe"
 ROOT="C:/ft-bench-rust"
 CONN="$ROOT/conn.json"; DST="$ROOT/dst"
 PY=python
 rm -rf "$ROOT"; mkdir -p "$ROOT"
+
+echo "Building the WAN proxy (cargo example) ..."
+( cd "$REPO/rust" && cargo build --release --example wanproxy >/dev/null 2>&1 ) || { echo "wanproxy build failed"; exit 1; }
 
 echo "Building corpora under $ROOT ..."
 RATIO=$("$PY" "$REPO/bench/build_corpora.py" "$ROOT" | sed -n 's/^RATIO=//p')
@@ -28,7 +36,7 @@ run_cell() { # corpus streams delay_ms rate_mbps
   for _ in $(seq 1 400000); do [ -f "$CONN" ] && grep -q '"token"' "$CONN" 2>/dev/null && break; done
   local connport=$sp PXY=""
   if [ "$delay" -gt 0 ] || [ "$(awk "BEGIN{print ($rate>0)}")" = 1 ]; then
-    "$PY" "$PROXY" --listen "$pp" --target-port "$sp" --delay-ms "$delay" --rate-mbps "$rate" > "$po" 2>&1 &
+    "$WANPROXY" --listen "$pp" --target-port "$sp" --delay-ms "$delay" --rate-mbps "$rate" > "$po" 2>&1 &
     PXY=$!
     for _ in $(seq 1 400000); do grep -q '^proxy ' "$po" 2>/dev/null && break; done
     connport=$pp

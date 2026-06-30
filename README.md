@@ -211,18 +211,18 @@ carried. Defaults (4 parallel streams + adaptive), over an emulated WAN at 0 ms 
 
 | data type | 20 Mbit | 20 Mbit +150ms | 100 Mbit | 100 Mbit +150ms | 200 Mbit | 200 Mbit +150ms |
 |---|---|---|---|---|---|---|
-| small files (10000 × 4 KB) — *disk‑bound* | 96% | 96% | 85% | 83% | 55% | 50% |
-| large, incompressible (4 MB, random) | 100% | 96% | **98%** | **96%** | **98%** | **96%** |
-| large, compressible (4 MB, text) | 428% | 384% | 457% | 400% | 444% | 234% |
+| small files (10000 × 4 KB) — *disk‑bound* | 100% | 96% | 64% | 65% | 57% | 48% |
+| large, incompressible (4 MB, random) | 100% | 100% | **99%** | **98%** | **100%** | **98%** |
+| large, compressible (4 MB, text) | 452% | 428% | 430% | 441% | 460% | 406% |
 
 - **Latency barely matters.** A fresh fetch streams every file without a per‑file round‑trip, so the
-  `+150 ms` columns sit right next to the `0 ms` ones (small files 85→83%, incompressible 98→96%) —
+  `+150 ms` columns sit right next to the `0 ms` ones (compressible 460→406%, incompressible 100→98%) —
   exactly what you want on a high‑latency WAN.
 - **Small files** are limited by **file creation on the receiver’s disk** (filesystem metadata +
-  antivirus), *not* the link. That’s why the % falls on faster links — e.g. **55% at 200 Mbit** isn’t
+  antivirus), *not* the link. That’s why the % falls on faster links — e.g. **57% at 200 Mbit** isn’t
   `ft` being slow, it’s the disk: the link simply isn’t the bottleneck. (On Linux/ext4 with no
   real‑time AV, the same files fly — see [BENCHMARKS-rust.md](BENCHMARKS-rust.md).)
-- **Incompressible** large files saturate the link at every speed and ping (96–100%).
+- **Incompressible** large files saturate the link at every speed and ping (98–100%).
 - **Compressible** data goes far above 100% — fewer bytes on the wire, more original data per second.
 - **Adaptive compression** decides all of this for you — automatically (see below).
 
@@ -238,9 +238,9 @@ entirely with `--no-compress`.)
 
 | data type | single‑stream | 4 streams |
 |---|---|---|
-| small files (10000 × 4 KB) | 6.6 MB/s | 12.9 MB/s |
-| large, incompressible | ~650 MB/s | ~930 MB/s |
-| large, compressible | ~345 MB/s | ~830 MB/s |
+| small files (10000 × 4 KB) | ~3.5 MB/s | ~10 MB/s |
+| large, incompressible | ~475 MB/s | ~885 MB/s |
+| large, compressible | ~440 MB/s | ~950 MB/s |
 
 Small files are NTFS+Defender bound (on Linux/ext4, with no real‑time AV, they’re ~15× faster).
 Full method, machine specs and cross‑OS (Windows ↔ Ubuntu) results:
