@@ -12,7 +12,7 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
-## [0.18.0] — 2026-06-30
+## [0.18.0] — 2026-07-01
 
 ### Performance (Rust `ft`)
 - **Switched the compressor from deflate to zstd** (vendored libzstd, **statically linked** — the
