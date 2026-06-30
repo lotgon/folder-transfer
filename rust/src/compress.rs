@@ -39,6 +39,18 @@ pub fn inflate_raw(data: &[u8], expected_len: usize) -> std::io::Result<Vec<u8>>
     Ok(out)
 }
 
+/// Compress one block with LZ4 (raw block format; the caller stores the original
+/// length out-of-band, like the `Z <clen> <rlen>` frame).
+pub fn lz4_compress(data: &[u8]) -> Vec<u8> {
+    lz4_flex::block::compress(data)
+}
+
+/// Decompress an LZ4 raw block into exactly `expected_len` bytes.
+pub fn lz4_decompress(data: &[u8], expected_len: usize) -> std::io::Result<Vec<u8>> {
+    lz4_flex::block::decompress(data, expected_len)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Per-connection adaptive-compression measurements. Persist across files in a
 /// single connection (`Send-LargeFile` in ft-server.ps1). See spec section 6.6.
 #[derive(Default)]
@@ -97,6 +109,20 @@ mod tests {
         assert!(c.len() < data.len(), "should compress repetitive data");
         let d = inflate_raw(&c, data.len()).unwrap();
         assert_eq!(d, data);
+    }
+
+    #[test]
+    fn lz4_round_trip() {
+        let data = b"the quick brown fox jumps over the lazy dog ".repeat(500);
+        let c = lz4_compress(&data);
+        assert!(c.len() < data.len(), "lz4 should compress repetitive data");
+        let d = lz4_decompress(&c, data.len()).unwrap();
+        assert_eq!(d, data);
+        // empty + tiny round-trip (edge cases the bundle path will hit)
+        for s in [&b""[..], &b"x"[..]] {
+            let c = lz4_compress(s);
+            assert_eq!(lz4_decompress(&c, s.len()).unwrap(), s);
+        }
     }
 
     #[test]
