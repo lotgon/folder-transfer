@@ -21,18 +21,27 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - **Adaptive compression level by link speed.** A per-connection controller picks the highest zstd
   level whose compression stays at least `--compress-margin`× the link speed (default **1.6**), so a
   slow link compresses harder (more ratio → fewer bytes) and a fast link compresses lighter (down to
-  zstd's ultra-fast negative levels, or raw if even those lose). The link rate is measured over a
-  window of wire bytes (per-block write time is meaningless — it's absorbed by the socket buffer).
-  Incompressible data is detected and sent raw (no expansion).
+  zstd's ultra-fast negative levels, or raw if even those lose). The link rate is measured over each
+  window's **wall-clock** (buffer-immune; per-block write time is not — a flush returns into the socket
+  buffer instantly). Incompressible data is detected and sent raw (no expansion).
 - **One shared level controller across all parallel streams.** Pooling every stream's measurements
   converges the level quickly; with the default 4 streams a single per-stream controller saw too
   little data to adapt. Measured: streams=4 over a 30 Mbit link climbs to ~level 10 (~9× on logs).
 - Configurable via `--compress-margin <x>` (JSON `compressMargin`). Removed the deflate code and the
   `flate2` dependency.
-- **Fixed the adaptive level on fast links.** The level decision compared compress time to write time
-  but dropped the compression-ratio factor, so a fast-but-compressible link mis-read its headroom and
-  collapsed to the ultra-fast floor (~1.5×). The ratio is now included; a 200 Mbit link with
-  compressible text climbs to a real level — measured efficiency went from ~150% to ~430%.
+- **Buffer-immune level signal (stops the level oscillating).** The level decision now uses the
+  window's wall-clock to judge how far compression out-paces the link (`spare`), instead of summed
+  per-block write time. Per-block write time is distorted by the socket send buffer — `--debug` logs
+  showed it swinging the level wildly (3→14) and overshooting into a state where the compressor
+  starved the link. The wall-clock signal is stable, so the level settles cleanly at the
+  margin-correct point. Trade-off: on a >1 GB/s link / loopback the controller now compresses to match
+  the *receiver's* rate even when raw memcpy would be faster there (it can't see the raw
+  counterfactual); on any real WAN link this is a clear win, and `--no-compress` covers the fast-LAN
+  edge. A 200 Mbit link with compressible text went from ~150% to ~460% efficiency over the 0.17 line.
+- **`--debug` mode.** Logs important decisions — chiefly every adaptive-level change (new level, the
+  `spare` and measured link rate, the realized ratio) and raw-mode toggles — to stderr **and** a debug
+  log file (`ft-debug.log`, or `--debug-log <path>`), so you can watch what the controller does and
+  share the log. Off by default; one atomic check when off.
 - **Latency: a fresh fetch no longer pays a round-trip per bundle / per large file.** When the
   destination is empty, the parallel client requests *stream mode* (`QSYNC STREAM`): the server sends
   every file at offset 0 without waiting for a per-bundle want-mask or a per-file offset reply (both

@@ -152,14 +152,13 @@ fn send_chunk_adaptive<S: Read + Write>(
         return Ok(());
     }
 
-    let t1 = Instant::now();
     conn.put_line(&format!("Z {} {}", cbuf.len(), n));
     conn.put_bytes(&cbuf);
     conn.flush()?;
-    let tw = t1.elapsed().as_secs_f64();
     stats.wire += cbuf.len() as u64;
-    // Re-pick the level from the windowed aggregate (per-block tw is buffer-distorted).
-    state.lock().unwrap().note_compressed(tc, tw, n, cbuf.len());
+    // Re-pick the level from the windowed aggregate (the controller times the window's
+    // wall-clock itself; per-block write time would be buffer-distorted).
+    state.lock().unwrap().note_compressed(tc, n, cbuf.len());
     Ok(())
 }
 
@@ -310,7 +309,7 @@ fn send_pass<S: Read + Write>(
 ) -> io::Result<(bool, SendStats)> {
     let mut stats = SendStats::default();
     conn.send_line("T 0")?; // no up-front count
-    let state = Mutex::new(AdaptiveState::new(margin));
+    let state = Mutex::new(AdaptiveState::new(margin, 1));
     let prog = Progress::new("[ft serve]");
     let mut bundle: Vec<BundleItem> = Vec::new();
     let mut bundle_bytes: u64 = 0;
@@ -895,7 +894,7 @@ pub fn run_serve_parallel(cfg: ServeConfig, identity: &ServerIdentity, token: &s
     // One shared adaptive-level controller across ALL streams: pooling every
     // stream's measurements converges the level fast (a single stream sees too
     // little data in parallel mode) and keeps all streams at one consistent level.
-    let state = Arc::new(Mutex::new(AdaptiveState::new(cfg.compress_margin)));
+    let state = Arc::new(Mutex::new(AdaptiveState::new(cfg.compress_margin, streams)));
 
     // Accept loop with the parallel shutdown rules.
     let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();

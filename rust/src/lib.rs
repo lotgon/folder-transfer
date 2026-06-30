@@ -8,6 +8,7 @@
 pub mod client;
 pub mod compress;
 pub mod config;
+pub mod debug;
 pub mod ffi;
 pub mod firewall;
 pub mod ignore;
