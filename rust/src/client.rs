@@ -17,7 +17,7 @@ const CLIENT_READ_TIMEOUT_SECS: u64 = 90;
 
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
-use crate::compress::inflate_raw;
+use crate::compress::zstd_decompress;
 use crate::mtime;
 use crate::paths::{norm_key, safe_join, top_segment};
 use crate::progress::Progress;
@@ -206,7 +206,7 @@ fn handle_bundle<S: Read + Write>(
             let clen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
             let rlen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
             let cbuf = conn.read_exact_vec(clen)?;
-            let obuf = inflate_raw(&cbuf, rlen)?;
+            let obuf = zstd_decompress(&cbuf, rlen)?;
             f.write_all(&obuf)?;
             obuf.len() as u64
         } else {
@@ -281,7 +281,7 @@ fn handle_large<S: Read + Write>(
                 let clen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
                 let rlen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
                 let cbuf = conn.read_exact_vec(clen)?;
-                let obuf = inflate_raw(&cbuf, rlen)?;
+                let obuf = zstd_decompress(&cbuf, rlen)?;
                 f.write_all(&obuf)?;
                 stats.bytes += obuf.len() as u64;
                 prog.add(obuf.len() as u64, 0);

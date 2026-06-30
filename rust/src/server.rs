@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
-use crate::compress::{deflate_raw, AdaptiveState, BLOCK_SIZE};
+use crate::compress::{zstd_compress, AdaptiveState, BLOCK_SIZE, LEVEL_MIN, RAW_REPROBE};
 use crate::ignore::IgnoreSet;
 use crate::mtime;
 use crate::paths::is_incompressible;
@@ -68,10 +68,20 @@ fn read_block(f: &mut File, buf: &mut [u8]) -> io::Result<usize> {
     Ok(off)
 }
 
-/// Send one chunk of `data` with an adaptive raw/compressed decision, framed as
-/// `Z <clen> <rlen>` (deflate) or `R <rlen>` (raw) followed by the bytes. Updates
-/// `adaptive` (per-connection A/B throughput) and `stats.wire`. Shared by the
-/// bundle path (one chunk per small file) and the large-file path (one per block).
+/// Send raw helper: `R <n>` + bytes.
+fn send_raw_chunk<S: Read + Write>(conn: &mut Conn<S>, data: &[u8], stats: &mut SendStats) -> io::Result<()> {
+    conn.put_line(&format!("R {}", data.len()));
+    conn.put_bytes(data);
+    conn.flush()?;
+    stats.wire += data.len() as u64;
+    Ok(())
+}
+
+/// Send one chunk of `data`, framed as `Z <clen> <rlen>` (zstd at the adaptive
+/// level) or `R <rlen>` (raw) followed by the bytes. The level controller keeps
+/// compression >= SPEED_MARGIN x the link; if even the floor level loses to raw
+/// (a very fast link), it switches to raw and re-probes periodically. Shared by
+/// the bundle path (one chunk per small file) and the large-file path (per block).
 fn send_chunk_adaptive<S: Read + Write>(
     conn: &mut Conn<S>,
     data: &[u8],
@@ -79,47 +89,37 @@ fn send_chunk_adaptive<S: Read + Write>(
     stats: &mut SendStats,
 ) -> io::Result<()> {
     let n = data.len();
-    let (do_comp, reprobe_now) = adaptive.decide(n);
-    if do_comp {
-        let t0 = Instant::now();
-        let cbuf = deflate_raw(data);
-        let tc = t0.elapsed().as_secs_f64();
-        adaptive.cz_ratio = n as f64 / cbuf.len().max(1) as f64;
-        if (cbuf.len() as f64) < (n as f64 * 0.95) {
-            let t1 = Instant::now();
-            conn.put_line(&format!("Z {} {}", cbuf.len(), n));
-            conn.put_bytes(&cbuf);
-            conn.flush()?;
-            let tw = t1.elapsed().as_secs_f64();
-            stats.wire += cbuf.len() as u64;
-            adaptive.cz_cmp_bytes += n as i64;
-            adaptive.cz_cmp_sec += tc + tw;
-        } else {
-            // compression did not pay: send raw, record as a raw sample
-            let t1 = Instant::now();
-            conn.put_line(&format!("R {n}"));
-            conn.put_bytes(data);
-            conn.flush()?;
-            let tw = t1.elapsed().as_secs_f64();
-            stats.wire += n as u64;
-            adaptive.cz_raw_bytes += n as i64;
-            adaptive.cz_raw_sec += tw;
+
+    // Fast-link raw mode: send raw, but re-probe compression every RAW_REPROBE chunks.
+    if adaptive.prefer_raw {
+        adaptive.raw_since += 1;
+        if adaptive.raw_since >= RAW_REPROBE {
+            adaptive.prefer_raw = false;
         }
-    } else {
-        let t1 = Instant::now();
-        conn.put_line(&format!("R {n}"));
-        conn.put_bytes(data);
-        conn.flush()?;
-        let tw = t1.elapsed().as_secs_f64();
-        stats.wire += n as u64;
-        adaptive.cz_raw_bytes += n as i64;
-        adaptive.cz_raw_sec += tw;
+        return send_raw_chunk(conn, data, stats);
     }
-    if reprobe_now {
-        adaptive.cz_since = 0;
-    } else {
-        adaptive.cz_since += 1;
+
+    let t0 = Instant::now();
+    let cbuf = zstd_compress(data, adaptive.level);
+    let tc = t0.elapsed().as_secs_f64();
+    adaptive.cz_ratio = n as f64 / cbuf.len().max(1) as f64;
+
+    // Incompressible chunk -> raw; ease the level down so we stop spending CPU.
+    if (cbuf.len() as f64) >= (n as f64 * 0.95) {
+        if adaptive.level > LEVEL_MIN {
+            adaptive.level -= 1;
+        }
+        return send_raw_chunk(conn, data, stats);
     }
+
+    let t1 = Instant::now();
+    conn.put_line(&format!("Z {} {}", cbuf.len(), n));
+    conn.put_bytes(&cbuf);
+    conn.flush()?;
+    let tw = t1.elapsed().as_secs_f64();
+    stats.wire += cbuf.len() as u64;
+    // Re-pick the level from the windowed aggregate (per-block tw is buffer-distorted).
+    adaptive.record(tc, tw, n, cbuf.len());
     Ok(())
 }
 
