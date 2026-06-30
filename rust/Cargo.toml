@@ -27,8 +27,9 @@ rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 # flate2 defaults to the pure-Rust miniz_oxide backend (no zlib C dependency).
 # We use it in RAW deflate mode (RFC 1951) to match .NET DeflateStream.
 flate2 = "1"
-# LZ4 via lz4_flex: pure-Rust (no C toolchain), compiled into the single static binary.
-lz4_flex = "0.11"
+# zstd: vendored libzstd compiled from C and STATICALLY linked into the binary
+# (build-time C only; no runtime .dll/.so -> the release stays a single file).
+zstd = "0.13"
 sha2 = "0.10"
 getrandom = "0.2"
 serde = { version = "1", features = ["derive"] }

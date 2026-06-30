@@ -39,16 +39,15 @@ pub fn inflate_raw(data: &[u8], expected_len: usize) -> std::io::Result<Vec<u8>>
     Ok(out)
 }
 
-/// Compress one block with LZ4 (raw block format; the caller stores the original
-/// length out-of-band, like the `Z <clen> <rlen>` frame).
-pub fn lz4_compress(data: &[u8]) -> Vec<u8> {
-    lz4_flex::block::compress(data)
+/// Compress with zstd at the given level (negative = ultra-fast .. ~19 high).
+/// One-shot; the zstd frame is self-describing, so the decoder needs only the bytes.
+pub fn zstd_compress(data: &[u8], level: i32) -> Vec<u8> {
+    zstd::bulk::compress(data, level).expect("zstd compress to Vec cannot fail")
 }
 
-/// Decompress an LZ4 raw block into exactly `expected_len` bytes.
-pub fn lz4_decompress(data: &[u8], expected_len: usize) -> std::io::Result<Vec<u8>> {
-    lz4_flex::block::decompress(data, expected_len)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+/// Decompress a zstd frame into at most `expected_len` bytes.
+pub fn zstd_decompress(data: &[u8], expected_len: usize) -> std::io::Result<Vec<u8>> {
+    zstd::bulk::decompress(data, expected_len)
 }
 
 /// Per-connection adaptive-compression measurements. Persist across files in a
@@ -112,16 +111,13 @@ mod tests {
     }
 
     #[test]
-    fn lz4_round_trip() {
+    fn zstd_round_trip() {
         let data = b"the quick brown fox jumps over the lazy dog ".repeat(500);
-        let c = lz4_compress(&data);
-        assert!(c.len() < data.len(), "lz4 should compress repetitive data");
-        let d = lz4_decompress(&c, data.len()).unwrap();
-        assert_eq!(d, data);
-        // empty + tiny round-trip (edge cases the bundle path will hit)
-        for s in [&b""[..], &b"x"[..]] {
-            let c = lz4_compress(s);
-            assert_eq!(lz4_decompress(&c, s.len()).unwrap(), s);
+        for lvl in [-3, 1, 3, 9, 19] {
+            let c = zstd_compress(&data, lvl);
+            assert!(c.len() < data.len(), "zstd level {lvl} should compress");
+            let d = zstd_decompress(&c, data.len()).unwrap();
+            assert_eq!(d, data, "round-trip at level {lvl}");
         }
     }
 
