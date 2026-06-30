@@ -63,6 +63,12 @@ impl<S: Read + Write> Conn<S> {
         self.wbuf.extend_from_slice(b);
     }
 
+    /// Bytes currently queued but not yet flushed (so a batched sender can decide
+    /// when to flush — e.g. coalescing many small files into a few large records).
+    pub fn buffered_len(&self) -> usize {
+        self.wbuf.len()
+    }
+
     /// Flush everything queued to the underlying stream.
     pub fn flush(&mut self) -> io::Result<()> {
         if !self.wbuf.is_empty() {
