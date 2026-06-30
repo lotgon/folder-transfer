@@ -86,14 +86,92 @@ impl ServeFileConfig {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("config file not found / unreadable: {path}: {e}"))?;
         let stripped = strip_jsonc(&raw);
-        serde_json::from_str(&stripped).map_err(|e| {
+        let cfg: Self = serde_json::from_str(&stripped).map_err(|e| -> BoxError {
             format!(
                 "invalid JSON in {path}: {e}\n  Tip: use forward slashes \"C:/path\" or DOUBLED \
                  backslashes \"C:\\\\path\", and no trailing commas. ( // and /* */ comments are allowed. )"
             )
             .into()
-        })
+        })?;
+        // Best-effort: bring an older config file up to the current schema (adds any
+        // missing tunables with their defaults so they're visible and editable). Never
+        // fatal — a read-only / managed config just stays as-is.
+        if let Err(e) = upgrade_serve_file(path, &raw, &stripped) {
+            eprintln!("[ft] note: could not auto-upgrade config {path}: {e}");
+        }
+        Ok(cfg)
     }
+}
+
+/// Current serve-config tunables: key, default JSON value, one-line doc. Used to
+/// fill in an older config file. Deliberately EXCLUDES the content keys
+/// (folder/folders/ignore) — those are the user's data, not defaults to inject.
+const SERVE_UPGRADE_KEYS: &[(&str, &str, &str)] = &[
+    ("port", "8722", "TCP port to listen on"),
+    ("streams", "4", "parallel streams (1 = classic SYNC, >1 = parallel)"),
+    ("compress", "true", "adaptive compression on/off"),
+    ("compressMargin", "1.6", "keep compression at least this x the link speed"),
+    ("idleSeconds", "600", "auto-stop after this many idle seconds with no client"),
+    ("stallTimeout", "300", "abort a connected-but-silent client after this many seconds"),
+    ("once", "false", "exit after one clean transfer"),
+    ("cutover", "false", "two-phase cutover (implies once, streams = 1)"),
+    ("noFirewall", "false", "do not touch the Windows firewall (no-op on Linux)"),
+    ("allowIp", "\"\"", "restrict to one source IP (empty = any)"),
+    ("serverHost", "\"\"", "address put in the generated client (empty = auto-detect)"),
+    ("clientOut", "\"\"", "where to write the generated client file (empty = default)"),
+];
+
+/// Append any missing current keys (with defaults + a comment) to an older serve
+/// config, preserving the file's existing content and comments. Saves the original
+/// to `<path>.bak` first. Validates the result and only writes if it still parses,
+/// so a parsing edge case can never corrupt the live config.
+fn upgrade_serve_file(path: &str, raw: &str, stripped: &str) -> Result<(), BoxError> {
+    let val: serde_json::Value = serde_json::from_str(stripped)?;
+    let obj = match val.as_object() {
+        Some(o) => o,
+        None => return Ok(()), // not an object literal -> leave it alone
+    };
+    let missing: Vec<&(&str, &str, &str)> =
+        SERVE_UPGRADE_KEYS.iter().filter(|(k, _, _)| !obj.contains_key(*k)).collect();
+    if missing.is_empty() {
+        return Ok(()); // already current
+    }
+
+    // Insert right after the last non-whitespace char before the root's closing '}'.
+    let close = raw.rfind('}').ok_or("config has no closing brace")?;
+    let bytes = raw.as_bytes();
+    let mut at = close;
+    while at > 0 && bytes[at - 1].is_ascii_whitespace() {
+        at -= 1;
+    }
+    let has_existing_keys = at > 0 && bytes[at - 1] != b'{';
+    let mut block = String::new();
+    if has_existing_keys {
+        block.push(','); // close off the previous key/value
+    }
+    block.push_str(&format!(
+        "\n\n  // ---- added by ft {} (current defaults; edit as needed) ----",
+        env!("CARGO_PKG_VERSION")
+    ));
+    for (i, (k, v, c)) in missing.iter().enumerate() {
+        let comma = if i + 1 < missing.len() { "," } else { "" };
+        block.push_str(&format!("\n  \"{k}\": {v}{comma} // {c}"));
+    }
+    let result = format!("{}{}{}", &raw[..at], block, &raw[at..]);
+
+    // Re-parse the result before touching disk — never write something that won't load.
+    serde_json::from_str::<ServeFileConfig>(&strip_jsonc(&result))
+        .map_err(|e| format!("upgraded config would be invalid, not written: {e}"))?;
+
+    std::fs::write(format!("{path}.bak"), raw.as_bytes())?;
+    std::fs::write(path, result.as_bytes())?;
+    let added: Vec<&str> = missing.iter().map(|(k, _, _)| *k).collect();
+    eprintln!(
+        "[ft] config {path}: added {} new field(s) ({}); original saved to {path}.bak",
+        added.len(),
+        added.join(", ")
+    );
+    Ok(())
 }
 
 /// Client connection file written by the server and read by `ft get --config`.
@@ -171,6 +249,36 @@ mod tests {
         let s = strip_jsonc(r#"{ "folder": "x", "somethingElse": 1 }"#);
         let cfg: ServeFileConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(cfg.folder.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn upgrade_adds_missing_keys_preserving_the_file() {
+        let p = std::env::temp_dir().join(format!("ft-upgrade-{}.json", std::process::id()));
+        let p = p.to_str().unwrap();
+        // An old, partial config WITH a comment, to prove comments survive.
+        std::fs::write(p, "{\n  // my prod server\n  \"folder\": \"C:/data\",\n  \"port\": 9000\n}\n").unwrap();
+
+        let cfg = ServeFileConfig::load(p).unwrap();
+        assert_eq!(cfg.port, Some(9000), "user value preserved");
+
+        let after = std::fs::read_to_string(p).unwrap();
+        assert!(after.contains("// my prod server"), "original comment preserved");
+        assert!(after.contains("\"folder\": \"C:/data\""), "original content preserved");
+        assert!(after.contains("\"streams\""), "missing key added");
+        assert!(after.contains("\"compressMargin\""), "missing key added");
+        assert!(std::fs::read_to_string(format!("{p}.bak")).unwrap().contains("\"port\": 9000"), "backup written");
+
+        // Still valid + values intact, defaults filled.
+        let cfg2: ServeFileConfig = serde_json::from_str(&strip_jsonc(&after)).unwrap();
+        assert_eq!(cfg2.port, Some(9000));
+        assert_eq!(cfg2.streams, Some(4));
+
+        // Idempotent: a second load must not change the file again.
+        let _ = ServeFileConfig::load(p).unwrap();
+        assert_eq!(after, std::fs::read_to_string(p).unwrap(), "second load must be a no-op");
+
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(format!("{p}.bak"));
     }
 
     #[test]

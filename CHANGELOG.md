@@ -50,6 +50,12 @@ aims to follow [Semantic Versioning](https://semver.org/).
   `sync DONE … bytes=… @ … MB/s` summary stays on screen. It only pauses when it owns the console and
   stdin is interactive — running from an existing shell, a pipe, or a script is unaffected. Force it
   from a launcher with `--pause`.
+- **Serve configs self-upgrade.** Loading an older server config (e.g. one written before `streams` or
+  `compressMargin` existed) appends the missing current options with their defaults and a one-line
+  comment each, so the file shows everything you can tune and stays editable. Your existing values,
+  comments, and layout are preserved (it only appends); the original is saved to `<config>.bak`. The
+  rewrite is validated before it's written and is skipped once the config is current — a read-only or
+  managed config is left untouched.
 - **Latency: a fresh fetch no longer pays a round-trip per bundle / per large file.** When the
   destination is empty, the parallel client requests *stream mode* (`QSYNC STREAM`): the server sends
   every file at offset 0 without waiting for a per-bundle want-mask or a per-file offset reply (both
