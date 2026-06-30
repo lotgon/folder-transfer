@@ -77,6 +77,8 @@ pub struct ServeFileConfig {
     pub no_firewall: Option<bool>,
     pub streams: Option<i32>,
     pub compress: Option<bool>,
+    /// Adaptive-level coefficient: keep compression >= this x the link speed (default 1.6).
+    pub compress_margin: Option<f64>,
 }
 
 impl ServeFileConfig {

@@ -17,7 +17,7 @@ const CLIENT_READ_TIMEOUT_SECS: u64 = 90;
 
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
-use crate::compress::inflate_raw;
+use crate::compress::zstd_decompress;
 use crate::mtime;
 use crate::paths::{norm_key, safe_join, top_segment};
 use crate::progress::Progress;
@@ -191,7 +191,7 @@ fn handle_bundle<S: Read + Write>(
 
     for (k, target) in targets.iter().enumerate() {
         let Some(bt) = target else { continue };
-        // Per file: "Z <clen> <rlen>" (deflate) / "R <rlen>" (raw) / "-1" (locked).
+        // Per file: "Z <clen> <rlen>" (zstd) / "R <rlen>" (raw) / "-1" (locked).
         let hdr = conn.read_line()?.ok_or_else(eof)?;
         if hdr == "-1" {
             continue; // locked on the source -> keep our copy
@@ -206,7 +206,7 @@ fn handle_bundle<S: Read + Write>(
             let clen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
             let rlen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
             let cbuf = conn.read_exact_vec(clen)?;
-            let obuf = inflate_raw(&cbuf, rlen)?;
+            let obuf = zstd_decompress(&cbuf, rlen)?;
             f.write_all(&obuf)?;
             obuf.len() as u64
         } else {
@@ -264,7 +264,7 @@ fn handle_large<S: Read + Write>(
     }
     let mut f = File::create(&target)?;
     if hdr == "Z" {
-        // adaptive: "Z <clen> <rlen>" (deflate) or "R <rlen>" (raw), ended by "E"
+        // adaptive: "Z <clen> <rlen>" (zstd) or "R <rlen>" (raw), ended by "E"
         loop {
             let ch = conn.read_line()?.ok_or_else(eof)?;
             if ch == "E" {
@@ -281,7 +281,7 @@ fn handle_large<S: Read + Write>(
                 let clen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
                 let rlen: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
                 let cbuf = conn.read_exact_vec(clen)?;
-                let obuf = inflate_raw(&cbuf, rlen)?;
+                let obuf = zstd_decompress(&cbuf, rlen)?;
                 f.write_all(&obuf)?;
                 stats.bytes += obuf.len() as u64;
                 prog.add(obuf.len() as u64, 0);

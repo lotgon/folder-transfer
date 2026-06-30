@@ -12,6 +12,28 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - Optional hash‑based integrity verification (`-Verify`).
 - Optional server‑side transfer log for auditing.
 
+## [0.18.0] — 2026-06-30
+
+### Performance (Rust `ft`)
+- **Switched the compressor from deflate to zstd** (vendored libzstd, **statically linked** — the
+  release is still a single self-contained binary, no runtime DLL/.so). zstd dominates deflate on
+  both ratio and speed: e.g. on log/JSON data ~8–9× vs deflate's ~5×.
+- **Adaptive compression level by link speed.** A per-connection controller picks the highest zstd
+  level whose compression stays at least `--compress-margin`× the link speed (default **1.6**), so a
+  slow link compresses harder (more ratio → fewer bytes) and a fast link compresses lighter (down to
+  zstd's ultra-fast negative levels, or raw if even those lose). The link rate is measured over a
+  window of wire bytes (per-block write time is meaningless — it's absorbed by the socket buffer).
+  Incompressible data is detected and sent raw (no expansion).
+- **One shared level controller across all parallel streams.** Pooling every stream's measurements
+  converges the level quickly; with the default 4 streams a single per-stream controller saw too
+  little data to adapt. Measured: streams=4 over a 30 Mbit link climbs to ~level 10 (~9× on logs).
+- Configurable via `--compress-margin <x>` (JSON `compressMargin`). Removed the deflate code and the
+  `flate2` dependency.
+
+### Notes
+- Compressed blocks are now zstd, so the wire format changed again — both ends must run 0.18.0+
+  (Rust ↔ Rust only; the PowerShell edition is a separate tool and unaffected).
+
 ## [0.17.0] — 2026-06-30
 
 ### Performance (Rust `ft`)

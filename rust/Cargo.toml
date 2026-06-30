@@ -1,6 +1,6 @@
 [package]
 name = "ft"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 rust-version = "1.96"
 description = "folder-transfer: wire-compatible Rust port of the PowerShell ft-server/ft-client"
@@ -24,9 +24,9 @@ clap = { version = "4", features = ["derive"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # ring backend (not the default aws_lc_rs) to avoid a C toolchain / cmake at build time.
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
-# flate2 defaults to the pure-Rust miniz_oxide backend (no zlib C dependency).
-# We use it in RAW deflate mode (RFC 1951) to match .NET DeflateStream.
-flate2 = "1"
+# zstd: vendored libzstd compiled from C and STATICALLY linked into the binary
+# (build-time C only; no runtime .dll/.so -> the release stays a single file).
+zstd = "0.13"
 sha2 = "0.10"
 getrandom = "0.2"
 serde = { version = "1", features = ["derive"] }
