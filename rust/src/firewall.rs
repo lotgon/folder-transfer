@@ -4,6 +4,8 @@
 
 /// Holds an opened firewall rule and removes it on drop.
 pub struct FirewallGuard {
+    // Only read on Windows (in `Drop` via `delete_rule`); a no-op elsewhere.
+    #[cfg_attr(not(windows), allow(dead_code))]
     rule: String,
     opened: bool,
 }
