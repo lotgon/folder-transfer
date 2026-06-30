@@ -41,7 +41,15 @@ aims to follow [Semantic Versioning](https://semver.org/).
 - **`--debug` mode.** Logs important decisions — chiefly every adaptive-level change (new level, the
   `spare` and measured link rate, the realized ratio) and raw-mode toggles — to stderr **and** a debug
   log file (`ft-debug.log`, or `--debug-log <path>`), so you can watch what the controller does and
-  share the log. Off by default; one atomic check when off.
+  share the log. Off by default; one atomic check when off. (The window-clock starts at the first
+  block of each window, so the first `--debug` line shows a real link rate, not a startup artifact.)
+
+### CLI / UX (Rust `ft`)
+- **The window no longer closes before you can read the result.** When `ft` is launched into its own
+  console (double-clicked, or from a launcher) it now waits for Enter at the end, so the final
+  `sync DONE … bytes=… @ … MB/s` summary stays on screen. It only pauses when it owns the console and
+  stdin is interactive — running from an existing shell, a pipe, or a script is unaffected. Force it
+  from a launcher with `--pause`.
 - **Latency: a fresh fetch no longer pays a round-trip per bundle / per large file.** When the
   destination is empty, the parallel client requests *stream mode* (`QSYNC STREAM`): the server sends
   every file at offset 0 without waiting for a per-bundle want-mask or a per-file offset reply (both

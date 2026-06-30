@@ -79,6 +79,10 @@ struct ServeArgs {
     /// Path for the debug log (default ft-debug.log in the current directory).
     #[arg(long)]
     debug_log: Option<String>,
+    /// Keep the window open at the end (wait for Enter). Auto-enabled when launched
+    /// into its own console (double-click); pass this to force it from a launcher.
+    #[arg(long)]
+    pause: bool,
 }
 
 #[derive(Parser)]
@@ -113,6 +117,10 @@ struct GetArgs {
     /// Path for the debug log (default ft-debug.log in the current directory).
     #[arg(long)]
     debug_log: Option<String>,
+    /// Keep the window open at the end (wait for Enter). Auto-enabled when launched
+    /// into its own console (double-click); pass this to force it from a launcher.
+    #[arg(long)]
+    pause: bool,
 }
 
 fn main() {
@@ -123,14 +131,57 @@ fn main() {
     // the first positional decides serve vs get; `serve`/`get` stay available explicitly.
     let argv = rewrite_argv(std::env::args().collect());
     let cli = Cli::parse_from(argv);
+    let force_pause = match &cli.cmd {
+        Cmd::Serve(a) => a.pause,
+        Cmd::Get(a) => a.pause,
+    };
     let result = match cli.cmd {
         Cmd::Serve(a) => cmd_serve(a),
         Cmd::Get(a) => cmd_get(a),
     };
-    if let Err(e) = result {
-        eprintln!("[ft] error: {e}");
-        std::process::exit(1);
+    let code = match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("[ft] error: {e}");
+            1
+        }
+    };
+    // Don't let the final summary vanish when ft was launched into its own console
+    // (double-click / launcher) that closes the instant we exit.
+    pause_at_exit(force_pause);
+    std::process::exit(code);
+}
+
+/// True if this process is the ONLY one attached to its console — Windows created
+/// the console for us and destroys it the instant we exit (double-click / launcher),
+/// so the output would flash and vanish. False when run from an existing shell
+/// (cmd/PowerShell are also attached) or when there is no console.
+#[cfg(windows)]
+fn owns_console() -> bool {
+    extern "system" {
+        fn GetConsoleProcessList(lpdwProcessList: *mut u32, dwProcessCount: u32) -> u32;
     }
+    let mut buf = [0u32; 4];
+    let n = unsafe { GetConsoleProcessList(buf.as_mut_ptr(), buf.len() as u32) };
+    n == 1
+}
+#[cfg(not(windows))]
+fn owns_console() -> bool {
+    false
+}
+
+/// Keep the console open so the final summary stays readable: pause when forced
+/// (`--pause`) or when we own the console (it would otherwise close). Never pauses
+/// without an interactive stdin, so scripts and pipes are unaffected.
+fn pause_at_exit(force: bool) {
+    use std::io::{BufRead, Write};
+    if !(force || owns_console()) || !std::io::stdin().is_terminal() {
+        return;
+    }
+    eprint!("\n[ft] Press Enter to close . . . ");
+    std::io::stderr().flush().ok();
+    let mut s = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut s);
 }
 
 /// Rewrite argv so a bare first positional works without a subcommand:

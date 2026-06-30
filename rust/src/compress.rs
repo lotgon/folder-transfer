@@ -93,8 +93,7 @@ impl AdaptiveState {
             margin,
             raise: margin + 0.4,
             streams: streams.max(1),
-            win_start: Some(Instant::now()),
-            ..Default::default()
+            ..Default::default() // win_start set lazily on the first block of each window
         }
     }
 
@@ -134,6 +133,12 @@ impl AdaptiveState {
     /// buffer-immune once the buffer fills, which it does over a 4 MiB window.
     pub fn note_compressed(&mut self, tc: f64, orig: usize, wire: usize) {
         self.incompressible_run = 0;
+        // Start the window clock at the FIRST block of the window, not at controller
+        // creation / last reset — otherwise the first window's elapsed includes
+        // connection setup + the walk, giving a meaningless link rate (e.g. 0.10 MB/s).
+        if self.win_wire == 0 {
+            self.win_start = Some(Instant::now());
+        }
         self.win_tc += tc;
         self.win_orig += orig as i64;
         self.win_wire += wire as i64;
@@ -202,7 +207,7 @@ impl AdaptiveState {
         self.win_tc = 0.0;
         self.win_orig = 0;
         self.win_wire = 0;
-        self.win_start = Some(Instant::now());
+        self.win_start = None; // set on the next window's first block
     }
 }
 
